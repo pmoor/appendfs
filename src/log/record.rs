@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
-// Bumped for delta-structured log format.
-pub const CURRENT_VERSION: u32 = 3;
-pub const FILE_HEADER_SIZE: usize = 24;
+// Bumped for RecordHeader's new key_id field - a breaking format change, so old logs
+// are cleanly rejected (FileHeader::from_bytes) rather than silently misparsed.
+// Bumped to 6: RecordHeader lost its `key_id` byte (records are 25 bytes rather than 26) and
+// FileHeader widened its timestamp back to a full i64 of seconds. Both shift every offset in
+// a log file, and the header is validated on open so an older file is refused rather than
+// read with the wrong layout.
+pub const CURRENT_VERSION: u32 = 6;
+/// magic(4) + version(4) + generation(8) + created_at seconds(8) + nanoseconds(4).
+pub const FILE_HEADER_SIZE: usize = 28;
 pub const RECORD_HEADER_SIZE: usize = 25;
 pub const RECORD_CHECKSUM_SIZE: usize = 4;
 
@@ -50,23 +56,29 @@ impl FileHeader {
         buf[0..4].copy_from_slice(&self.magic);
         buf[4..8].copy_from_slice(&self.version.to_le_bytes());
         buf[8..16].copy_from_slice(&self.generation.to_le_bytes());
-        let (secs, _) = crate::clock::system_time_to_unix(self.created_at);
+        // Seconds are stored as a full signed 64-bit count. Narrowing them to u32 - as this
+        // header briefly did - silently wraps every timestamp past 2106 back to 1970 and
+        // every pre-1970 one forward to ~2106, which corrupts the ordering that
+        // `mount-ro --at-time` selects generations by.
+        let (secs, nsecs) = crate::clock::system_time_to_unix(self.created_at);
         buf[16..24].copy_from_slice(&secs.to_le_bytes());
+        buf[24..28].copy_from_slice(&nsecs.to_le_bytes());
         buf
     }
 
     pub fn from_bytes(bytes: &[u8; FILE_HEADER_SIZE]) -> Result<Self, &'static str> {
-        let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        let magic: [u8; 4] = bytes[0..4].try_into().unwrap();
         if magic != FILE_MAGIC {
-            return Err("Invalid log file magic bytes");
+            return Err("invalid magic bytes");
         }
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         if version != CURRENT_VERSION {
-            return Err("Unsupported log format version");
+            return Err("unsupported file version");
         }
         let generation = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let created_at_sec = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let created_at = crate::clock::unix_to_system_time(created_at_sec, 0);
+        let secs = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let nsecs = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let created_at = crate::clock::unix_to_system_time(secs, nsecs);
 
         Ok(Self {
             magic,
@@ -114,6 +126,11 @@ impl std::fmt::Display for OpCode {
 }
 
 /// Compact per-record header (25 bytes).
+///
+/// Deliberately carries no `key_id`: whether a payload is encrypted is a property of the
+/// volume, recorded once in the volume header where the key check value vouches for it.
+/// A per-record copy would be unauthenticated - this header is not covered by `checksum` -
+/// and clearing it used to downgrade an encrypted read into a raw one.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
@@ -514,6 +531,29 @@ mod tests {
 
         let deserialized = FileHeader::from_bytes(&bytes).unwrap();
         assert_eq!(header, deserialized);
+    }
+
+    #[test]
+    fn test_file_header_timestamp_survives_the_u32_boundaries() {
+        // Seconds were briefly stored as u32, which wrapped 2106 back to 1970 and pre-1970
+        // forward to ~2106. `mount-ro --at-time` picks a generation by comparing these, so a
+        // wrapped value silently selects the wrong point in history rather than failing.
+        let cases = [
+            ("epoch", 0i64),
+            ("just inside u32", u32::MAX as i64 - 1),
+            ("past the u32 ceiling (year 2106+)", u32::MAX as i64 + 1_000),
+            ("far future", 1i64 << 40),
+            ("before the epoch", -1),
+            ("well before the epoch", -2_208_988_800),
+        ];
+
+        for (name, secs) in cases {
+            let created_at = crate::clock::unix_to_system_time(secs, 123_456_789);
+            let header = FileHeader::new(7, created_at);
+            let round_tripped = FileHeader::from_bytes(&header.to_bytes()).unwrap();
+            assert_eq!(round_tripped.created_at, created_at, "{} did not round-trip", name);
+            assert_eq!(round_tripped.generation, 7, "{}", name);
+        }
     }
 
     #[test]

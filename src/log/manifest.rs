@@ -64,7 +64,12 @@ impl LogManifest {
 
         Self {
             branch,
-            logs: vec![LogFileInfo::new(start_generation, current_filename, created_at, 24)],
+            logs: vec![LogFileInfo::new(
+                start_generation,
+                current_filename,
+                created_at,
+                crate::log::record::FILE_HEADER_SIZE as u64,
+            )],
             next_generation,
             next_filename,
         }
@@ -72,6 +77,9 @@ impl LogManifest {
 
     /// Appends a new rolled log generation and advances `next_generation` / `next_filename`.
     pub fn record_roll(&mut self, next_gen: u64, next_file: String, created_at: SystemTime, initial_header_size: u64) {
+        if self.logs.iter().any(|l| l.generation == next_gen) {
+            return;
+        }
         let entry = LogFileInfo::new(next_gen, next_file, created_at, initial_header_size);
         self.logs.push(entry);
         self.next_generation = next_gen + 1;
@@ -118,7 +126,12 @@ mod tests {
         assert_eq!(manifest.next_generation, 2);
         assert_eq!(manifest.next_filename, "000002.log");
 
-        manifest.record_roll(2, "000002.log".to_string(), SystemTime::now(), 24);
+        manifest.record_roll(
+            2,
+            "000002.log".to_string(),
+            SystemTime::now(),
+            crate::log::record::FILE_HEADER_SIZE as u64,
+        );
         assert_eq!(manifest.logs.len(), 2);
         assert_eq!(manifest.logs[1].generation, 2);
         assert_eq!(manifest.next_generation, 3);

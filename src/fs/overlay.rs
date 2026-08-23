@@ -388,7 +388,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -417,7 +427,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();

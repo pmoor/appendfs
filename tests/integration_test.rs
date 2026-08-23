@@ -251,12 +251,20 @@ fn test_fuse_filesystem() {
 
 #[test]
 fn test_fuse_with_log_writer() {
-    let clock = appendfs::SystemClock;
     let log_dir = tempfile::Builder::new().prefix("appendfs_log_dir_").tempdir().unwrap();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir.path()));
 
-    let writer =
-        Arc::new(appendfs::LogWriter::create(storage, 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(
+            storage,
+            1,
+            &appendfs::SystemClock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
+    );
     let fs = appendfs::InMemoryFS::with_log(Arc::clone(&writer));
 
     let mount_dir = tempfile::Builder::new()
@@ -436,7 +444,9 @@ fn test_log_rolling() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     // Create a LogWriter with a tiny max_log_size of 512 bytes to force rolling
-    let writer = Arc::new(appendfs::LogWriter::create(storage, 1, &*clock, 512, 1).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(storage, 1, &*clock, 512, 1, appendfs::VolumeKey::plaintext_arc()).unwrap(),
+    );
 
     let mut fs_instance = appendfs::InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
     fs_instance.set_log_dir(&log_path);
@@ -492,6 +502,7 @@ fn test_log_rolling() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let mount_dir_rec = tempfile::Builder::new()
@@ -527,7 +538,15 @@ fn test_summary_single_file_export_and_recovery() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     let writer = Arc::new(
-        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create(
+            storage.clone(),
+            1,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
 
     let mut fs_instance = appendfs::InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
@@ -558,6 +577,7 @@ fn test_summary_single_file_export_and_recovery() {
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let summary_file = fs_tmp.export_summary(storage.as_ref()).unwrap();
@@ -567,7 +587,8 @@ fn test_summary_single_file_export_and_recovery() {
     assert_eq!(summary_file, "000001.summary");
 
     // Inspect summary snapshot using SummaryReader
-    let reader = appendfs::SummaryReader::open(storage.as_ref(), &summary_file).unwrap();
+    let reader =
+        appendfs::SummaryReader::open(storage.as_ref(), &summary_file, appendfs::VolumeKey::plaintext_arc()).unwrap();
     assert_eq!(reader.header.generation, 1);
     assert_eq!(reader.footer.entry_count, 4); // root (1), docs dir (2), file1 (3), file2 (4)
 
@@ -583,6 +604,7 @@ fn test_summary_single_file_export_and_recovery() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
 
@@ -665,7 +687,9 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     // 2KB max log size to trigger rolling across writes
-    let writer = Arc::new(appendfs::LogWriter::create(storage, 1, &*clock, 2048, 1).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(storage, 1, &*clock, 2048, 1, appendfs::VolumeKey::plaintext_arc()).unwrap(),
+    );
     let fs = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
     let temp_dir = tempfile::Builder::new()
@@ -711,6 +735,7 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let stats = recovered_fs.calculate_generation_live_stats();
@@ -730,13 +755,18 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
 
 #[test]
 fn test_volume_init_mount_and_stats_flow() {
-    let clock = Arc::new(appendfs::SystemClock);
     let log_dir = tempfile::Builder::new().prefix("appendfs_init_vol_").tempdir().unwrap();
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     // 1. Explicitly initialize empty volume
-    let summary_filename = appendfs::init_volume(storage.clone(), Some("work")).unwrap();
+    let summary_filename = appendfs::init_volume(
+        storage.clone(),
+        Some("work"),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+    )
+    .unwrap();
     let summary_path = log_path.join(&summary_filename);
     assert!(summary_path.exists());
     assert_eq!(summary_filename, "000000.summary");
@@ -746,12 +776,23 @@ fn test_volume_init_mount_and_stats_flow() {
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let next_gen = fs_instance.manifest.read().unwrap().next_generation;
     assert_eq!(next_gen, 1);
 
-    let writer = Arc::new(appendfs::LogWriter::create(storage.clone(), next_gen, &*clock, 1024 * 1024, 1).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(
+            storage.clone(),
+            next_gen,
+            &appendfs::SystemClock,
+            1024 * 1024,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
+    );
     fs_instance.log_writer = Some(Arc::clone(&writer));
     fs_instance.set_log_dir(&log_path);
 
@@ -788,6 +829,7 @@ fn test_volume_init_mount_and_stats_flow() {
             live_storage,
             appendfs::RecoveryTarget::Latest,
             Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
         let live_stats = appendfs::VolumeStats::collect(&live_recovered_fs);
@@ -807,6 +849,7 @@ fn test_volume_init_mount_and_stats_flow() {
         rec_storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let stats = appendfs::VolumeStats::collect(&recovered_fs);
@@ -828,7 +871,7 @@ fn test_volume_init_mount_and_stats_flow() {
     assert!(log_file.exists());
 
     // Summary level (verbosity 0)
-    let dump_v0 = appendfs::dump_log_file(rec_storage.as_ref(), "000001.log", 0).unwrap();
+    let dump_v0 = appendfs::dump_log_file(rec_storage.as_ref(), "000001.log", 0, None).unwrap();
     assert!(dump_v0.contains("File Size:"));
     assert!(dump_v0.contains("Committed Flushes:"));
     assert!(dump_v0.contains("Trailing Batch:      None"));
@@ -836,28 +879,28 @@ fn test_volume_init_mount_and_stats_flow() {
     assert!(dump_v0.contains("Write"));
 
     // Record stream level (verbosity 1)
-    let dump_v1 = appendfs::dump_log_file(rec_storage.as_ref(), "000001.log", 1).unwrap();
+    let dump_v1 = appendfs::dump_log_file(rec_storage.as_ref(), "000001.log", 1, None).unwrap();
     assert!(dump_v1.contains("Create"));
     assert!(dump_v1.contains("Write"));
     assert!(dump_v1.contains("note.txt"));
     assert!(dump_v1.contains("[COMMITTED]"));
 
     // Full hex payload level (verbosity 2)
-    let dump_v2 = appendfs::dump_file(rec_storage.as_ref(), "000001.log", 2).unwrap();
+    let dump_v2 = appendfs::dump_file(rec_storage.as_ref(), "000001.log", 2, None).unwrap();
     assert!(dump_v2.contains("hello appendfs v"));
     assert!(dump_v2.contains("olume"));
 
     // 6. Test dump command on the initial summary file 000000.summary
     let summary_file = log_path.join("000000.summary");
     assert!(summary_file.exists());
-    let dump_sum_v0 = appendfs::dump_file(rec_storage.as_ref(), "000000.summary", 0).unwrap();
+    let dump_sum_v0 = appendfs::dump_file(rec_storage.as_ref(), "000000.summary", 0, None).unwrap();
     assert!(dump_sum_v0.contains("=== appendfs Summary File Dump ==="));
     assert!(dump_sum_v0.contains("Branch:              work"));
     assert!(dump_sum_v0.contains("Total Inodes:        1"));
     assert!(dump_sum_v0.contains("Checksum (BLAKE3):"));
     assert!(dump_sum_v0.contains("VERIFIED"));
 
-    let dump_sum_v1 = appendfs::dump_file(rec_storage.as_ref(), "000000.summary", 1).unwrap();
+    let dump_sum_v1 = appendfs::dump_file(rec_storage.as_ref(), "000000.summary", 1, None).unwrap();
     assert!(dump_sum_v1.contains("Summary Inode Records"));
     assert!(dump_sum_v1.contains("Directory  \"/\""));
 }
@@ -869,7 +912,13 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
     // 1. Initialize volume
-    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+    )
+    .unwrap();
 
     // Verify only 000000.summary exists
     let files: Vec<_> = std::fs::read_dir(log_path)
@@ -884,10 +933,18 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
             storage.clone(),
             appendfs::RecoveryTarget::Latest,
             Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
         let writer = std::sync::Arc::new(
-            appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+            appendfs::LogWriter::create_lazy(
+                storage.clone(),
+                1,
+                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                appendfs::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
         );
         fs.log_writer = Some(writer);
         fs.set_log_dir(log_path);
@@ -914,10 +971,18 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
             storage.clone(),
             appendfs::RecoveryTarget::Latest,
             Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
         let writer = std::sync::Arc::new(
-            appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+            appendfs::LogWriter::create_lazy(
+                storage.clone(),
+                1,
+                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                appendfs::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
         );
         fs.log_writer = Some(writer);
         fs.set_log_dir(log_path);
@@ -949,6 +1014,7 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let root_entries = recovered.list_directory(1).unwrap();
@@ -962,16 +1028,30 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     let log_path = dir.path();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+    )
+    .unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let writer = std::sync::Arc::new(
-        appendfs::LogWriter::create_lazy(storage, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create_lazy(
+            storage,
+            1,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
@@ -1009,16 +1089,30 @@ fn test_background_flusher_in_mount_session() {
     let log_path = dir.path();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+    )
+    .unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let writer = std::sync::Arc::new(
-        appendfs::LogWriter::create_lazy(storage, 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create_lazy(
+            storage,
+            1,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
@@ -1055,16 +1149,30 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     let log_path = dir.path();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+    )
+    .unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let writer = std::sync::Arc::new(
-        appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create_lazy(
+            storage.clone(),
+            1,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
     fs.log_writer = Some(writer);
     fs.set_log_dir(log_path);
@@ -1078,7 +1186,7 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
     fs.sync_log().unwrap();
 
     // 2. Check clean volume
-    let report = appendfs::check_volume(storage, true).unwrap();
+    let report = appendfs::check_volume(storage, true, appendfs::VolumeKey::plaintext_arc()).unwrap();
     assert!(report.is_clean(), "Clean volume must pass check: {:?}", report.issues);
     assert_eq!(report.error_count(), 0);
     assert_eq!(report.orphaned_inodes.len(), 0);
@@ -1192,22 +1300,42 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
     let log_path = dir.path();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
 
-    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+    )
+    .unwrap();
 
     // 1. First RW Mount: acquires exclusive lock
     let mut fs1 = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
-    let writer1 = appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1)
-        .expect("First RW mount must successfully acquire exclusive volume lock");
+    let writer1 = appendfs::LogWriter::create_lazy(
+        storage.clone(),
+        1,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .expect("First RW mount must successfully acquire exclusive volume lock");
     fs1.log_writer = Some(std::sync::Arc::new(writer1));
     fs1.set_log_dir(log_path);
 
     // 2. Second concurrent RW Mount attempt: must fail with WouldBlock
-    let err = appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap_err();
+    let err = appendfs::LogWriter::create_lazy(
+        storage.clone(),
+        1,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap_err();
     assert_eq!(
         err.kind(),
         std::io::ErrorKind::WouldBlock,
@@ -1224,6 +1352,7 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .expect("RO recovery must succeed concurrently while RW mount is active");
     assert!(ro_fs.list_directory(1).is_some());
@@ -1232,13 +1361,25 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
     drop(fs1);
 
     // 5. Subsequent RW Mount: must now succeed cleanly
-    let mut writer2_res = appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1);
+    let mut writer2_res = appendfs::LogWriter::create_lazy(
+        storage.clone(),
+        1,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+        appendfs::VolumeKey::plaintext_arc(),
+    );
     for _ in 0..20 {
         if writer2_res.is_ok() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
-        writer2_res = appendfs::LogWriter::create_lazy(storage.clone(), 1, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1);
+        writer2_res = appendfs::LogWriter::create_lazy(
+            storage.clone(),
+            1,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        );
     }
     let writer2 = writer2_res.expect("Subsequent RW mount must succeed after previous RW mount is dropped");
     drop(writer2);
@@ -1348,7 +1489,15 @@ fn test_special_file_types_and_recovery() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     let writer = Arc::new(
-        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create(
+            storage.clone(),
+            1,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
     let mut fs_instance = appendfs::InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
     fs_instance.set_log_dir(&log_path);
@@ -1406,6 +1555,7 @@ fn test_special_file_types_and_recovery() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .expect("recover_fs should succeed");
     let remount_dir = tempfile::Builder::new()
@@ -1538,7 +1688,15 @@ fn test_xattr_fuse_crud_and_crash_recovery() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     let writer = Arc::new(
-        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create(
+            storage.clone(),
+            1,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
     let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
@@ -1600,6 +1758,7 @@ fn test_xattr_fuse_crud_and_crash_recovery() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .expect("recovery should succeed");
     let remount_dir = tempfile::Builder::new()
@@ -1637,7 +1796,15 @@ fn test_xattr_on_directories_and_special_files() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     let writer = Arc::new(
-        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create(
+            storage.clone(),
+            1,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
     let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
@@ -1667,6 +1834,7 @@ fn test_xattr_on_directories_and_special_files() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .expect("recovery should succeed");
     let remount_dir = tempfile::Builder::new()
@@ -1692,7 +1860,15 @@ fn test_directory_nlink_tracking_and_recovery() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     let writer = Arc::new(
-        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create(
+            storage.clone(),
+            1,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
     let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
@@ -1736,6 +1912,7 @@ fn test_directory_nlink_tracking_and_recovery() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .expect("recovery should succeed");
     let remount_dir = tempfile::Builder::new()
@@ -1762,7 +1939,17 @@ fn test_special_permission_bits_live_folded_and_recovery() {
         .unwrap();
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
-    let writer = Arc::new(appendfs::LogWriter::create(storage.clone(), 1, &*clock, 1024 * 1024, 1).unwrap());
+    let writer = Arc::new(
+        appendfs::LogWriter::create(
+            storage.clone(),
+            1,
+            &*clock,
+            1024 * 1024,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
+    );
     let fs = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
     // 1. Create file and directory
@@ -1837,6 +2024,7 @@ fn test_special_permission_bits_live_folded_and_recovery() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let rec_file = recovered.get_attr(file_ino).unwrap();
@@ -1858,6 +2046,7 @@ fn test_special_permission_bits_live_folded_and_recovery() {
         sum_storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let sum_file = summary_recovered.get_attr(file_ino).unwrap();
@@ -1897,7 +2086,15 @@ fn test_fallocate_punch_hole_zero_range_and_recovery() {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
     let writer = Arc::new(
-        appendfs::LogWriter::create(storage.clone(), 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap(),
+        appendfs::LogWriter::create(
+            storage.clone(),
+            1,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
     );
     let fs_instance = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
@@ -1985,6 +2182,7 @@ fn test_fallocate_punch_hole_zero_range_and_recovery() {
         storage,
         appendfs::RecoveryTarget::Latest,
         Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap();
     let ino = recovered_fs.lookup_child(1, "holey.bin").expect("file must survive");
@@ -2003,7 +2201,13 @@ fn test_fallocate_punch_hole_zero_range_and_recovery() {
 fn test_recovery_refuses_a_volume_with_no_readable_summary() {
     let dir = tempfile::tempdir().unwrap();
     let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
-    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+    )
+    .unwrap();
 
     // Truncate the only summary so it cannot be opened at all. Truncation is used rather
     // than a corrupted field because it fails the same way regardless of which fields a
@@ -2016,6 +2220,7 @@ fn test_recovery_refuses_a_volume_with_no_readable_summary() {
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
         std::sync::Arc::new(appendfs::SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     ) else {
         panic!("recovery must refuse a volume it cannot describe");
     };
@@ -2034,8 +2239,377 @@ fn test_recovery_refuses_a_volume_with_no_readable_summary() {
             fresh_storage,
             appendfs::RecoveryTarget::Latest,
             std::sync::Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
         )
         .is_ok(),
         "an empty directory has no state to contradict"
+    );
+}
+
+#[test]
+fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+    let master_key = appendfs::crypto::MasterKey::new([0x42u8; 32]);
+
+    // 1. Initialize encrypted volume
+    let (volume_header, volume_key) =
+        appendfs::crypto::VolumeHeader::new_encrypted(&master_key, [0x11u8; 16], appendfs::crypto::KeySource::KeyFile)
+            .unwrap();
+    appendfs::log::init_volume(
+        std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path)),
+        Some("main"),
+        &volume_key,
+        volume_header,
+    )
+    .unwrap();
+
+    let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
+    let unlocked_arc = std::sync::Arc::new(volume_key);
+
+    // 2. Open writer and append sensitive data
+    {
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            std::sync::Arc::new(appendfs::SystemClock),
+            unlocked_arc.clone(),
+        )
+        .unwrap();
+
+        let writer = std::sync::Arc::new(
+            appendfs::LogWriter::create_lazy(
+                storage.clone(),
+                1,
+                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                unlocked_arc.clone(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_log_dir(log_path);
+
+        let file_attr =
+            appendfs::operations::read_write::create_core(&fs, 1, "confidential.txt", 0o600, 0, 1000, 1000).unwrap();
+        let secret = b"TOP_SECRET_CREDENTIALS_AND_PAYLOAD_987654321";
+        appendfs::operations::read_write::write_core(&fs, file_attr.ino, secret, 0).unwrap();
+
+        fs.sync_log().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+    }
+
+    // 3. Raw Disk Inspection: Verify zero plaintext leaks on disk!
+    let raw_log = std::fs::read(log_path.join("000001.log")).unwrap();
+    let secret = b"TOP_SECRET_CREDENTIALS_AND_PAYLOAD_987654321";
+    let filename = b"confidential.txt";
+    assert!(
+        !raw_log.windows(secret.len()).any(|w| w == secret),
+        "Plaintext data leaked into raw log file!"
+    );
+    assert!(
+        !raw_log.windows(filename.len()).any(|w| w == filename),
+        "Plaintext metadata/filename leaked into raw log file!"
+    );
+
+    let raw_summary = std::fs::read(log_path.join("000001.summary")).unwrap();
+    assert!(
+        !raw_summary.windows(secret.len()).any(|w| w == secret),
+        "Plaintext data leaked into raw summary snapshot!"
+    );
+
+    // 4. Successful recovery using correct master key
+    {
+        let summary_kr = appendfs::log::SummaryReader::read_volume_header(storage.as_ref(), "000001.summary").unwrap();
+        let unlocked_recovered = summary_kr.unlock(&master_key).unwrap();
+
+        let recovered = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            std::sync::Arc::new(appendfs::SystemClock),
+            std::sync::Arc::new(unlocked_recovered),
+        )
+        .unwrap();
+
+        let entries = recovered.list_directory(1).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "confidential.txt");
+
+        let content = recovered.read_file_data(entries[0].1, 0, secret.len()).unwrap();
+        assert_eq!(content, secret);
+    }
+
+    // 5. A wrong master key is rejected up front, and is reported as a wrong key rather
+    //    than as corruption - the volume on disk is perfectly intact.
+    {
+        let wrong_key = appendfs::crypto::MasterKey::new([0x99u8; 32]);
+        let header = appendfs::log::SummaryReader::read_volume_header(storage.as_ref(), "000001.summary").unwrap();
+        assert_eq!(
+            header.unlock(&wrong_key).unwrap_err(),
+            appendfs::crypto::CryptoError::WrongKey
+        );
+
+        // And it surfaces as PermissionDenied, not InvalidData, so callers that map errno
+        // do not tell the user their data is damaged.
+        let io_err: std::io::Error = header.unlock(&wrong_key).unwrap_err().into();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+}
+
+/// Tampering with a record header must be caught, not served as data.
+///
+/// The header sits outside the payload checksum, so it reaches the reader unauthenticated.
+/// `op_code` and `inode` are therefore bound into the record's associated data: an intact
+/// ciphertext relabelled onto another inode must fail to authenticate rather than graft one
+/// file's contents onto another. (Records no longer carry a `key_id` at all - a per-record
+/// copy of a volume-level fact was itself the downgrade vector, so it was removed rather
+/// than guarded.)
+#[test]
+fn test_tampered_record_header_is_rejected_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+    let master_key = appendfs::crypto::MasterKey::new([0x7Eu8; 32]);
+    let secret = b"PLAINTEXT_THAT_MUST_NEVER_BE_SERVED";
+
+    let (volume_header, volume_key) =
+        appendfs::crypto::VolumeHeader::new_encrypted(&master_key, [0x0Au8; 16], appendfs::crypto::KeySource::KeyFile)
+            .unwrap();
+    let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
+    appendfs::log::init_volume(storage.clone(), Some("main"), &volume_key, volume_header).unwrap();
+
+    let volume_key = std::sync::Arc::new(volume_key);
+    let ino = {
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            std::sync::Arc::new(appendfs::SystemClock),
+            volume_key.clone(),
+        )
+        .unwrap();
+        let writer = std::sync::Arc::new(
+            appendfs::LogWriter::create_lazy(
+                storage.clone(),
+                1,
+                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                volume_key.clone(),
+            )
+            .unwrap(),
+        );
+        fs.log_writer = Some(writer);
+        fs.set_log_dir(log_path);
+
+        let attr = appendfs::operations::read_write::create_core(&fs, 1, "secret.txt", 0o600, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, attr.ino, secret, 0).unwrap();
+        fs.sync_log().unwrap();
+        fs.export_summary(storage.as_ref()).unwrap();
+        attr.ino
+    };
+
+    // Sanity check: untouched, the file reads back correctly.
+    {
+        let fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            std::sync::Arc::new(appendfs::SystemClock),
+            volume_key.clone(),
+        )
+        .unwrap();
+        assert_eq!(fs.read_file_data(ino, 0, secret.len()).unwrap(), secret);
+    }
+
+    // Flip a bit in every record header's `inode` field, simulating an attacker with write
+    // access but no key. Layout is op_code(1) tx_id(8) inode(8) payload_len(4) checksum(4).
+    let log_file = log_path.join("000001.log");
+    let mut bytes = std::fs::read(&log_file).unwrap();
+    let header_size = appendfs::log::record::RECORD_HEADER_SIZE;
+    let mut off = appendfs::log::record::FILE_HEADER_SIZE;
+    let mut tampered = 0;
+    while off + header_size <= bytes.len() {
+        let payload_len = u32::from_le_bytes(bytes[off + 17..off + 21].try_into().unwrap()) as usize;
+        bytes[off + 9] ^= 0x01;
+        tampered += 1;
+        off += header_size + payload_len;
+    }
+    assert!(tampered > 0, "expected records to tamper with");
+    std::fs::write(&log_file, &bytes).unwrap();
+
+    // Whether it surfaces during replay or at read time, the one outcome that must never
+    // happen is the secret being returned as though nothing were wrong.
+    let recovered = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        std::sync::Arc::new(appendfs::SystemClock),
+        volume_key.clone(),
+    );
+
+    match recovered {
+        Err(_) => {}
+        Ok(fs) => match fs.read_file_data(ino, 0, secret.len()) {
+            Err(_) => {}
+            Ok(data) => {
+                assert_ne!(data.as_slice(), secret.as_slice(), "tampering served the plaintext");
+                panic!(
+                    "tampered header was accepted, returning {} bytes instead of an error",
+                    data.len()
+                );
+            }
+        },
+    }
+}
+
+/// A volume must record which credentials open it, so a mount asks for the right thing.
+///
+/// Without this the CLI can only infer the credential type from which flags were passed, and
+/// a wrong guess is indistinguishable from a wrong credential - both just fail the key check.
+#[test]
+fn test_key_source_round_trips_through_the_volume_header() {
+    use appendfs::crypto::KeySource;
+
+    for (source, needs_file, needs_pass) in [
+        (KeySource::Passphrase, false, true),
+        (KeySource::KeyFile, true, false),
+        (KeySource::KeyFileAndPassphrase, true, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+        let master = appendfs::crypto::MasterKey::new([0x5Cu8; 32]);
+
+        let (header, key) = appendfs::crypto::VolumeHeader::new_encrypted(&master, [0x11u8; 16], source).unwrap();
+        assert_eq!(header.key_source.needs_key_file(), needs_file, "{:?}", source);
+        assert_eq!(header.key_source.needs_passphrase(), needs_pass, "{:?}", source);
+
+        appendfs::log::init_volume(storage.clone(), Some("main"), &key, header).unwrap();
+
+        // The mode must survive the round trip through the plaintext header blob, and be
+        // readable without any credential at all - that is what lets a mount know what to
+        // ask for before it can ask for it.
+        let read_back = appendfs::log::SummaryReader::read_volume_header(storage.as_ref(), "000000.summary").unwrap();
+        assert_eq!(read_back.key_source, source);
+        assert!(read_back.unlock(&master).is_ok());
+    }
+
+    // A plaintext volume reports no credential at all.
+    let dir = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        &appendfs::VolumeKey::plaintext(),
+        appendfs::VolumeHeader::plaintext(),
+    )
+    .unwrap();
+    let read_back = appendfs::log::SummaryReader::read_volume_header(storage.as_ref(), "000000.summary").unwrap();
+    assert_eq!(read_back.key_source, KeySource::None);
+    assert!(!read_back.key_source.needs_key_file());
+    assert!(!read_back.key_source.needs_passphrase());
+}
+
+/// An encrypted volume may not describe itself as having no key source.
+#[test]
+fn test_encrypted_volume_rejects_none_key_source() {
+    use appendfs::crypto::KeySource;
+    let master = appendfs::crypto::MasterKey::new([0x01u8; 32]);
+    assert!(appendfs::crypto::VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::None).is_err());
+}
+
+/// A rewritten summary footer must produce an error, never a panic or a huge allocation.
+///
+/// The footer's BLAKE3 checksum carries no key, so anyone able to modify the file can
+/// recompute it; every offset and count it holds is therefore attacker-controlled and has to
+/// be bounds-checked before it indexes the decrypted body or sizes a buffer.
+#[test]
+fn test_forged_summary_offsets_error_rather_than_panic() {
+    use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
+
+    /// Rewrites `000000.summary` via `edit`, restoring the whole-file checksum so the edit
+    /// gets past the bitrot check and reaches the code under test.
+    fn tamper(dir: &std::path::Path, edit: impl FnOnce(&mut Vec<u8>)) {
+        let path = dir.join("000000.summary");
+        let mut bytes = std::fs::read(&path).unwrap();
+        edit(&mut bytes);
+        let n = bytes.len();
+        let digest = blake3::hash(&bytes[..n - 60]);
+        bytes[n - 32..].copy_from_slice(digest.as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+    }
+
+    for (name, edit) in [
+        (
+            "manifest_offset past the body",
+            Box::new(|b: &mut Vec<u8>| {
+                let n = b.len();
+                b[n - 60..n - 52].copy_from_slice(&(1u64 << 40).to_le_bytes());
+            }) as Box<dyn FnOnce(&mut Vec<u8>)>,
+        ),
+        (
+            "index_offset past the body",
+            Box::new(|b: &mut Vec<u8>| {
+                let n = b.len();
+                b[n - 52..n - 44].copy_from_slice(&(1u64 << 40).to_le_bytes());
+            }),
+        ),
+        (
+            "absurd entry_count",
+            Box::new(|b: &mut Vec<u8>| {
+                let n = b.len();
+                b[n - 44..n - 36].copy_from_slice(&u64::MAX.to_le_bytes());
+            }),
+        ),
+        (
+            "oversized volume_header_len",
+            Box::new(|b: &mut Vec<u8>| {
+                b[56..60].copy_from_slice(&u32::MAX.to_le_bytes());
+            }),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+        let master = MasterKey::new([0x33u8; 32]);
+        let (header, key) = VolumeHeader::new_encrypted(&master, [0x44u8; 16], KeySource::KeyFile).unwrap();
+        appendfs::log::init_volume(storage.clone(), Some("main"), &key, header).unwrap();
+
+        tamper(dir.path(), edit);
+
+        let opened = appendfs::log::SummaryReader::open(storage.as_ref(), "000000.summary", std::sync::Arc::new(key));
+        assert!(opened.is_err(), "{}: forged summary opened successfully", name);
+    }
+}
+
+/// A header/key pair that disagrees must be refused rather than written.
+///
+/// The header is stored in plaintext while the key encrypts the body, so a mismatched pair
+/// yields a summary that advertises itself as unencrypted yet cannot be reopened by the key
+/// that wrote it.
+#[test]
+fn test_export_refuses_a_mismatched_header_and_key() {
+    use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage: std::sync::Arc<dyn appendfs::storage::Storage> =
+        std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+    let master = MasterKey::new([0x55u8; 32]);
+    let (_header, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile).unwrap();
+
+    // `with_log` adopts the writer's encrypted key while the header stays at its plaintext
+    // default - the pairing this guard exists to catch.
+    let writer = std::sync::Arc::new(
+        appendfs::LogWriter::create_lazy(
+            storage.clone(),
+            1,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            std::sync::Arc::new(key),
+        )
+        .unwrap(),
+    );
+    let fs = appendfs::InMemoryFS::with_log(writer);
+
+    let err = fs.export_summary(storage.as_ref()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("refusing to export an unreadable summary"),
+        "unexpected error: {}",
+        err
     );
 }

@@ -934,7 +934,15 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     let dir = tempfile::tempdir().unwrap();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(dir.path()));
     let clock = SystemClock;
-    let writer = LogWriter::create(storage.clone(), 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+    let writer = LogWriter::create(
+        storage.clone(),
+        1,
+        &clock,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap();
 
     // Batch 1: mkdir "committed_dir" under root (ino 1), properly committed with a
     // trailing FlushCommit - simulates a flush() call that completed successfully.
@@ -978,7 +986,13 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     writer.sync().unwrap();
     drop(writer);
 
-    let recovered = recover_fs(storage, appendfs::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+    let recovered = recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap();
     let map = recovered.snapshot_all();
 
     let root = map.get(&1).unwrap();
@@ -1011,7 +1025,15 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(dir.path()));
     let clock = SystemClock;
-    let writer = LogWriter::create(storage.clone(), 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+    let writer = LogWriter::create(
+        storage.clone(),
+        1,
+        &clock,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap();
 
     let file_delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {
         attr_delta: LogAttrDelta {
@@ -1029,7 +1051,12 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     writer.sync().unwrap();
     drop(writer);
 
-    let result = recover_fs(storage, appendfs::RecoveryTarget::Latest, Arc::new(SystemClock));
+    let result = recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
+    );
     assert!(
         result.is_err(),
         "a FlushCommit with a mismatched record_count must fail recovery hard"
@@ -1044,7 +1071,15 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     let dir = tempfile::tempdir().unwrap();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(dir.path()));
     let clock = SystemClock;
-    let writer = LogWriter::create(storage.clone(), 1, &clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+    let writer = LogWriter::create(
+        storage.clone(),
+        1,
+        &clock,
+        appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+        1,
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap();
 
     let file_delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {
         attr_delta: LogAttrDelta {
@@ -1063,7 +1098,13 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     drop(writer);
 
     // Sanity check: recovery succeeds and sees the file before any corruption.
-    let recovered = recover_fs(storage.clone(), appendfs::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+    let recovered = recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap();
     assert!(recovered.get_attr(2).is_some());
     drop(recovered);
 
@@ -1081,7 +1122,12 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     file.write_all(&byte).unwrap();
     drop(file);
 
-    let result = recover_fs(storage, appendfs::RecoveryTarget::Latest, Arc::new(SystemClock));
+    let result = recover_fs(
+        storage,
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
+    );
     assert!(
         result.is_err(),
         "bitrot in a previously-committed record must be detected and hard-fail recovery, not be silently applied"
@@ -1542,6 +1588,7 @@ fn test_summary_export_is_deterministic() {
             replay_storage.clone(),
             appendfs::RecoveryTarget::Latest,
             Arc::new(clock.clone()),
+            appendfs::VolumeKey::plaintext_arc(),
         )
         .expect("recover_fs failed on replay");
         replayed.track_atime = false;

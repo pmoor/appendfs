@@ -56,6 +56,18 @@ pub enum Commands {
     Check(CheckArgs),
     /// Alias for check (filesystem consistency check)
     Fsck(CheckArgs),
+    /// Show a volume's encryption state and identity (no key required)
+    Key(KeyArgs),
+}
+
+/// Arguments for `key`, which reports a volume's encryption state.
+///
+/// Whether a volume is encrypted is fixed at `init` and cannot be changed afterwards, so
+/// there is nothing here to toggle - only to inspect.
+#[derive(Args, Debug)]
+pub struct KeyArgs {
+    /// Volume log directory
+    pub log_dir: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -66,6 +78,10 @@ pub struct DumpArgs {
     /// Verbosity level (-v for record details, -vv for full hex/ASCII payload dumps)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Path to key file for decrypting records (64 hex characters)
+    #[arg(long = "key-file")]
+    pub key_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -76,6 +92,37 @@ pub struct InitArgs {
     /// Initial branch name (default: "main")
     #[arg(long = "branch", default_value = "main")]
     pub branch: String,
+
+    /// Encrypt with ChaCha20-Poly1305, unlocked by a key file: 64 hex characters, e.g. from
+    /// `openssl rand -hex 32`
+    ///
+    /// Add --passphrase to require both, so a stolen key file alone is useless.
+    #[arg(long = "key-file")]
+    pub key_file: Option<PathBuf>,
+
+    /// Encrypt with ChaCha20-Poly1305, unlocked by a passphrase prompted for interactively
+    ///
+    /// Combine with --key-file to require both.
+    #[arg(long = "passphrase", default_value_t = false)]
+    pub passphrase: bool,
+}
+
+impl InitArgs {
+    /// Resolves the requested credential mode from the encryption flags.
+    ///
+    /// The two flags are orthogonal and between them name every mode, so there is no
+    /// separate "encrypt" switch: naming a credential *is* the request to encrypt, and
+    /// naming none leaves the volume plaintext. Whichever mode this picks is recorded in the
+    /// volume and required at every mount thereafter; it cannot be changed later.
+    pub fn key_source(&self) -> crate::crypto::KeySource {
+        use crate::crypto::KeySource;
+        match (self.key_file.is_some(), self.passphrase) {
+            (true, true) => KeySource::KeyFileAndPassphrase,
+            (true, false) => KeySource::KeyFile,
+            (false, true) => KeySource::Passphrase,
+            (false, false) => KeySource::None,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -113,6 +160,10 @@ pub struct MountArgs {
     /// Additional raw FUSE options passed to libfuse (e.g. -o allow_other)
     #[arg(short = 'o', value_delimiter = ',')]
     pub fuse_options: Vec<String>,
+
+    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
+    #[arg(long = "key-file")]
+    pub key_file: Option<PathBuf>,
 }
 
 impl MountArgs {
@@ -157,6 +208,10 @@ pub struct MountRoArgs {
     /// Additional raw FUSE options passed to libfuse (e.g. -o allow_other)
     #[arg(short = 'o', value_delimiter = ',')]
     pub fuse_options: Vec<String>,
+
+    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
+    #[arg(long = "key-file")]
+    pub key_file: Option<PathBuf>,
 }
 
 impl MountRoArgs {
@@ -178,6 +233,10 @@ impl MountRoArgs {
 pub struct StatsArgs {
     /// Directory path where the appendfs volume log and summary files are stored
     pub log_dir: PathBuf,
+
+    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
+    #[arg(long = "key-file")]
+    pub key_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -192,6 +251,10 @@ pub struct CheckArgs {
     /// Verbosity level (-v for detailed integrity check report)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
+    #[arg(long = "key-file")]
+    pub key_file: Option<PathBuf>,
 }
 
 /// Helper scanning `storage` for existing `.log` files to find the highest generation number.

@@ -358,7 +358,37 @@ impl InMemoryFS {
         let next_inode = self.next_inode.load(Ordering::SeqCst);
         let manifest = self.manifest.read().unwrap().clone();
         let now = self.clock.now();
-        crate::log::summary::export_summary(&snapshot, &manifest, storage, generation, last_tx_id, next_inode, now)
+
+        // The header goes into the summary in plaintext while the key encrypts its body, so
+        // a pair that disagrees writes a snapshot nothing can reopen - it would advertise
+        // itself as unencrypted to `resolve_volume_key` while holding an encrypted body.
+        // Refuse rather than emit one. `InMemoryFS::with_log` can produce such a pair, since
+        // it adopts the writer's key while the header stays at its plaintext default.
+        if self.volume_header.cipher != self.volume_key.cipher() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to export an unreadable summary: volume header describes a {} volume \
+                     but the key in use is for {}",
+                    self.volume_header.cipher,
+                    self.volume_key.cipher()
+                ),
+            ));
+        }
+
+        crate::log::summary::export_summary(
+            &crate::log::summary::SummarySnapshot {
+                inodes: &snapshot,
+                manifest: &manifest,
+                volume_header: &self.volume_header,
+                generation,
+                last_tx_id,
+                next_inode,
+                created_at: now,
+            },
+            storage,
+            &self.volume_key,
+        )
     }
 
     pub fn sync_and_export_summary(&self) -> std::io::Result<Option<String>> {
@@ -429,7 +459,17 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
         let clock = SystemClock;
-        let writer = Arc::new(LogWriter::create(storage, 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_log(writer);
 
         let ino = fs.allocate_inode();
@@ -496,91 +536,120 @@ mod tests {
     }
 
     /// A write far larger than `max_extent_size` must be emitted as several capped records
-    /// rather than one huge one, and must still read back byte-for-byte - including
-    /// sub-ranges that straddle chunk boundaries, and after a full replay from the log.
+    /// rather than one huge one, so that reading any byte of it decrypts only its own chunk.
+    /// Runs over both a plaintext and an encrypted volume: the cap is not conditional on
+    /// encryption, and the read path differs between the two (direct seek vs decrypt).
     #[test]
     fn test_large_write_is_split_into_capped_extents() {
         const CAP: usize = 1024;
         // Deliberately not a multiple of CAP, so the final chunk is a partial one.
         const TOTAL: usize = 8 * CAP + 300;
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        for encrypted in [false, true] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
 
-        let writer = Arc::new(
-            LogWriter::create(
-                Arc::clone(&storage),
-                1,
-                &SystemClock,
-                crate::cli::DEFAULT_MAX_LOG_SIZE,
-                1,
-            )
-            .unwrap(),
-        );
-        let mut fs = InMemoryFS::with_log(writer);
-        fs.max_extent_size = CAP;
-
-        let ino = fs.allocate_inode();
-        fs.insert_new_node(
-            ino,
-            NodeDelta::File(FileDelta {
-                attr_delta: AttrDelta {
-                    mode: Some(0o644),
-                    nlink: Some(1),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-        );
-        fs.add_dir_entry(1, "big.bin", ino, SystemTime::now());
-
-        // A single contiguous write many times larger than the cap.
-        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
-        write_core(&fs, ino, &payload, 0).unwrap();
-        fs.sync_log().unwrap();
-
-        {
-            let base = fs.base.read().unwrap();
-            let node = base.get(&ino).expect("inode missing in base");
-            if let NodeKind::File { range_map, size, .. } = &node.kind {
-                assert_eq!(*size as usize, TOTAL);
-                assert_eq!(
-                    range_map.len(),
-                    TOTAL.div_ceil(CAP),
-                    "expected one extent per capped chunk"
-                );
-                for (_, entry) in range_map.iter() {
-                    assert!(
-                        entry.length as usize <= CAP,
-                        "extent of {} bytes exceeds the {} byte cap",
-                        entry.length,
-                        CAP
-                    );
-                }
+            let volume_key = if encrypted {
+                let master = crate::crypto::MasterKey::new([0x42u8; 32]);
+                let (_, key) =
+                    crate::crypto::VolumeHeader::new_encrypted(&master, [0u8; 16], crate::crypto::KeySource::KeyFile)
+                        .unwrap();
+                Arc::new(key)
             } else {
-                panic!("expected NodeKind::File in base");
-            }
-        }
+                crate::crypto::VolumeKey::plaintext_arc()
+            };
 
-        // Whole-file and sub-range reads, including ranges straddling chunk boundaries.
-        assert_eq!(fs.read_file_data(ino, 0, TOTAL).unwrap(), payload);
-        for (off, len) in [(0usize, 10usize), (CAP - 5, 10), (CAP * 3 + 7, CAP), (TOTAL - 10, 10)] {
+            let writer = Arc::new(
+                LogWriter::create(
+                    Arc::clone(&storage),
+                    1,
+                    &SystemClock,
+                    crate::cli::DEFAULT_MAX_LOG_SIZE,
+                    1,
+                    Arc::clone(&volume_key),
+                )
+                .unwrap(),
+            );
+            let mut fs = InMemoryFS::with_log(writer);
+            fs.max_extent_size = CAP;
+
+            let ino = fs.allocate_inode();
+            fs.insert_new_node(
+                ino,
+                NodeDelta::File(FileDelta {
+                    attr_delta: AttrDelta {
+                        mode: Some(0o644),
+                        nlink: Some(1),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            );
+            fs.add_dir_entry(1, "big.bin", ino, SystemTime::now());
+
+            // A single contiguous write many times larger than the cap.
+            let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+            write_core(&fs, ino, &payload, 0).unwrap();
+            fs.sync_log().unwrap();
+
+            {
+                let base = fs.base.read().unwrap();
+                let node = base.get(&ino).expect("inode missing in base");
+                if let NodeKind::File { range_map, size, .. } = &node.kind {
+                    assert_eq!(*size as usize, TOTAL);
+                    assert_eq!(
+                        range_map.len(),
+                        TOTAL.div_ceil(CAP),
+                        "expected one extent per capped chunk (encrypted={})",
+                        encrypted
+                    );
+                    for (_, entry) in range_map.iter() {
+                        assert!(
+                            entry.length as usize <= CAP,
+                            "extent of {} bytes exceeds the {} byte cap (encrypted={})",
+                            entry.length,
+                            CAP,
+                            encrypted
+                        );
+                    }
+                } else {
+                    panic!("expected NodeKind::File in base");
+                }
+            }
+
+            // Whole-file and sub-range reads, including ranges straddling chunk boundaries.
             assert_eq!(
-                fs.read_file_data(ino, off as u64, len).unwrap(),
-                payload[off..off + len],
-                "sub-range read at {}..{}",
-                off,
-                off + len
+                fs.read_file_data(ino, 0, TOTAL).unwrap(),
+                payload,
+                "encrypted={}",
+                encrypted
+            );
+            for (off, len) in [(0usize, 10usize), (CAP - 5, 10), (CAP * 3 + 7, CAP), (TOTAL - 10, 10)] {
+                assert_eq!(
+                    fs.read_file_data(ino, off as u64, len).unwrap(),
+                    payload[off..off + len],
+                    "sub-range read at {}..{} (encrypted={})",
+                    off,
+                    off + len,
+                    encrypted
+                );
+            }
+
+            // The split must survive a full replay from the log.
+            let recovered = crate::log::recover_fs(
+                Arc::clone(&storage),
+                crate::RecoveryTarget::Latest,
+                Arc::new(SystemClock),
+                volume_key,
+            )
+            .unwrap();
+            assert_eq!(
+                recovered.read_file_data(ino, 0, TOTAL).unwrap(),
+                payload,
+                "after recovery (encrypted={})",
+                encrypted
             );
         }
-
-        // The split must survive a full replay from the log.
-        let recovered = crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
-        assert_eq!(
-            recovered.read_file_data(ino, 0, TOTAL).unwrap(),
-            payload,
-            "after recovery"
-        );
     }
 
     /// The core property a hole has to have: once the data it covers is durable in `base`,
@@ -598,6 +667,7 @@ mod tests {
                 &SystemClock,
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
                 1,
+                crate::crypto::VolumeKey::plaintext_arc(),
             )
             .unwrap(),
         );
@@ -652,14 +722,20 @@ mod tests {
             Arc::clone(&storage),
             crate::RecoveryTarget::Latest,
             Arc::new(SystemClock),
+            crate::crypto::VolumeKey::plaintext_arc(),
         )
         .unwrap();
         assert_eq!(from_log.get_attr(ino).unwrap().size, 1000);
         expect_holed(&from_log.read_file_data(ino, 0, 1000).unwrap());
 
         fs.sync_and_export_summary().unwrap();
-        let from_summary =
-            crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let from_summary = crate::log::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         assert_eq!(from_summary.get_attr(ino).unwrap().size, 1000);
         expect_holed(&from_summary.read_file_data(ino, 0, 1000).unwrap());
     }
@@ -679,6 +755,7 @@ mod tests {
                 &SystemClock,
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
                 1,
+                crate::crypto::VolumeKey::plaintext_arc(),
             )
             .unwrap(),
         );
@@ -724,7 +801,13 @@ mod tests {
 
         // And it must still hold once flushed and replayed.
         fs.sync_log().unwrap();
-        let recovered = crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let recovered = crate::log::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let rec = recovered.read_file_data(ino, 0, 1000).unwrap();
         assert_eq!(&rec[..100], &payload[..100]);
         assert!(rec[100..].iter().all(|&b| b == 0), "after recovery");
@@ -799,8 +882,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         let ino1 = fs.allocate_inode();
@@ -848,7 +940,13 @@ mod tests {
         assert!(storage.exists(&summary_file));
 
         // Recover filesystem and verify manifest is restored identically
-        let recovered = crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, clock.clone()).unwrap();
+        let recovered = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            clock.clone(),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let recovered_stats = recovered.calculate_generation_live_stats();
         assert_eq!(recovered_stats.len(), 1);
         assert_eq!(recovered_stats[0].generation, 1);
@@ -862,8 +960,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Create /Gletscher, /Gletscher/sub, and files
@@ -909,11 +1016,17 @@ mod tests {
         assert_eq!(stats_after[0].live_extents, 0);
 
         // 3. Inspect the log dump to verify InodeDelta records were written
-        let dump_text = crate::dump::dump_log_file(storage.as_ref(), "000001.log", 1).unwrap();
+        let dump_text = crate::dump::dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
         assert!(dump_text.contains("InodeDelta"));
 
         // 4. Recover filesystem and verify no orphaned nodes remain
-        let recovered = crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, clock.clone()).unwrap();
+        let recovered = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            clock.clone(),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let base = recovered.base.read().unwrap();
         assert_eq!(base.len(), 1); // ONLY root directory (inode 1) remains!
         assert!(base.contains_key(&1));
@@ -928,8 +1041,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Create /keep and /Gletscher directories
@@ -970,7 +1092,13 @@ mod tests {
         assert_eq!(stats2[0].live_extents, 1);
 
         // 5. Crash-recovery: Recover filesystem and verify /keep/shared.txt survived with full data!
-        let recovered = crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, clock).unwrap();
+        let recovered = crate::log::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            clock,
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let rec_file_attr = recovered
             .get_attr(file_attr.ino)
             .expect("shared.txt must survive recovery");
@@ -989,7 +1117,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
         // Set small operation threshold of 5 ops
         fs.max_staged_ops = 5;
@@ -1015,8 +1153,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // Create a temp file
@@ -1037,7 +1184,13 @@ mod tests {
         fs.sync_log().unwrap();
 
         // Recover filesystem from log
-        let recovered = crate::log::recover_fs(storage, crate::RecoveryTarget::Latest, clock).unwrap();
+        let recovered = crate::log::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            clock,
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let base = recovered.base.read().unwrap();
 
         // Only root inode (1) should exist; NO resurrected /file_{ino} or phantom entries!
@@ -1054,7 +1207,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // Create file and write 100 bytes (0xAA)
@@ -1171,11 +1334,27 @@ mod tests {
         let fault_storage = crate::storage::FaultStorage::new(mem);
         let storage = Arc::new(fault_storage.clone());
 
-        crate::log::init_volume(storage.clone(), Some("main")).unwrap();
+        crate::log::init_volume(
+            storage.clone(),
+            Some("main"),
+            &crate::crypto::VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
         let clock = Arc::new(SystemClock);
         // Set tiny max_log_size (50 bytes) so the next flush rolls to 000002.log
-        let writer = Arc::new(LogWriter::create(storage.clone(), 1, &*clock, 50, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                50,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage.clone());
         fs.log_writer = Some(writer);
 
@@ -1231,7 +1410,13 @@ mod tests {
         assert_eq!(&d3, b"third payload");
 
         // 7. Crash-recovery: Recover filesystem and verify all files recovered cleanly
-        let recovered = crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, clock.clone()).unwrap();
+        let recovered = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            clock.clone(),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         assert!(recovered.get_attr(f1.ino).is_some());
         assert!(recovered.get_attr(f2.ino).is_some());
         assert!(recovered.get_attr(f3.ino).is_some());
@@ -1249,8 +1434,17 @@ mod tests {
         let fault_storage = crate::storage::FaultStorage::new(mem);
         let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
         // 1. Initial batch with 2 files flushed cleanly
@@ -1301,8 +1495,13 @@ mod tests {
         assert_eq!(fs.flushing.read().unwrap().len(), 0);
 
         // 8. Recover filesystem and verify 100% data integrity without checksum mismatches!
-        let recovered = crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, clock.clone())
-            .expect("Recovery must succeed cleanly");
+        let recovered = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            clock.clone(),
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .expect("Recovery must succeed cleanly");
         for ino in initial_inos {
             assert!(recovered.get_attr(ino).is_some());
             let d = crate::operations::read_write::read_core(&recovered, ino, 15, 0).unwrap();
@@ -1314,7 +1513,8 @@ mod tests {
             assert_eq!(d, payload);
         }
 
-        let report = crate::check::check_volume(storage.clone(), true).unwrap();
+        let report =
+            crate::check::check_volume(storage.clone(), true, crate::crypto::VolumeKey::plaintext_arc()).unwrap();
         assert!(report.is_clean(), "Integrity check must be clean: {:?}", report.issues);
     }
 
@@ -1324,8 +1524,17 @@ mod tests {
         let fault_storage = crate::storage::FaultStorage::new(mem);
         let storage = Arc::new(fault_storage.clone());
         let clock = Arc::new(SystemClock);
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
         fs.max_staged_ops = 1; // freeze a batch on every mutation
         fs.max_flush_queue_depth = 4;

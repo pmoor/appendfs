@@ -478,6 +478,7 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
         replay_storage.clone(),
         appendfs::RecoveryTarget::Latest,
         Arc::new(SystemClock),
+        appendfs::VolumeKey::plaintext_arc(),
     )
     .unwrap_or_else(|e| panic!("recover_fs failed on replay (seed {}): {}", seed, e));
     replayed.track_atime = false;
@@ -494,8 +495,14 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
     // record, has no way to see that gap. That never corrupts anything (the skipped
     // number was never live-assigned to any real node, so reusing it post-recovery
     // can't collide with one); it's excluded here deliberately, not overlooked.
-    let written_reader = SummaryReader::open(storage.as_ref(), &written_file).unwrap();
-    let regenerated_reader = SummaryReader::open(replay_storage.as_ref(), &regenerated_file).unwrap();
+    let written_reader =
+        SummaryReader::open(storage.as_ref(), &written_file, appendfs::VolumeKey::plaintext_arc()).unwrap();
+    let regenerated_reader = SummaryReader::open(
+        replay_storage.as_ref(),
+        &regenerated_file,
+        appendfs::VolumeKey::plaintext_arc(),
+    )
+    .unwrap();
     let written_inodes = written_reader.read_all_inodes().unwrap();
     let regenerated_inodes = regenerated_reader.read_all_inodes().unwrap();
 
@@ -585,7 +592,7 @@ fn dump_log_records_for_inode(log_dir: &std::path::Path, ino: u64) {
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let storage = OsStorage::new(parent);
-        let reader = match LogReader::open(&storage, filename) {
+        let reader = match LogReader::open(&storage, filename, appendfs::VolumeKey::plaintext_arc()) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("    (failed to open {:?}: {})", path, e);
@@ -636,7 +643,7 @@ fn dump_preserved_repro() {
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let storage = OsStorage::new(parent);
-        let reader = LogReader::open(&storage, filename).unwrap();
+        let reader = LogReader::open(&storage, filename, appendfs::VolumeKey::plaintext_arc()).unwrap();
         for rec in reader {
             let rec = rec.unwrap();
             let decoded = rec.decode().ok();
@@ -653,7 +660,17 @@ fn run_concurrent_stress(seed: u64) {
     let log_dir = temp_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_dir));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let writer = Arc::new(LogWriter::create(storage, 1, &*clock, appendfs::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+    let writer = Arc::new(
+        LogWriter::create(
+            storage,
+            1,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap(),
+    );
     let mut fs = InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
     // Reads bump atime in memory but are never logged (logging every read would defeat
     // the point of an append-only log), so with atime tracking on, a live instance and

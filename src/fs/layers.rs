@@ -288,7 +288,7 @@ impl<'a> InodeLayerStack<'a> {
                             ext_start,
                             ext_len,
                             &shared_state,
-                        );
+                        )?;
                     }
                 }
                 _ => {}
@@ -308,7 +308,7 @@ impl<'a> InodeLayerStack<'a> {
                             ext_start,
                             ext_len,
                             &shared_state,
-                        );
+                        )?;
                     }
                 }
             }
@@ -331,11 +331,11 @@ impl InMemoryFS {
         ext_start: u64,
         ext_len: u64,
         shared_state: &SharedExtentState,
-    ) {
+    ) -> Result<(), i32> {
         let seg_start = std::cmp::max(read_start, ext_start);
         let seg_end = std::cmp::min(read_start + read_len, ext_start + ext_len);
         if seg_start >= seg_end {
-            return;
+            return Ok(());
         }
 
         let seg_len = (seg_end - seg_start) as usize;
@@ -343,7 +343,7 @@ impl InMemoryFS {
         let slice_inner_offset = (seg_start - ext_start) as usize;
 
         if filled[dst_offset..dst_offset + seg_len].iter().all(|&b| b) {
-            return;
+            return Ok(());
         }
 
         let mut temp_buf = vec![0u8; seg_len];
@@ -376,15 +376,22 @@ impl InMemoryFS {
                 payload_offset,
                 length: _,
             } => {
-                if let Some(ref cache) = self.log_cache
-                    && let Ok(reader) = cache.get_or_open(generation)
-                {
-                    let disk_seek_pos = record_log_offset
-                        + crate::log::RECORD_HEADER_SIZE as u64
-                        + payload_offset as u64
-                        + slice_inner_offset as u64;
-                    if reader.read_exact_at(disk_seek_pos, &mut temp_buf).is_ok() {
-                        bytes_read = seg_len;
+                if let Some(ref cache) = self.log_cache {
+                    match cache.read_extent_payload(
+                        generation,
+                        record_log_offset,
+                        payload_offset,
+                        slice_inner_offset as u32,
+                        &mut temp_buf[..seg_len],
+                        &self.volume_key,
+                    ) {
+                        Ok(n) => bytes_read = n,
+                        // A Disk extent is authoritative for these bytes. Swallowing the
+                        // error would leave the segment unfilled, so the read falls through
+                        // to lower layers and ultimately returns zeros - turning bitrot, a
+                        // failed I/O, or a detected AEAD forgery into silent, plausible
+                        // data. Report it instead.
+                        Err(_) => return Err(libc::EIO),
                     }
                 }
             }
@@ -396,6 +403,8 @@ impl InMemoryFS {
                 filled[dst_offset + i] = true;
             }
         }
+
+        Ok(())
     }
 }
 

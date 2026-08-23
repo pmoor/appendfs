@@ -15,16 +15,22 @@ struct ActiveLogFile {
 }
 
 enum ActiveLogState {
-    Unopened { generation: u64 },
+    Unopened {
+        generation: u64,
+        created_at: Option<std::time::SystemTime>,
+    },
     Open(ActiveLogFile),
 }
 
-fn open_generation_file(storage: &Arc<dyn Storage>, generation: u64, clock: &dyn Clock) -> io::Result<ActiveLogFile> {
+fn open_generation_file(
+    storage: &Arc<dyn Storage>,
+    generation: u64,
+    created_at: std::time::SystemTime,
+) -> io::Result<ActiveLogFile> {
     let filename = format!("{:06}.log", generation);
     let mut writer = storage.open_writer(&filename, WriteMode::CreateNew)?;
 
-    let now = clock.now();
-    let file_header = FileHeader::new(generation, now);
+    let file_header = FileHeader::new(generation, created_at);
     let header_bytes = file_header.to_bytes();
     writer.append(&header_bytes)?;
     writer.sync()?;
@@ -37,12 +43,15 @@ fn open_generation_file(storage: &Arc<dyn Storage>, generation: u64, clock: &dyn
     })
 }
 
+use crate::crypto::VolumeKey;
+
 /// Active log writer managing append-only writes to generation log files with automatic rolling.
 pub struct LogWriter {
     active_state: Mutex<ActiveLogState>,
     tx_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
+    volume_key: Arc<VolumeKey>,
     _lock: Option<Box<dyn crate::storage::StorageLock>>,
 }
 
@@ -51,6 +60,7 @@ impl std::fmt::Debug for LogWriter {
         f.debug_struct("LogWriter")
             .field("tx_id", &self.tx_id.load(Ordering::Relaxed))
             .field("max_log_size", &self.max_log_size)
+            .field("cipher", &self.volume_key.cipher())
             .finish()
     }
 }
@@ -63,33 +73,46 @@ impl LogWriter {
         clock: &dyn Clock,
         max_log_size: u64,
         start_tx_id: u64,
+        volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
-        let active_file = open_generation_file(&storage, generation, clock)?;
+        let active_file = open_generation_file(&storage, generation, clock.now())?;
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Open(active_file)),
             tx_id: AtomicU64::new(start_tx_id),
             storage,
             max_log_size,
+            volume_key,
             _lock: Some(lock),
         })
     }
 
-    /// Creates a lazy log writer backed by a custom `Storage` instance.
+    /// Creates a lazy log writer backed by a custom `Storage` instance. The generation file
+    /// is not created until the first append or roll.
     pub fn create_lazy(
         storage: Arc<dyn Storage>,
         generation: u64,
         max_log_size: u64,
         start_tx_id: u64,
+        volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
         Ok(Self {
-            active_state: Mutex::new(ActiveLogState::Unopened { generation }),
+            active_state: Mutex::new(ActiveLogState::Unopened {
+                generation,
+                created_at: None,
+            }),
             tx_id: AtomicU64::new(start_tx_id),
             storage,
             max_log_size,
+            volume_key,
             _lock: Some(lock),
         })
+    }
+
+    /// Returns the active VolumeHeader used to encrypt record payloads.
+    pub fn volume_key(&self) -> &Arc<VolumeKey> {
+        &self.volume_key
     }
 
     /// Returns the underlying storage instance.
@@ -114,9 +137,10 @@ impl LogWriter {
         };
 
         match &mut *state {
-            ActiveLogState::Unopened { generation } => {
+            ActiveLogState::Unopened { generation, created_at } => {
                 let gen_num = *generation;
-                let active_file = open_generation_file(&self.storage, gen_num, clock)?;
+                let c_time = created_at.unwrap_or_else(|| clock.now());
+                let active_file = open_generation_file(&self.storage, gen_num, c_time)?;
                 *state = ActiveLogState::Open(active_file);
                 log::info!("Lazily opened initial log file for generation {}", gen_num);
                 Ok(Some(gen_num))
@@ -131,7 +155,7 @@ impl LogWriter {
                 active.writer.sync()?;
 
                 let next_gen = active.generation + 1;
-                let next_active = open_generation_file(&self.storage, next_gen, clock)?;
+                let next_active = open_generation_file(&self.storage, next_gen, clock.now())?;
 
                 log::info!("Rolled log file to generation {} ({})", next_gen, next_active.filename);
 
@@ -144,15 +168,6 @@ impl LogWriter {
     /// Appends a record (`RecordHeader` + payload bytes) to the active log file.
     pub fn append_record(&self, op_code: OpCode, inode: u64, payload: &[u8]) -> io::Result<(u64, u64, u64)> {
         let tx = self.tx_id.fetch_add(1, Ordering::SeqCst);
-        let header = RecordHeader {
-            op_code,
-            tx_id: tx,
-            inode,
-            payload_len: payload.len() as u32,
-            checksum: crate::log::record::checksum_payload(payload),
-        };
-        let header_bytes = header.to_bytes();
-        let total_bytes = header_bytes.len() + payload.len();
 
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
@@ -161,9 +176,10 @@ impl LogWriter {
 
         let active = match &mut *state {
             ActiveLogState::Open(a) => a,
-            ActiveLogState::Unopened { generation } => {
+            ActiveLogState::Unopened { generation, created_at } => {
                 let gen_num = *generation;
-                let active_file = open_generation_file(&self.storage, gen_num, &crate::clock::SystemClock)?;
+                let c_time = created_at.unwrap_or_else(std::time::SystemTime::now);
+                let active_file = open_generation_file(&self.storage, gen_num, c_time)?;
                 *state = ActiveLogState::Open(active_file);
                 match &mut *state {
                     ActiveLogState::Open(a) => a,
@@ -172,11 +188,27 @@ impl LogWriter {
             }
         };
 
+        let generation = active.generation;
+        let cipher_payload = self
+            .volume_key
+            .encrypt_record(generation, tx, op_code as u8, inode, payload)
+            .map_err(io::Error::other)?;
+
+        let header = RecordHeader {
+            op_code,
+            tx_id: tx,
+            inode,
+            payload_len: cipher_payload.len() as u32,
+            checksum: crate::log::record::checksum_payload(&cipher_payload),
+        };
+        let header_bytes = header.to_bytes();
+        let total_bytes = header_bytes.len() + cipher_payload.len();
+
         let record_log_offset = active.current_offset;
         let write_result = (|| -> io::Result<()> {
             active.writer.append(&header_bytes)?;
-            if !payload.is_empty() {
-                active.writer.append(payload)?;
+            if !cipher_payload.is_empty() {
+                active.writer.append(&cipher_payload)?;
             }
             Ok(())
         })();
@@ -189,7 +221,6 @@ impl LogWriter {
 
         active.current_offset += total_bytes as u64;
 
-        let generation = active.generation;
         Ok((tx, generation, record_log_offset))
     }
 
@@ -250,7 +281,7 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
         match &*state {
-            ActiveLogState::Unopened { generation } => *generation,
+            ActiveLogState::Unopened { generation, .. } => *generation,
             ActiveLogState::Open(active) => active.generation,
         }
     }
@@ -274,7 +305,7 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
         match &*state {
-            ActiveLogState::Unopened { generation } => format!("{:06}.log", generation),
+            ActiveLogState::Unopened { generation, .. } => format!("{:06}.log", generation),
             ActiveLogState::Open(active) => active.filename.clone(),
         }
     }
@@ -302,7 +333,15 @@ mod tests {
     fn test_log_writer_create_and_append() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         assert_eq!(writer.generation(), 1);
         let (tx, gen_num, offset) = writer.append_record(OpCode::Data, 100, b"test_data").unwrap();
@@ -315,7 +354,7 @@ mod tests {
     fn test_append_record_never_rolls_mid_batch() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 30, 1).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 30, 1, VolumeKey::plaintext_arc()).unwrap();
 
         for _ in 0..5 {
             let (_, gen_num, _) = writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
@@ -328,7 +367,7 @@ mod tests {
     fn test_roll_if_needed_rolls_between_batches() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 60, 1).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 60, 1, VolumeKey::plaintext_arc()).unwrap();
 
         writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
         assert_eq!(writer.generation(), 1);
@@ -344,13 +383,21 @@ mod tests {
     fn test_emit_flush_commit_round_trip() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
         writer.append_record(OpCode::Data, 1, b"more").unwrap();
         writer.emit_flush_commit(2, &clock).unwrap();
 
-        let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename())
+        let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename(), VolumeKey::plaintext_arc())
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
@@ -364,7 +411,8 @@ mod tests {
     fn test_lazy_log_writer_creates_no_file_until_first_write() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create_lazy(storage.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer =
+            LogWriter::create_lazy(storage.clone(), 1, DEFAULT_MAX_LOG_SIZE, 1, VolumeKey::plaintext_arc()).unwrap();
 
         assert!(!writer.is_open());
         assert_eq!(writer.generation(), 1);

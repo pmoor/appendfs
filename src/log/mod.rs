@@ -19,5 +19,7 @@ pub use record::{
     RECORD_HEADER_SIZE, RecordHeader, checksum_payload,
 };
 pub use recovery::{RecoveryTarget, recover_fs};
-pub use summary::{SummaryFooter, SummaryHeader, SummaryIndexEntry, SummaryReader, export_summary, init_volume};
+pub use summary::{
+    SummaryFooter, SummaryHeader, SummaryIndexEntry, SummaryReader, SummarySnapshot, export_summary, init_volume,
+};
 pub use writer::LogWriter;

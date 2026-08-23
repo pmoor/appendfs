@@ -1,4 +1,5 @@
 use appendfs::InMemoryFS;
+use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::log::RecoveryTarget;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -40,7 +41,13 @@ impl TestMount {
         let log_dir = tempfile::Builder::new().prefix("appendfs_log_").tempdir().unwrap();
         let log_path = log_dir.path().to_path_buf();
         let storage: Arc<dyn appendfs::storage::Storage> = Arc::new(appendfs::storage::OsStorage::new(&log_path));
-        appendfs::init_volume(storage.clone(), Some("main")).unwrap();
+        appendfs::init_volume(
+            storage.clone(),
+            Some("main"),
+            &VolumeKey::plaintext(),
+            VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
         let mount_dir = tempfile::Builder::new().prefix("appendfs_mnt_").tempdir().unwrap();
         let mount_path = mount_dir.path().to_path_buf();
@@ -50,13 +57,21 @@ impl TestMount {
             storage.clone(),
             appendfs::RecoveryTarget::Latest,
             Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
         let latest_gen = appendfs::find_latest_generation_in_storage(storage.as_ref());
         let next_gen = latest_gen + 1;
         let start_tx = fs.last_tx_id.load(Ordering::SeqCst) + 1;
         let writer = Arc::new(
-            appendfs::LogWriter::create_lazy(storage, next_gen, appendfs::cli::DEFAULT_MAX_LOG_SIZE, start_tx).unwrap(),
+            appendfs::LogWriter::create_lazy(
+                storage,
+                next_gen,
+                appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                start_tx,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
         );
         fs.log_writer = Some(writer);
         fs.set_log_dir(&log_path);
@@ -137,12 +152,18 @@ impl TestMount {
             storage.clone(),
             appendfs::RecoveryTarget::Latest,
             Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
         )
         .unwrap();
         let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
         let start_tx = fs.last_tx_id.load(Ordering::SeqCst) + 1;
-        let mut writer_res =
-            appendfs::LogWriter::create_lazy(storage.clone(), next_gen, appendfs::cli::DEFAULT_MAX_LOG_SIZE, start_tx);
+        let mut writer_res = appendfs::LogWriter::create_lazy(
+            storage.clone(),
+            next_gen,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            start_tx,
+            VolumeKey::plaintext_arc(),
+        );
         for _ in 0..20 {
             if writer_res.is_ok() {
                 break;
@@ -153,6 +174,7 @@ impl TestMount {
                 next_gen,
                 appendfs::cli::DEFAULT_MAX_LOG_SIZE,
                 start_tx,
+                VolumeKey::plaintext_arc(),
             );
         }
         let writer = Arc::new(writer_res.unwrap());
@@ -196,7 +218,13 @@ impl TestMount {
     pub fn remount_ro(&mut self, target: RecoveryTarget) {
         self.unmount();
         let storage: Arc<dyn appendfs::storage::Storage> = Arc::new(appendfs::storage::OsStorage::new(&self.log_path));
-        let mut fs = appendfs::log::recover_fs(storage, target, Arc::new(appendfs::SystemClock)).unwrap();
+        let mut fs = appendfs::log::recover_fs(
+            storage,
+            target,
+            Arc::new(appendfs::SystemClock),
+            appendfs::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         fs.set_log_dir(&self.log_path);
         fs.set_read_only(true);
 

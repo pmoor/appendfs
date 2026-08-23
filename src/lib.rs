@@ -1,6 +1,7 @@
 pub mod check;
 pub mod cli;
 pub mod clock;
+pub mod crypto;
 pub mod dump;
 pub mod fs;
 pub mod log;
@@ -11,9 +12,13 @@ pub mod shim;
 pub mod stats;
 pub mod storage;
 
+// Only the two types callers routinely name are lifted to the crate root; everything else
+// crypto exposes stays reachable at its canonical `appendfs::crypto::` path.
+pub use crypto::{VolumeHeader, VolumeKey};
+
 pub use check::{IntegrityIssue, IntegrityReport, IssueLevel, check_fs_integrity, check_volume};
 pub use cli::{
-    CheckArgs, Cli, Commands, DumpArgs, InitArgs, MountArgs, MountRoArgs, StatsArgs, find_latest_generation,
+    CheckArgs, Cli, Commands, DumpArgs, InitArgs, KeyArgs, MountArgs, MountRoArgs, StatsArgs, find_latest_generation,
     find_latest_generation_in_storage,
 };
 pub use clock::{AdvancingClock, Clock, MockClock, SystemClock, format_local_civil_time, parse_timestamp};

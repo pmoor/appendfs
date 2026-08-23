@@ -33,16 +33,19 @@ impl LogRecord {
     }
 }
 
+use crate::crypto::VolumeKey;
+
 /// Iterator for sequentially reading records from a `.log` generation file.
 pub struct LogReader {
     reader: Arc<dyn StorageReader>,
     header: FileHeader,
     current_offset: u64,
+    volume_key: Arc<VolumeKey>,
 }
 
 impl LogReader {
     /// Opens a `.log` file from a `Storage` instance, verifies its `FileHeader`, and initializes the iterator.
-    pub fn open(storage: &dyn Storage, filename: &str) -> io::Result<Self> {
+    pub fn open(storage: &dyn Storage, filename: &str, volume_key: Arc<VolumeKey>) -> io::Result<Self> {
         let reader = storage.open_reader(filename)?;
 
         let mut header_buf = [0u8; FILE_HEADER_SIZE];
@@ -54,6 +57,7 @@ impl LogReader {
             reader,
             header,
             current_offset: FILE_HEADER_SIZE as u64,
+            volume_key,
         })
     }
 
@@ -93,17 +97,17 @@ impl Iterator for LogReader {
             Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
         };
 
-        let mut payload = vec![0u8; header.payload_len as usize];
+        let mut raw_payload = vec![0u8; header.payload_len as usize];
         if let Err(e) = self
             .reader
-            .read_exact_at(record_offset + RECORD_HEADER_SIZE as u64, &mut payload)
+            .read_exact_at(record_offset + RECORD_HEADER_SIZE as u64, &mut raw_payload)
         {
             return Some(Err(e));
         }
 
         self.current_offset += RECORD_HEADER_SIZE as u64 + header.payload_len as u64;
 
-        let actual_checksum = crate::log::record::checksum_payload(&payload);
+        let actual_checksum = crate::log::record::checksum_payload(&raw_payload);
         if actual_checksum != header.checksum {
             return Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -114,9 +118,20 @@ impl Iterator for LogReader {
             )));
         }
 
+        let decrypted_payload = match self.volume_key.decrypt_record(
+            self.header.generation,
+            header.tx_id,
+            header.op_code as u8,
+            header.inode,
+            &raw_payload,
+        ) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e.into())),
+        };
+
         Some(Ok(LogRecord {
             header,
-            payload,
+            payload: decrypted_payload,
             record_log_offset: record_offset,
         }))
     }
@@ -126,6 +141,7 @@ impl Iterator for LogReader {
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
+    use crate::crypto::VolumeKey;
     use crate::log::record::OpCode;
     use crate::log::writer::LogWriter;
     use crate::storage::MemoryStorage;
@@ -134,13 +150,21 @@ mod tests {
     fn test_log_reader_iteration() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         writer.append_record(OpCode::Data, 2, b"payload1").unwrap();
         writer.append_record(OpCode::InodeDelta, 3, b"payload22").unwrap();
         writer.sync().unwrap();
 
-        let reader = LogReader::open(&storage, &writer.filename()).unwrap();
+        let reader = LogReader::open(&storage, &writer.filename(), VolumeKey::plaintext_arc()).unwrap();
         assert_eq!(reader.file_header().generation, 1);
 
         let records: Vec<LogRecord> = reader.map(|r| r.unwrap()).collect();

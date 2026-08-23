@@ -103,6 +103,17 @@ pub struct InMemoryFS {
     pub recovered_time: RwLock<Option<SystemTime>>,
     /// Serializes every directory-structure mutation (mkdir/create/symlink/unlink/rmdir/rename/link).
     pub dir_lock: Mutex<()>,
+    /// Active VolumeHeader holding unlocked Data Encryption Keys.
+    pub volume_key: Arc<crate::crypto::VolumeKey>,
+    /// Volume identity and key-check material, carried alongside the key it belongs to.
+    ///
+    /// Deliberately not part of `LogManifest`: the manifest describes log generation
+    /// lineage, and folding volume identity into it meant every encrypted summary stored
+    /// the header twice - once as the plaintext blob a reader actually consults, and again
+    /// inside the encrypted manifest where nothing read it. Two copies of a
+    /// security-relevant fact with nothing checking they agree is the shape of bug this
+    /// module has already paid for.
+    pub volume_header: crate::crypto::VolumeHeader,
 }
 
 impl InMemoryFS {
@@ -130,6 +141,12 @@ impl InMemoryFS {
         let log_cache = log_writer
             .as_ref()
             .map(|w| Arc::new(LogFileCache::with_storage(w.storage().clone())));
+
+        // The writer owns the volume's volume_key; without one this is a plaintext volume.
+        let volume_key = log_writer
+            .as_ref()
+            .map(|w| Arc::clone(w.volume_key()))
+            .unwrap_or_else(|| Arc::new(crate::crypto::VolumeKey::plaintext()));
 
         let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
         let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(start_gen, "main", now)));
@@ -165,6 +182,8 @@ impl InMemoryFS {
             read_only: std::sync::atomic::AtomicBool::new(false),
             recovered_time: RwLock::new(None),
             dir_lock: Mutex::new(()),
+            volume_key,
+            volume_header: crate::crypto::VolumeHeader::plaintext(),
         }
     }
 
@@ -172,6 +191,43 @@ impl InMemoryFS {
         let mut fs = Self::with_clock(clock);
         fs.set_storage(storage);
         fs
+    }
+
+    pub fn with_clock_storage_and_volume_key(
+        clock: Arc<dyn Clock>,
+        storage: Arc<dyn Storage>,
+        volume_key: Arc<crate::crypto::VolumeKey>,
+    ) -> Self {
+        let mut fs = Self::with_clock(clock);
+        fs.set_storage(storage);
+        fs.volume_key = volume_key;
+        fs
+    }
+
+    /// Sets the volume's header and key together, rejecting a pair that disagrees.
+    ///
+    /// The two are separate fields but describe one volume, and only agreeing values are
+    /// coherent: the header is written to the summary in plaintext while the key encrypts
+    /// its body, so a mismatched pair produces a snapshot that announces itself as
+    /// unencrypted yet cannot be reopened by the key that wrote it.
+    pub fn set_volume(
+        &mut self,
+        volume_header: crate::crypto::VolumeHeader,
+        volume_key: Arc<crate::crypto::VolumeKey>,
+    ) -> std::io::Result<()> {
+        if volume_header.cipher != volume_key.cipher() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "volume header describes a {} volume but the key is for {}",
+                    volume_header.cipher,
+                    volume_key.cipher()
+                ),
+            ));
+        }
+        self.volume_header = volume_header;
+        self.volume_key = volume_key;
+        Ok(())
     }
 
     pub fn set_read_only(&self, ro: bool) {

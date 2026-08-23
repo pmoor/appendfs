@@ -1,3 +1,4 @@
+use crate::crypto::VolumeKey;
 use crate::log::ExtentState;
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader, OpCode, RECORD_HEADER_SIZE, RecordHeader, checksum_payload};
 use crate::log::summary::{SUMMARY_MAGIC, SummaryReader};
@@ -6,10 +7,16 @@ use crate::storage::{Storage, StorageReader};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::io;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Dispatches dumping from a `Storage` instance based on magic bytes or extension.
-pub fn dump_file(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
+pub fn dump_file(
+    storage: &dyn Storage,
+    filename: &str,
+    verbosity: u8,
+    volume_key: Option<&VolumeKey>,
+) -> io::Result<String> {
     let reader = storage.open_reader(filename)?;
     let mut magic = [0u8; 4];
     if reader.len()? < 4 {
@@ -21,9 +28,9 @@ pub fn dump_file(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Re
     reader.read_exact_at(0, &mut magic)?;
 
     if magic == crate::log::record::FILE_MAGIC || filename.ends_with(".log") {
-        dump_log_reader_with_path(reader.as_ref(), Some(filename), verbosity)
+        dump_log_reader_with_path(reader.as_ref(), Some(filename), verbosity, volume_key)
     } else if &magic == SUMMARY_MAGIC || filename.ends_with(".summary") {
-        dump_summary_file(storage, filename, verbosity)
+        dump_summary_file(storage, filename, verbosity, volume_key)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -96,20 +103,26 @@ pub struct OpCodeStats {
 /// - `verbosity == 0`: File header, summary statistics, whole-file checksum, operations histogram, payload sizes histogram.
 /// - `verbosity == 1`: Summary + complete record list (op, tx_id, inode, offsets, payloads).
 /// - `verbosity >= 2`: Summary + all records + full hex/ASCII data dumps for writes.
-pub fn dump_log_file(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
+pub fn dump_log_file(
+    storage: &dyn Storage,
+    filename: &str,
+    verbosity: u8,
+    volume_key: Option<&VolumeKey>,
+) -> io::Result<String> {
     let reader = storage.open_reader(filename)?;
-    dump_log_reader_with_path(reader.as_ref(), Some(filename), verbosity)
+    dump_log_reader_with_path(reader.as_ref(), Some(filename), verbosity, volume_key)
 }
 
 /// Reads and analyzes a `.log` file from a `StorageReader`.
 pub fn dump_log_reader(reader: &dyn StorageReader, verbosity: u8) -> io::Result<String> {
-    dump_log_reader_with_path(reader, None, verbosity)
+    dump_log_reader_with_path(reader, None, verbosity, None)
 }
 
 pub fn dump_log_reader_with_path(
     reader: &dyn StorageReader,
     display_path: Option<&str>,
     verbosity: u8,
+    volume_key: Option<&VolumeKey>,
 ) -> io::Result<String> {
     let file_len = reader.len()?;
 
@@ -202,8 +215,8 @@ pub fn dump_log_reader_with_path(
             break;
         }
 
-        let mut payload = vec![0u8; header.payload_len as usize];
-        if let Err(e) = reader.read_exact_at(record_offset + RECORD_HEADER_SIZE as u64, &mut payload) {
+        let mut raw_payload = vec![0u8; header.payload_len as usize];
+        if let Err(e) = reader.read_exact_at(record_offset + RECORD_HEADER_SIZE as u64, &mut raw_payload) {
             records.push(DumpRecordEntry::TornRecord {
                 offset: record_offset,
                 reason: format!("Failed reading full payload: {}", e),
@@ -212,14 +225,29 @@ pub fn dump_log_reader_with_path(
             break;
         }
 
-        if checksum_payload(&payload) != header.checksum {
+        if checksum_payload(&raw_payload) != header.checksum {
             records.push(DumpRecordEntry::TornRecord {
                 offset: record_offset,
                 reason: "Payload BLAKE3 checksum mismatch (corrupted / bitrot)".to_string(),
-                partial_bytes: payload,
+                partial_bytes: raw_payload,
             });
             break;
         }
+
+        // Without a key, or when decryption fails, the raw bytes are shown as-is: this is a
+        // diagnostic tool and seeing what is physically on disk is the point.
+        let payload = match volume_key {
+            Some(kr) => kr
+                .decrypt_record(
+                    file_header.generation,
+                    header.tx_id,
+                    header.op_code as u8,
+                    header.inode,
+                    &raw_payload,
+                )
+                .unwrap_or(raw_payload),
+            None => raw_payload,
+        };
 
         let is_commit = header.op_code == OpCode::FlushCommit;
         let rec_idx = records.len();
@@ -454,11 +482,89 @@ pub fn dump_log_reader_with_path(
 /// - `verbosity == 0`: Summary metadata, whole-file checksum, inode breakdown, extent fragmentation stats, histogram, top fragmented files, manifest table.
 /// - `verbosity == 1`: Summary + complete inode listing / directory tree.
 /// - `verbosity >= 2`: Summary + complete inode listing + detailed physical extent range mappings for all files.
-pub fn dump_summary_file(storage: &dyn Storage, filename: &str, verbosity: u8) -> io::Result<String> {
-    let reader = SummaryReader::open(storage, filename)?;
+pub fn dump_summary_file(
+    storage: &dyn Storage,
+    filename: &str,
+    verbosity: u8,
+    volume_key: Option<&VolumeKey>,
+) -> io::Result<String> {
+    // An encrypted summary opened without a key cannot have its body read, but the parts
+    // that live in plaintext still describe the volume. Report those rather than refusing:
+    // inspecting on-disk structure without credentials is exactly what this tool is for.
+    if volume_key.is_none() {
+        let header = SummaryReader::read_volume_header(storage, filename)?;
+        if header.cipher.is_encrypted() {
+            return dump_encrypted_summary_without_key(storage, filename, &header);
+        }
+    }
+
+    let kr = volume_key.cloned().unwrap_or_else(VolumeKey::plaintext);
+    let reader = SummaryReader::open(storage, filename, Arc::new(kr))?;
     dump_summary_reader_with_path(&reader, Some(filename), verbosity)
 }
 
+/// Formats the plaintext-visible structure of an encrypted summary: everything outside the
+/// encrypted body.
+fn dump_encrypted_summary_without_key(
+    storage: &dyn Storage,
+    filename: &str,
+    volume_header: &crate::crypto::VolumeHeader,
+) -> io::Result<String> {
+    use crate::log::summary::{SUMMARY_FOOTER_SIZE, SUMMARY_HEADER_SIZE, SummaryFooter, SummaryHeader};
+
+    let reader = storage.open_reader(filename)?;
+    let file_len = reader.len()?;
+    if file_len < (SUMMARY_HEADER_SIZE + SUMMARY_FOOTER_SIZE) as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("summary file {} is too short ({} bytes)", filename, file_len),
+        ));
+    }
+
+    let mut header_buf = [0u8; SUMMARY_HEADER_SIZE];
+    reader.read_exact_at(0, &mut header_buf)?;
+    let header = SummaryHeader::from_bytes(&header_buf)?;
+
+    let mut footer_buf = [0u8; SUMMARY_FOOTER_SIZE];
+    reader.read_exact_at(file_len - SUMMARY_FOOTER_SIZE as u64, &mut footer_buf)?;
+    let footer = SummaryFooter::from_bytes(&footer_buf)?;
+
+    let mut out = String::new();
+    writeln!(out, "=== appendfs Summary File Dump ===").unwrap();
+    writeln!(out, "File:                {:?}", filename).unwrap();
+    writeln!(out, "Generation:          {}", header.generation).unwrap();
+    writeln!(out, "Format Version:      {}", header.version).unwrap();
+    writeln!(out, "Last Transaction ID: {}", header.last_tx_id).unwrap();
+    writeln!(out, "Next Inode:          {}", header.next_inode).unwrap();
+    writeln!(out, "File Size:           {}", format_bytes(file_len)).unwrap();
+    writeln!(out, "Encryption:          {}", volume_header.cipher).unwrap();
+    writeln!(out, "Unlocked by:         {}", volume_header.key_source).unwrap();
+    writeln!(
+        out,
+        "Volume ID:           {}",
+        volume_header
+            .volume_id
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    )
+    .unwrap();
+    writeln!(out, "Inode Count:         {}", footer.entry_count).unwrap();
+    writeln!(
+        out,
+        "Encrypted Body:      {} at offset {}",
+        format_bytes(
+            file_len - SUMMARY_FOOTER_SIZE as u64 - SUMMARY_HEADER_SIZE as u64 - header.volume_header_len as u64
+        ),
+        SUMMARY_HEADER_SIZE as u64 + header.volume_header_len as u64
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "No key supplied: the inode table, manifest and index live in the").unwrap();
+    writeln!(out, "encrypted body and cannot be shown. Pass --key-file to read them.").unwrap();
+
+    Ok(out)
+}
 /// Reads and analyzes a `.summary` snapshot from an existing `SummaryReader`.
 pub fn dump_summary_reader(reader: &SummaryReader, verbosity: u8) -> io::Result<String> {
     dump_summary_reader_with_path(reader, None, verbosity)
@@ -594,6 +700,10 @@ pub fn dump_summary_reader_with_path(
     writeln!(out, "Last Transaction ID: {}", reader.header.last_tx_id).unwrap();
     writeln!(out, "Next Inode:          {}", reader.header.next_inode).unwrap();
     writeln!(out, "File Size:           {}", format_bytes(file_len)).unwrap();
+    writeln!(out, "Encryption:          {}", reader.volume_header.cipher).unwrap();
+    if reader.volume_header.cipher.is_encrypted() {
+        writeln!(out, "Unlocked by:         {}", reader.volume_header.key_source).unwrap();
+    }
 
     // Checksum display
     let checksum_hex = reader
@@ -1050,7 +1160,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = Arc::new(OsStorage::new(dir.path()));
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         // Write InodeDelta record
         let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
@@ -1076,7 +1194,7 @@ mod tests {
         assert!(storage.exists("000001.log"));
 
         // Level 0: Summary
-        let summary_dump = dump_log_file(storage.as_ref(), "000001.log", 0).unwrap();
+        let summary_dump = dump_log_file(storage.as_ref(), "000001.log", 0, None).unwrap();
         assert!(summary_dump.contains("Total Valid Records: 3"));
         assert!(summary_dump.contains("Committed Flushes:   1"));
         assert!(summary_dump.contains("Trailing Batch:      None"));
@@ -1084,7 +1202,7 @@ mod tests {
         assert!(summary_dump.contains("64 B .. 511 B"));
 
         // Level 1: Records
-        let v1_dump = dump_log_file(storage.as_ref(), "000001.log", 1).unwrap();
+        let v1_dump = dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
         assert!(v1_dump.contains("Sequential Record Stream"));
         assert!(v1_dump.contains("InodeDelta"));
         assert!(v1_dump.contains("Data"));
@@ -1092,7 +1210,7 @@ mod tests {
         assert!(v1_dump.contains("[COMMITTED]"));
 
         // Level 2: Full Hex
-        let v2_dump = dump_log_file(storage.as_ref(), "000001.log", 2).unwrap();
+        let v2_dump = dump_log_file(storage.as_ref(), "000001.log", 2, None).unwrap();
         assert!(v2_dump.contains("42 42 42 42"));
     }
 
@@ -1103,7 +1221,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = Arc::new(OsStorage::new(dir.path()));
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap();
+        let writer = LogWriter::create(
+            storage.clone(),
+            1,
+            &clock,
+            crate::cli::DEFAULT_MAX_LOG_SIZE,
+            1,
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         let dir_delta = LogEntryDelta::Node(LogNodeDelta::Directory(LogDirectoryDelta {
             parent: Some(1),
@@ -1118,7 +1244,7 @@ mod tests {
         writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
         drop(writer);
 
-        let dump = dump_log_file(storage.as_ref(), "000001.log", 1).unwrap();
+        let dump = dump_log_file(storage.as_ref(), "000001.log", 1, None).unwrap();
         assert!(dump.contains("Trailing Batch:      1 UNCOMMITTED records"));
         assert!(dump.contains("[UNCOMMITTED TRAILING BATCH]"));
     }
@@ -1126,7 +1252,7 @@ mod tests {
     #[test]
     fn test_dump_summary_file_summary_and_verbosity_levels() {
         use crate::fs::InMemoryFS;
-        use crate::log::summary::{export_summary, init_volume};
+        use crate::log::summary::{SummarySnapshot, export_summary, init_volume};
         use crate::log::{LogManifest, SharedExtentState};
         use crate::node::{InodeMeta, Node, NodeKind};
         use crate::range_map::RangeMap;
@@ -1134,12 +1260,18 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let storage = Arc::new(OsStorage::new(dir.path()));
-        init_volume(storage.clone(), Some("feature-branch")).unwrap();
+        init_volume(
+            storage.clone(),
+            Some("feature-branch"),
+            &crate::crypto::VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
         assert!(storage.exists("000000.summary"));
 
         // Level 0: Summary
-        let dump_v0 = dump_file(storage.as_ref(), "000000.summary", 0).unwrap();
+        let dump_v0 = dump_file(storage.as_ref(), "000000.summary", 0, None).unwrap();
         assert!(dump_v0.contains("=== appendfs Summary File Dump ==="));
         assert!(dump_v0.contains("Branch:              feature-branch"));
         assert!(dump_v0.contains("Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)"));
@@ -1214,19 +1346,23 @@ mod tests {
         };
 
         export_summary(
-            &snapshot,
-            &manifest,
+            &SummarySnapshot {
+                inodes: &snapshot,
+                manifest: &manifest,
+                volume_header: &crate::crypto::VolumeHeader::plaintext(),
+                generation: 1,
+                last_tx_id: 100,
+                next_inode: 4,
+                created_at: std::time::SystemTime::now(),
+            },
             storage.as_ref(),
-            1,
-            100,
-            4,
-            std::time::SystemTime::now(),
+            &crate::crypto::VolumeKey::plaintext(),
         )
         .unwrap();
         assert!(storage.exists("000001.summary"));
 
         // Level 0: Fragmentation Stats & Top Fragmented Files
-        let dump_snap_v0 = dump_file(storage.as_ref(), "000001.summary", 0).unwrap();
+        let dump_snap_v0 = dump_file(storage.as_ref(), "000001.summary", 0, None).unwrap();
         assert!(dump_snap_v0.contains("Total Regular Files: 1"));
         assert!(dump_snap_v0.contains("Total File Extents:  2"));
         assert!(dump_snap_v0.contains("Avg Extents / File:  2.00"));
@@ -1238,14 +1374,14 @@ mod tests {
         assert!(dump_snap_v0.contains("000002.log"));
 
         // Level 1: Inode Tree Listing
-        let dump_snap_v1 = dump_file(storage.as_ref(), "000001.summary", 1).unwrap();
+        let dump_snap_v1 = dump_file(storage.as_ref(), "000001.summary", 1, None).unwrap();
         assert!(dump_snap_v1.contains("Summary Inode Records"));
         assert!(dump_snap_v1.contains("Directory  \"/\""));
         assert!(dump_snap_v1.contains("Directory  \"/docs\""));
         assert!(dump_snap_v1.contains("RegularFile \"/docs/fragmented.bin\""));
 
         // Level 2: Full Physical Extent Mappings
-        let dump_snap_v2 = dump_file(storage.as_ref(), "000001.summary", 2).unwrap();
+        let dump_snap_v2 = dump_file(storage.as_ref(), "000001.summary", 2, None).unwrap();
         assert!(dump_snap_v2.contains("extents (2):"));
         assert!(dump_snap_v2.contains("000001.log [record offset 0x00000064 / 100"));
         assert!(dump_snap_v2.contains("000002.log [record offset 0x000000c8 / 200"));

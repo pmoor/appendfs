@@ -721,11 +721,16 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
 }
 
 /// Helper function to recover a volume using Storage in read-only mode and run integrity checks.
-pub fn check_volume(storage: Arc<dyn crate::storage::Storage>, verify_data: bool) -> std::io::Result<IntegrityReport> {
+pub fn check_volume(
+    storage: Arc<dyn crate::storage::Storage>,
+    verify_data: bool,
+    volume_key: Arc<crate::crypto::VolumeKey>,
+) -> std::io::Result<IntegrityReport> {
     let fs = crate::log::recover_fs(
         storage,
         crate::log::RecoveryTarget::Latest,
         std::sync::Arc::new(crate::clock::SystemClock),
+        volume_key,
     )?;
     Ok(check_fs_integrity(&fs, None, verify_data))
 }
@@ -734,6 +739,7 @@ pub fn check_volume(storage: Arc<dyn crate::storage::Storage>, verify_data: bool
 mod tests {
     use super::*;
     use crate::clock::SystemClock;
+    use crate::crypto::VolumeKey;
     use crate::log::{LogWriter, SharedExtentState};
     use crate::node::{InodeMeta, Node, NodeKind};
     use crate::range_map::RangeMap;
@@ -743,12 +749,33 @@ mod tests {
     fn test_clean_filesystem_integrity_passes() {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
-        crate::init_volume(storage.clone(), Some("main")).unwrap();
+        crate::init_volume(
+            storage.clone(),
+            Some("main"),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
-        let mut fs = crate::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let mut fs = crate::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let clock = Arc::new(SystemClock);
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         fs.log_writer = Some(writer);
         fs.set_storage(storage.clone());
 
@@ -761,7 +788,7 @@ mod tests {
 
         fs.sync_log().unwrap();
 
-        let report = check_volume(storage, true).unwrap();
+        let report = check_volume(storage, true, VolumeKey::plaintext_arc()).unwrap();
         assert!(report.is_clean(), "Report must be clean: {:?}", report.issues);
         assert_eq!(report.error_count(), 0);
         assert_eq!(report.orphaned_inodes.len(), 0);
@@ -774,9 +801,21 @@ mod tests {
     fn test_orphan_inode_detection() {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
-        crate::init_volume(storage.clone(), Some("main")).unwrap();
+        crate::init_volume(
+            storage.clone(),
+            Some("main"),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
-        let fs = crate::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let fs = crate::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         // Inject an orphan inode 999 not linked into directory tree
         let orphan_ino = 999;
         let orphan_node = Node {
@@ -799,11 +838,33 @@ mod tests {
     fn test_nlink_mismatch_detection() {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
-        crate::init_volume(storage.clone(), Some("main")).unwrap();
+        crate::init_volume(
+            storage.clone(),
+            Some("main"),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
-        let mut fs = crate::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let mut fs = crate::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let clock = Arc::new(SystemClock);
-        let writer = Arc::new(LogWriter::create(storage, 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         fs.log_writer = Some(writer);
         fs.set_log_dir(dir.path());
 
@@ -829,9 +890,21 @@ mod tests {
     fn test_extent_past_eof_detection() {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
-        crate::init_volume(storage.clone(), Some("main")).unwrap();
+        crate::init_volume(
+            storage.clone(),
+            Some("main"),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
-        let fs = crate::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let fs = crate::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         // Inject file with extent beyond its size
         let mut rm = RangeMap::new();
@@ -865,9 +938,21 @@ mod tests {
     fn test_directory_cycle_detection() {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
-        crate::init_volume(storage.clone(), Some("main")).unwrap();
+        crate::init_volume(
+            storage.clone(),
+            Some("main"),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
-        let fs = crate::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let fs = crate::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         // Create cycle: /a (ino 2) -> /a/b (ino 3) -> /a/b/a (ino 2)
         let dir_a = Node {
@@ -907,9 +992,21 @@ mod tests {
     fn test_dangling_entry_and_invalid_parent_detection() {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
-        crate::init_volume(storage.clone(), Some("main")).unwrap();
+        crate::init_volume(
+            storage.clone(),
+            Some("main"),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
-        let fs = crate::recover_fs(storage, crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let fs = crate::recover_fs(
+            storage,
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
 
         // 1. Root contains dangling entry to ino 404
         // 2. Dir 2 has parent field 999 instead of 1
@@ -942,13 +1039,33 @@ mod tests {
     #[test]
     fn test_corrupt_log_record_checksum_detected() {
         let storage = Arc::new(crate::storage::MemoryStorage::new());
-        crate::log::init_volume(storage.clone(), Some("main")).unwrap();
+        crate::log::init_volume(
+            storage.clone(),
+            Some("main"),
+            &VolumeKey::plaintext(),
+            crate::crypto::VolumeHeader::plaintext(),
+        )
+        .unwrap();
 
-        let mut fs =
-            crate::log::recover_fs(storage.clone(), crate::RecoveryTarget::Latest, Arc::new(SystemClock)).unwrap();
+        let mut fs = crate::log::recover_fs(
+            storage.clone(),
+            crate::RecoveryTarget::Latest,
+            Arc::new(SystemClock),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
         let clock = Arc::new(SystemClock);
-        let writer =
-            Arc::new(LogWriter::create(storage.clone(), 1, &*clock, crate::cli::DEFAULT_MAX_LOG_SIZE, 1).unwrap());
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
         fs.log_writer = Some(writer);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "data.txt", 0o644, 0, 1000, 1000).unwrap();
