@@ -80,8 +80,18 @@ pub struct DumpArgs {
     pub verbose: u8,
 
     /// Path to key file for decrypting records (64 hex characters)
+    ///
+    /// Without this (and without --passphrase) the raw on-disk bytes are shown, which is
+    /// often what you want when inspecting structure.
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
+
+    /// Prompt for the volume's passphrase in order to decrypt records
+    ///
+    /// Needed to read a passphrase-protected volume; combine with --key-file for a volume
+    /// that requires both.
+    #[arg(long = "passphrase", default_value_t = false)]
+    pub passphrase: bool,
 }
 
 #[derive(Args, Debug)]

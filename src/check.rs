@@ -541,11 +541,15 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                     ));
                 }
 
+                // `length` is deliberately ignored: it is the extent's logical size, and the
+                // bytes a record occupies on disk are derived from the record header's
+                // `payload_len` instead. Treating the logical length as a physical bound is
+                // what made healthy compressed volumes look corrupt.
                 if let ExtentState::Disk {
                     generation,
                     record_log_offset,
                     payload_offset: _,
-                    length,
+                    length: _,
                 } = entry.value.read_state()
                 {
                     if !active_generations.contains(&generation) {
@@ -574,14 +578,22 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                     ),
                                 ));
                         } else if let Ok(file_len) = c.storage().file_len(&log_filename) {
-                            let required_end = record_log_offset + length as u64;
-                            if file_len < required_end {
+                            // Only the header's position can be judged from the extent alone.
+                            // `length` is the extent's *logical* size, which bears no fixed
+                            // relation to the bytes on disk: encryption adds a tag, and
+                            // compression can shrink a multi-megabyte extent to a few hundred
+                            // bytes. Comparing `record_log_offset + length` against the file
+                            // size therefore called every healthy compressed volume corrupt,
+                            // and - because it gated the branch below - skipped the header and
+                            // checksum verification that would have shown otherwise. The
+                            // record's real extent is checked once `payload_len` is known.
+                            if file_len < record_log_offset + RECORD_HEADER_SIZE as u64 {
                                 report.issues.push(IntegrityIssue::error(
                                         "EXTENT_PAST_LOG_EOF",
                                         Some(ino),
                                         format!(
-                                            "File inode {} extent references log generation {} at offset 0x{:x} + len {}, but file size is only {} bytes",
-                                            ino, generation, record_log_offset, length, file_len
+                                            "File inode {} extent references log generation {} at offset 0x{:x}, but file size is only {} bytes",
+                                            ino, generation, record_log_offset, file_len
                                         ),
                                     ));
                             } else {
@@ -627,6 +639,19 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                                                             "CORRUPT_LOG_RECORD",
                                                             Some(ino),
                                                             format!("Record at offset 0x{:x} in {} belongs to inode {}, expected inode {}", record_log_offset, log_filename, rec_ino, ino),
+                                                        ));
+                                                    } else if file_len
+                                                        < record_log_offset
+                                                            + RECORD_HEADER_SIZE as u64
+                                                            + payload_len as u64
+                                                    {
+                                                        report.issues.push(IntegrityIssue::error(
+                                                            "EXTENT_PAST_LOG_EOF",
+                                                            Some(ino),
+                                                            format!(
+                                                                "File inode {} record at offset 0x{:x} in {} declares a {} byte payload, which runs past the {} byte file",
+                                                                ino, record_log_offset, log_filename, payload_len, file_len
+                                                            ),
                                                         ));
                                                     } else {
                                                         let mut payload = vec![0u8; payload_len];

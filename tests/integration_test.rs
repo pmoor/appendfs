@@ -2732,3 +2732,80 @@ fn test_compressed_volume_round_trips_and_saves_space() {
         compressed
     );
 }
+
+/// `check --verify-data` must judge an extent by the record's physical size, not its logical
+/// one.
+///
+/// An extent's `length` is its uncompressed size and bears no fixed relation to the bytes on
+/// disk: encryption adds a tag, compression can shrink megabytes to hundreds of bytes.
+/// Comparing that length against the log file size called every healthy compressed volume
+/// corrupt - and skipped the header and checksum verification that would have shown otherwise.
+#[test]
+fn test_check_verifies_compressed_volumes_without_false_positives() {
+    use appendfs::compress::Compression;
+    use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
+
+    for compression in [Compression::None, Compression::Zstd] {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path();
+        let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
+        let master = MasterKey::new([0x31u8; 32]);
+        let (header, key) =
+            VolumeHeader::new_encrypted(&master, [0x32u8; 16], KeySource::KeyFile, compression).unwrap();
+        appendfs::log::init_volume(storage.clone(), Some("main"), &key, header).unwrap();
+        let key = std::sync::Arc::new(key);
+
+        // Highly compressible, and large enough that the compressed log is orders of
+        // magnitude smaller than the logical extent lengths.
+        let payload: Vec<u8> = "compressible payload ".repeat(300_000).into_bytes();
+        {
+            let mut fs = appendfs::recover_fs(
+                storage.clone(),
+                appendfs::RecoveryTarget::Latest,
+                std::sync::Arc::new(appendfs::SystemClock),
+                key.clone(),
+            )
+            .unwrap();
+            let writer = std::sync::Arc::new(
+                appendfs::LogWriter::create_lazy(
+                    storage.clone(),
+                    1,
+                    appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                    1,
+                    key.clone(),
+                )
+                .unwrap()
+                .with_compression(compression),
+            );
+            fs.log_writer = Some(writer);
+            fs.set_log_dir(log_path);
+            let attr = appendfs::operations::read_write::create_core(&fs, 1, "big.txt", 0o644, 0, 1000, 1000).unwrap();
+            appendfs::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
+            fs.sync_log().unwrap();
+            fs.export_summary(storage.as_ref()).unwrap();
+        }
+
+        let report = appendfs::check_volume(storage.clone(), true, key.clone()).unwrap();
+        assert!(
+            report.is_clean(),
+            "{:?} volume reported {} errors: {:?}",
+            compression,
+            report.error_count(),
+            report.issues
+        );
+
+        // The check must still catch a genuinely truncated log rather than having been
+        // loosened into uselessness.
+        let log_file = log_path.join("000001.log");
+        let len = std::fs::metadata(&log_file).unwrap().len();
+        let bytes = std::fs::read(&log_file).unwrap();
+        std::fs::write(&log_file, &bytes[..(len / 2) as usize]).unwrap();
+
+        let truncated = appendfs::check_volume(storage, true, key).unwrap();
+        assert!(
+            !truncated.is_clean(),
+            "{:?}: truncating the log must be detected",
+            compression
+        );
+    }
+}

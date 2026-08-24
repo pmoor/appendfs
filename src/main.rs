@@ -11,6 +11,7 @@ use clap::Parser;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use zeroize::Zeroizing;
 
 /// Finds the newest `{:06}.summary` in a volume directory.
 ///
@@ -65,14 +66,16 @@ fn resolve_volume_key(log_dir: &Path, key_file: Option<&Path>) -> Result<Arc<Vol
         // Without a terminal this fails with a bare errno, which says nothing about *why* a
         // passphrase was wanted - the common case being a script mounting a two-factor
         // volume with only `--key-file`.
-        Some(
+        // Wrapped so the passphrase is wiped when it goes out of scope rather than left in
+        // freed heap memory for whatever allocates next.
+        Some(Zeroizing::new(
             prompt_passphrase(&format!("Enter passphrase for volume '{}': ", log_dir.display())).map_err(|e| {
                 format!(
                     "Volume is unlocked by: {}. Could not prompt for its passphrase: {}",
                     source, e
                 )
             })?,
-        )
+        ))
     } else {
         None
     };
@@ -422,20 +425,23 @@ fn main() {
             let filename = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
             let storage = OsStorage::new(parent);
 
-            // Without a key the raw (still encrypted) records are dumped, which is a valid
-            // way to inspect on-disk structure. With one, resolve it against the volume's
-            // summary - not against the file being dumped, which is usually a .log and
-            // carries no volume header - and fail loudly rather than silently falling back
-            // to a ciphertext dump the user did not ask for.
-            let volume_key = match args.key_file {
-                Some(ref kf) => match resolve_volume_key(parent, Some(kf)) {
+            // Asking for neither credential dumps the raw on-disk bytes, which is a valid way
+            // to inspect structure. Asking for either resolves against the volume's summary -
+            // not against the file being dumped, which is usually a .log and carries no
+            // volume header - and fails loudly rather than quietly falling back to a
+            // ciphertext dump the user did not ask for. A passphrase volume needs the
+            // explicit flag, since prompting whenever a volume happens to be encrypted would
+            // make scripted raw dumps hang waiting on a terminal.
+            let volume_key = if args.key_file.is_some() || args.passphrase {
+                match resolve_volume_key(parent, args.key_file.as_deref()) {
                     Ok(k) => Some(k),
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }
-                },
-                None => None,
+                }
+            } else {
+                None
             };
 
             match dump_file(&storage, &filename, args.verbose, volume_key.as_deref()) {
