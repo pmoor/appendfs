@@ -1,6 +1,7 @@
 pub mod check;
 pub mod cli;
 pub mod clock;
+pub mod compress;
 pub mod crypto;
 pub mod dump;
 pub mod fs;

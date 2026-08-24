@@ -90,6 +90,10 @@ pub struct VolumeHeader {
     pub cipher: CipherSuite,
     /// Which credentials reconstruct this volume's key.
     pub key_source: KeySource,
+    /// How newly written records are compressed. Governs writes only - each record carries
+    /// its own tag inside the encrypted envelope, and that is what readers act on.
+    #[serde(default)]
+    pub compression: crate::compress::Compression,
     pub volume_id: [u8; 16],
     /// Argon2id salt. Meaningful only when [`KeySource::needs_passphrase`]; zero otherwise,
     /// since a key file carries full entropy and is used without stretching.
@@ -107,6 +111,7 @@ impl VolumeHeader {
         Self {
             cipher: CipherSuite::None,
             key_source: KeySource::None,
+            compression: crate::compress::Compression::None,
             volume_id: [0u8; 16],
             kdf_salt: [0u8; 16],
             kcv_iv: [0u8; 12],
@@ -123,6 +128,7 @@ impl VolumeHeader {
         master: &MasterKey,
         kdf_salt: [u8; 16],
         key_source: KeySource,
+        compression: crate::compress::Compression,
     ) -> Result<(Self, VolumeKey), CryptoError> {
         if key_source == KeySource::None {
             return Err(CryptoError::IoError(
@@ -137,6 +143,7 @@ impl VolumeHeader {
         let header = Self {
             cipher: CipherSuite::ChaCha20Poly1305,
             key_source,
+            compression,
             volume_id,
             kdf_salt,
             kcv_iv,
@@ -333,7 +340,13 @@ mod tests {
     #[test]
     fn test_volume_round_trip() {
         let master = MasterKey::new([0x33u8; 32]);
-        let (header, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile).unwrap();
+        let (header, key) = VolumeHeader::new_encrypted(
+            &master,
+            [0u8; 16],
+            KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
         assert_eq!(header.cipher, CipherSuite::ChaCha20Poly1305);
 
         let payload = b"Record payload for the volume key";
@@ -349,7 +362,13 @@ mod tests {
     #[test]
     fn test_wrong_key_is_distinguishable_from_corruption() {
         let master = MasterKey::new([0x33u8; 32]);
-        let (header, _key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile).unwrap();
+        let (header, _key) = VolumeHeader::new_encrypted(
+            &master,
+            [0u8; 16],
+            KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
 
         // The whole point of the KCV: a wrong key is reported as WrongKey, not AuthFailed,
         // so a mount never tells the user their intact volume is corrupt.
@@ -364,8 +383,20 @@ mod tests {
     fn test_kcv_cannot_be_transplanted_between_volumes() {
         let master_a = MasterKey::new([0x11u8; 32]);
         let master_b = MasterKey::new([0x22u8; 32]);
-        let (header_a, _) = VolumeHeader::new_encrypted(&master_a, [0u8; 16], KeySource::KeyFile).unwrap();
-        let (mut header_b, _) = VolumeHeader::new_encrypted(&master_b, [0u8; 16], KeySource::KeyFile).unwrap();
+        let (header_a, _) = VolumeHeader::new_encrypted(
+            &master_a,
+            [0u8; 16],
+            KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
+        let (mut header_b, _) = VolumeHeader::new_encrypted(
+            &master_b,
+            [0u8; 16],
+            KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
 
         // Splicing A's check value into B's header must not make A's key open B, because
         // the KCV is bound to the volume ID it was minted for.
@@ -387,7 +418,13 @@ mod tests {
     #[test]
     fn test_record_aad_binds_opcode_and_inode() {
         let master = MasterKey::new([0x33u8; 32]);
-        let (_header, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile).unwrap();
+        let (_header, key) = VolumeHeader::new_encrypted(
+            &master,
+            [0u8; 16],
+            KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
 
         let payload = b"extent belonging to inode 5";
         let ct = key.encrypt_record(1, 100, OP, 5, payload).unwrap();
@@ -432,7 +469,13 @@ mod tests {
     #[test]
     fn test_summary_round_trip() {
         let master = MasterKey::new([0x66u8; 32]);
-        let (header, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile).unwrap();
+        let (header, key) = VolumeHeader::new_encrypted(
+            &master,
+            [0u8; 16],
+            KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
 
         let iv = generate_random_iv();
         let aad = b"summary header bytes";

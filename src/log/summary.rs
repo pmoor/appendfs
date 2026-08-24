@@ -13,11 +13,12 @@ use std::sync::Arc;
 pub const SUMMARY_FOOTER_SIZE: usize = 60;
 pub const SUMMARY_INDEX_ENTRY_SIZE: usize = 16;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
-// Bumped to 8: SummaryHeader dropped its redundant `cipher` and `key_id` bytes (shrinking it
-// from 62 to SUMMARY_HEADER_SIZE) and LogManifest no longer carries the volume header. Every
+// Bumped to 9: the plaintext VolumeHeader blob is now written for every volume, not only
+// encrypted ones, and carries a compression setting. Version 8 dropped SummaryHeader's
+// redundant `cipher` and `key_id` bytes and moved the volume header out of LogManifest. Every
 // one of these layouts deserializes from the others' bytes without erroring, so this version
 // check is the only thing standing between an older volume and being silently misread.
-pub const CURRENT_SUMMARY_VERSION: u32 = 8;
+pub const CURRENT_SUMMARY_VERSION: u32 = 9;
 pub const SUMMARY_HEADER_SIZE: usize = 60;
 
 /// Fixed-size header written at offset 0 of `{:06}.summary`, exactly `SUMMARY_HEADER_SIZE`
@@ -334,11 +335,11 @@ pub fn export_summary(
     } else {
         [0u8; 12]
     };
-    let volume_header_bytes = if is_encrypted {
-        bincode::serialize(volume_header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-    } else {
-        Vec::new()
-    };
+    // Always written, even for an unencrypted volume. The blob used to be encryption-only,
+    // which silently discarded any other volume-wide setting it carries - compression was
+    // lost on plaintext volumes because there was nowhere to record it.
+    let volume_header_bytes =
+        bincode::serialize(volume_header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let header = SummaryHeader::new(
         generation,
@@ -1007,9 +1008,13 @@ mod tests {
     fn test_volume_header_is_readable_without_the_key() {
         let storage = Arc::new(MemoryStorage::new());
         let master = crate::crypto::MasterKey::new([0x5Au8; 32]);
-        let (header, key) =
-            crate::crypto::VolumeHeader::new_encrypted(&master, [0x77u8; 16], crate::crypto::KeySource::KeyFile)
-                .unwrap();
+        let (header, key) = crate::crypto::VolumeHeader::new_encrypted(
+            &master,
+            [0x77u8; 16],
+            crate::crypto::KeySource::KeyFile,
+            crate::compress::Compression::None,
+        )
+        .unwrap();
         let expected_id = header.volume_id;
 
         init_volume(storage.clone(), Some("main"), &key, header).unwrap();

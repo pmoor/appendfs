@@ -164,13 +164,14 @@ fn main() {
                     }
                 };
 
-                let (volume_header, volume_key) = match VolumeHeader::new_encrypted(&master_key, salt, key_source) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        eprintln!("Failed to initialize volume encryption: {}", e);
-                        std::process::exit(1);
-                    }
-                };
+                let (volume_header, volume_key) =
+                    match VolumeHeader::new_encrypted(&master_key, salt, key_source, args.compression()) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            eprintln!("Failed to initialize volume encryption: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
                 let volume_id = hex_string(&volume_header.volume_id);
 
                 let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
@@ -182,6 +183,7 @@ fn main() {
                         println!("  Branch:          {}", args.branch);
                         println!("  Cipher:          ChaCha20-Poly1305");
                         println!("  Unlocked by:     {}", key_source);
+                        println!("  Compression:     {}", args.compression());
                         println!("  Volume ID:       {}", volume_id);
                         println!("  Root Inode:      1 (/)");
                         println!("  Next Generation: 1 (000001.log)");
@@ -197,18 +199,18 @@ fn main() {
                 }
             } else {
                 let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
-                match init_volume(
-                    storage,
-                    Some(&args.branch),
-                    &VolumeKey::plaintext(),
-                    VolumeHeader::plaintext(),
-                ) {
+                // Compression is independent of encryption, so an unencrypted volume must
+                // still honour --compress rather than silently dropping it.
+                let mut volume_header = VolumeHeader::plaintext();
+                volume_header.compression = args.compression();
+                match init_volume(storage, Some(&args.branch), &VolumeKey::plaintext(), volume_header) {
                     Ok(summary_filename) => {
                         println!("Initialized empty appendfs volume successfully!");
                         println!("  Log Directory:   {}", args.log_dir.display());
                         println!("  Summary File:    {}", summary_filename);
                         println!("  Branch:          {}", args.branch);
                         println!("  Cipher:          Plaintext (None)");
+                        println!("  Compression:     {}", args.compression());
                         println!("  Root Inode:      1 (/)");
                         println!("  Next Generation: 1 (000001.log)");
                     }
@@ -264,8 +266,11 @@ fn main() {
 
             let start_tx = fs_instance.last_tx_id.load(Ordering::SeqCst) + 1;
 
+            // The volume header decides how writes are compressed; it was read back during
+            // recovery, so a mount never has to be told separately.
+            let compression = fs_instance.volume_header.compression;
             let writer = match LogWriter::create_lazy(storage, next_gen, args.max_log_size, start_tx, volume_key) {
-                Ok(w) => Arc::new(w),
+                Ok(w) => Arc::new(w.with_compression(compression)),
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
@@ -496,11 +501,17 @@ fn main() {
             println!("=== Volume Encryption ===");
             println!("Volume:        {}", log_dir.display());
             println!("Cipher Suite:  {}", header.cipher);
+            println!("Compression:   {}", header.compression);
 
             if header.cipher.is_encrypted() {
                 println!("Unlocked by:   {}", header.key_source);
                 println!("Volume ID:     {}", hex_string(&header.volume_id));
                 println!();
+                if header.compression.is_enabled() {
+                    println!("Compressed records reveal roughly how compressible their contents");
+                    println!("were, which encryption alone does not. Sizes leak; contents do not.");
+                    println!();
+                }
                 println!("Credentials are supplied at mount time and are not stored here.");
                 println!("Back them up: losing them loses the volume, and changing them means");
                 println!("re-encrypting into a fresh volume.");

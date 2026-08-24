@@ -43,7 +43,15 @@ impl LogFileCache {
         Ok(reader)
     }
 
-    /// Reads a slice from an extent stored on disk, decrypting if necessary.
+    /// Reads a slice from an extent stored on disk.
+    ///
+    /// The whole record is always fetched and processed, encrypted or not. There is no
+    /// direct-seek shortcut for unencrypted volumes: an AEAD authenticates a payload as a
+    /// unit, so an encrypted record has to be read whole regardless, and keeping a second
+    /// path for the unencrypted case bought a narrow win in exchange for a branch that had
+    /// to decide, per record, how to interpret bytes from disk. That decision is what the
+    /// `key_id` downgrade exploited. One path also means compression can sit behind this
+    /// interface without the two cases diverging again.
     pub fn read_extent_payload(
         &self,
         generation: u64,
@@ -59,42 +67,27 @@ impl LogFileCache {
         let header = crate::log::record::RecordHeader::from_bytes(&header_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        // Whether to decrypt is a property of the volume, so it cannot be influenced by
-        // anything read out of the record. Records used to carry a `key_id` that this branch
-        // consulted, which let anyone able to write to the storage clear one byte and have
-        // this copy raw ciphertext straight into a read buffer, bypassing the AEAD.
-        if !volume_key.cipher().is_encrypted() {
-            // Unencrypted fast-path: direct seek and read
-            let seek_pos = record_log_offset
-                + crate::log::record::RECORD_HEADER_SIZE as u64
-                + payload_offset as u64
-                + slice_offset as u64;
-            reader.read_exact_at(seek_pos, dst_buf)?;
-            return Ok(dst_buf.len());
-        }
-
-        // Encrypted path: read ciphertext payload, decrypt, copy slice
         let mut raw_payload = vec![0u8; header.payload_len as usize];
         reader.read_exact_at(
             record_log_offset + crate::log::record::RECORD_HEADER_SIZE as u64,
             &mut raw_payload,
         )?;
 
-        let decrypted = volume_key
-            .decrypt_record(
+        let decrypted = crate::log::codec::decode(
+            volume_key,
+            crate::log::codec::RecordId {
                 generation,
-                header.tx_id,
-                header.op_code as u8,
-                header.inode,
-                &raw_payload,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                tx_id: header.tx_id,
+                op_code: header.op_code as u8,
+                inode: header.inode,
+            },
+            &raw_payload,
+        )?;
 
-        // Fill the whole request or fail. The unencrypted path above uses `read_exact_at`,
-        // so it already errors on a short extent; returning a partial count here instead
-        // left `copy_extent_data` with an unfilled tail that lower layers then rendered as
-        // zeros - silently substituting plausible data for the `EIO` that a Disk extent
-        // disagreeing with its record actually warrants.
+        // Fill the whole request or fail. Returning a partial count instead left
+        // `copy_extent_data` with an unfilled tail that lower layers then rendered as zeros -
+        // silently substituting plausible data for the `EIO` that a Disk extent disagreeing
+        // with its record actually warrants.
         let start = payload_offset as u64 + slice_offset as u64;
         let slice = usize::try_from(start)
             .ok()
@@ -109,7 +102,7 @@ impl LogFileCache {
                     io::ErrorKind::InvalidData,
                     format!(
                         "extent in generation {} at record offset {} wants {} bytes from payload offset {}, \
-                         but that record decrypts to only {} bytes",
+                         but that record holds only {} bytes",
                         generation,
                         record_log_offset,
                         dst_buf.len(),

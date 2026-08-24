@@ -7,11 +7,12 @@ use std::time::SystemTime;
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 // Bumped for RecordHeader's new key_id field - a breaking format change, so old logs
 // are cleanly rejected (FileHeader::from_bytes) rather than silently misparsed.
-// Bumped to 6: RecordHeader lost its `key_id` byte (records are 25 bytes rather than 26) and
-// FileHeader widened its timestamp back to a full i64 of seconds. Both shift every offset in
-// a log file, and the header is validated on open so an older file is refused rather than
-// read with the wrong layout.
-pub const CURRENT_VERSION: u32 = 6;
+// Bumped to 7: every record payload now carries a one-byte compression envelope inside the
+// encrypted region, so a v6 payload read as v7 would lose its first byte and gain a bogus
+// tag. Version 6 had removed RecordHeader's `key_id` (25 bytes rather than 26) and widened
+// FileHeader's timestamp to a full i64 of seconds. The header is validated on open, so an
+// older file is refused rather than read with the wrong layout.
+pub const CURRENT_VERSION: u32 = 7;
 /// magic(4) + version(4) + generation(8) + created_at seconds(8) + nanoseconds(4).
 pub const FILE_HEADER_SIZE: usize = 28;
 pub const RECORD_HEADER_SIZE: usize = 25;

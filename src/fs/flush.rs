@@ -412,6 +412,13 @@ impl InMemoryFS {
 }
 
 /// Upper bound on the bytes this batch will append.
+/// Upper bound on the bytes a frozen batch will occupy, used only to decide whether it fits
+/// in the current generation before any of it is written.
+///
+/// Compression makes the bound looser - payloads shrink after this runs - but it stays an
+/// upper bound, and the looseness costs at most one batch of slack at a generation boundary
+/// rather than shrinking files generally. Feeding an observed ratio back here would trade
+/// that for extra state on a hot path.
 fn estimate_batch_bytes(frozen: &HashMap<u64, EntryDelta>, max_extent_size: usize) -> u64 {
     let mut estimated_bytes: u64 = RECORD_HEADER_SIZE as u64 + 64; // FlushCommit
     for entry in frozen.values() {
@@ -551,9 +558,13 @@ mod tests {
 
             let volume_key = if encrypted {
                 let master = crate::crypto::MasterKey::new([0x42u8; 32]);
-                let (_, key) =
-                    crate::crypto::VolumeHeader::new_encrypted(&master, [0u8; 16], crate::crypto::KeySource::KeyFile)
-                        .unwrap();
+                let (_, key) = crate::crypto::VolumeHeader::new_encrypted(
+                    &master,
+                    [0u8; 16],
+                    crate::crypto::KeySource::KeyFile,
+                    crate::compress::Compression::None,
+                )
+                .unwrap();
                 Arc::new(key)
             } else {
                 crate::crypto::VolumeKey::plaintext_arc()

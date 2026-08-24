@@ -141,6 +141,10 @@ pub fn dump_log_reader_with_path(
     reader.read_exact_at(0, &mut header_buf)?;
     let file_header = FileHeader::from_bytes(&header_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+    // A keyless dump still has to unwrap the compression envelope, so it decodes with a
+    // pass-through key rather than skipping the codec - that asymmetry is what previously
+    // left keyless dumps showing every payload shifted by the envelope's tag byte.
+    let plaintext_key = VolumeKey::plaintext();
     let mut records: Vec<DumpRecordEntry> = Vec::new();
     let mut current_offset = FILE_HEADER_SIZE as u64;
 
@@ -236,18 +240,21 @@ pub fn dump_log_reader_with_path(
 
         // Without a key, or when decryption fails, the raw bytes are shown as-is: this is a
         // diagnostic tool and seeing what is physically on disk is the point.
-        let payload = match volume_key {
-            Some(kr) => kr
-                .decrypt_record(
-                    file_header.generation,
-                    header.tx_id,
-                    header.op_code as u8,
-                    header.inode,
-                    &raw_payload,
-                )
-                .unwrap_or(raw_payload),
-            None => raw_payload,
+        // Every record carries a compression envelope, whether or not the volume compresses
+        // anything - a compressed volume still stores incompressible records raw, so the tag
+        // has to be unconditional for readers to interpret bytes without consulting volume
+        // policy. Unwrap it here too, or a dump shows payloads shifted by the tag byte.
+        let id = crate::log::codec::RecordId {
+            generation: file_header.generation,
+            tx_id: header.tx_id,
+            op_code: header.op_code as u8,
+            inode: header.inode,
         };
+        let unwrapped = crate::log::codec::decode(volume_key.unwrap_or(&plaintext_key), id, &raw_payload).ok();
+
+        // Falling back to the raw bytes keeps a keyless or corrupt dump useful: seeing what
+        // is physically on disk is the point of this tool.
+        let payload = unwrapped.unwrap_or(raw_payload);
 
         let is_commit = header.op_code == OpCode::FlushCommit;
         let rec_idx = records.len();

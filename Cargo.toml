@@ -16,6 +16,7 @@ argon2 = "0.5"
 rpassword = "7.3"
 zeroize = { version = "1.8", features = ["derive"] }
 rand = "0.8"
+zstd = "0.13"
 
 [build-dependencies]
 cc = "1.0"

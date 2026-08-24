@@ -52,6 +52,10 @@ pub struct LogWriter {
     storage: Arc<dyn Storage>,
     max_log_size: u64,
     volume_key: Arc<VolumeKey>,
+    /// Compression applied to payloads before encryption. Set from the volume header via
+    /// [`LogWriter::with_compression`] rather than passed to every constructor, which would
+    /// reintroduce the telescoping shape this module deliberately avoids.
+    compression: crate::compress::Compression,
     _lock: Option<Box<dyn crate::storage::StorageLock>>,
 }
 
@@ -83,6 +87,7 @@ impl LogWriter {
             storage,
             max_log_size,
             volume_key,
+            compression: crate::compress::Compression::None,
             _lock: Some(lock),
         })
     }
@@ -106,11 +111,18 @@ impl LogWriter {
             storage,
             max_log_size,
             volume_key,
+            compression: crate::compress::Compression::None,
             _lock: Some(lock),
         })
     }
 
-    /// Returns the active VolumeHeader used to encrypt record payloads.
+    /// Sets the compression applied to record payloads before they are encrypted.
+    pub fn with_compression(mut self, compression: crate::compress::Compression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Returns the volume key used to encrypt record payloads.
     pub fn volume_key(&self) -> &Arc<VolumeKey> {
         &self.volume_key
     }
@@ -189,10 +201,17 @@ impl LogWriter {
         };
 
         let generation = active.generation;
-        let cipher_payload = self
-            .volume_key
-            .encrypt_record(generation, tx, op_code as u8, inode, payload)
-            .map_err(io::Error::other)?;
+        let cipher_payload = crate::log::codec::encode(
+            &self.volume_key,
+            self.compression,
+            crate::log::codec::RecordId {
+                generation,
+                tx_id: tx,
+                op_code: op_code as u8,
+                inode,
+            },
+            payload,
+        )?;
 
         let header = RecordHeader {
             op_code,

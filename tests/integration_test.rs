@@ -2253,9 +2253,13 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
     let master_key = appendfs::crypto::MasterKey::new([0x42u8; 32]);
 
     // 1. Initialize encrypted volume
-    let (volume_header, volume_key) =
-        appendfs::crypto::VolumeHeader::new_encrypted(&master_key, [0x11u8; 16], appendfs::crypto::KeySource::KeyFile)
-            .unwrap();
+    let (volume_header, volume_key) = appendfs::crypto::VolumeHeader::new_encrypted(
+        &master_key,
+        [0x11u8; 16],
+        appendfs::crypto::KeySource::KeyFile,
+        appendfs::compress::Compression::None,
+    )
+    .unwrap();
     appendfs::log::init_volume(
         std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path)),
         Some("main"),
@@ -2371,9 +2375,13 @@ fn test_tampered_record_header_is_rejected_not_served() {
     let master_key = appendfs::crypto::MasterKey::new([0x7Eu8; 32]);
     let secret = b"PLAINTEXT_THAT_MUST_NEVER_BE_SERVED";
 
-    let (volume_header, volume_key) =
-        appendfs::crypto::VolumeHeader::new_encrypted(&master_key, [0x0Au8; 16], appendfs::crypto::KeySource::KeyFile)
-            .unwrap();
+    let (volume_header, volume_key) = appendfs::crypto::VolumeHeader::new_encrypted(
+        &master_key,
+        [0x0Au8; 16],
+        appendfs::crypto::KeySource::KeyFile,
+        appendfs::compress::Compression::None,
+    )
+    .unwrap();
     let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
     appendfs::log::init_volume(storage.clone(), Some("main"), &volume_key, volume_header).unwrap();
 
@@ -2475,7 +2483,13 @@ fn test_key_source_round_trips_through_the_volume_header() {
         let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
         let master = appendfs::crypto::MasterKey::new([0x5Cu8; 32]);
 
-        let (header, key) = appendfs::crypto::VolumeHeader::new_encrypted(&master, [0x11u8; 16], source).unwrap();
+        let (header, key) = appendfs::crypto::VolumeHeader::new_encrypted(
+            &master,
+            [0x11u8; 16],
+            source,
+            appendfs::compress::Compression::None,
+        )
+        .unwrap();
         assert_eq!(header.key_source.needs_key_file(), needs_file, "{:?}", source);
         assert_eq!(header.key_source.needs_passphrase(), needs_pass, "{:?}", source);
 
@@ -2510,7 +2524,15 @@ fn test_key_source_round_trips_through_the_volume_header() {
 fn test_encrypted_volume_rejects_none_key_source() {
     use appendfs::crypto::KeySource;
     let master = appendfs::crypto::MasterKey::new([0x01u8; 32]);
-    assert!(appendfs::crypto::VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::None).is_err());
+    assert!(
+        appendfs::crypto::VolumeHeader::new_encrypted(
+            &master,
+            [0u8; 16],
+            KeySource::None,
+            appendfs::compress::Compression::None
+        )
+        .is_err()
+    );
 }
 
 /// A rewritten summary footer must produce an error, never a panic or a huge allocation.
@@ -2566,7 +2588,13 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
         let master = MasterKey::new([0x33u8; 32]);
-        let (header, key) = VolumeHeader::new_encrypted(&master, [0x44u8; 16], KeySource::KeyFile).unwrap();
+        let (header, key) = VolumeHeader::new_encrypted(
+            &master,
+            [0x44u8; 16],
+            KeySource::KeyFile,
+            appendfs::compress::Compression::None,
+        )
+        .unwrap();
         appendfs::log::init_volume(storage.clone(), Some("main"), &key, header).unwrap();
 
         tamper(dir.path(), edit);
@@ -2589,7 +2617,13 @@ fn test_export_refuses_a_mismatched_header_and_key() {
     let storage: std::sync::Arc<dyn appendfs::storage::Storage> =
         std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
     let master = MasterKey::new([0x55u8; 32]);
-    let (_header, key) = VolumeHeader::new_encrypted(&master, [0u8; 16], KeySource::KeyFile).unwrap();
+    let (_header, key) = VolumeHeader::new_encrypted(
+        &master,
+        [0u8; 16],
+        KeySource::KeyFile,
+        appendfs::compress::Compression::None,
+    )
+    .unwrap();
 
     // `with_log` adopts the writer's encrypted key while the header stays at its plaintext
     // default - the pairing this guard exists to catch.
@@ -2611,5 +2645,90 @@ fn test_export_refuses_a_mismatched_header_and_key() {
         err.to_string().contains("refusing to export an unreadable summary"),
         "unexpected error: {}",
         err
+    );
+}
+
+/// Compressed records must round-trip through a real write/recover/read cycle, and must
+/// actually shrink the log.
+#[test]
+fn test_compressed_volume_round_trips_and_saves_space() {
+    use appendfs::compress::Compression;
+    use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
+
+    // Same payload written to a compressed and an uncompressed volume, so the only
+    // difference in log size is the compression.
+    let payload: Vec<u8> = "the quick brown fox jumps over the lazy dog. "
+        .repeat(4000)
+        .into_bytes();
+
+    let mut sizes = Vec::new();
+    for compression in [Compression::None, Compression::Zstd] {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path();
+        let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
+        let master = MasterKey::new([0x6Bu8; 32]);
+        let (header, key) =
+            VolumeHeader::new_encrypted(&master, [0x77u8; 16], KeySource::KeyFile, compression).unwrap();
+        appendfs::log::init_volume(storage.clone(), Some("main"), &key, header.clone()).unwrap();
+
+        let key = std::sync::Arc::new(key);
+        let ino = {
+            let mut fs = appendfs::recover_fs(
+                storage.clone(),
+                appendfs::RecoveryTarget::Latest,
+                std::sync::Arc::new(appendfs::SystemClock),
+                key.clone(),
+            )
+            .unwrap();
+            let writer = std::sync::Arc::new(
+                appendfs::LogWriter::create_lazy(
+                    storage.clone(),
+                    1,
+                    appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+                    1,
+                    key.clone(),
+                )
+                .unwrap()
+                .with_compression(compression),
+            );
+            fs.log_writer = Some(writer);
+            fs.set_log_dir(log_path);
+
+            let attr = appendfs::operations::read_write::create_core(&fs, 1, "text.log", 0o644, 0, 1000, 1000).unwrap();
+            appendfs::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
+            fs.sync_log().unwrap();
+            fs.export_summary(storage.as_ref()).unwrap();
+            attr.ino
+        };
+
+        // The setting must survive the round trip through the volume header.
+        let read_back = appendfs::log::SummaryReader::read_volume_header(storage.as_ref(), "000001.summary").unwrap();
+        assert_eq!(read_back.compression, compression);
+
+        // Recovering replays records through the reader; reading pulls them through the
+        // extent cache. Both have to unwrap the envelope for this to match.
+        let recovered = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            std::sync::Arc::new(appendfs::SystemClock),
+            key.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.read_file_data(ino, 0, payload.len()).unwrap(),
+            payload,
+            "{:?} did not round-trip",
+            compression
+        );
+
+        sizes.push(std::fs::metadata(log_path.join("000001.log")).unwrap().len());
+    }
+
+    let (uncompressed, compressed) = (sizes[0], sizes[1]);
+    assert!(
+        compressed * 4 < uncompressed,
+        "expected a large saving on highly repetitive data, got {} -> {} bytes",
+        uncompressed,
+        compressed
     );
 }

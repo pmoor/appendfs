@@ -118,15 +118,18 @@ impl Iterator for LogReader {
             )));
         }
 
-        let decrypted_payload = match self.volume_key.decrypt_record(
-            self.header.generation,
-            header.tx_id,
-            header.op_code as u8,
-            header.inode,
+        let decrypted_payload = match crate::log::codec::decode(
+            &self.volume_key,
+            crate::log::codec::RecordId {
+                generation: self.header.generation,
+                tx_id: header.tx_id,
+                op_code: header.op_code as u8,
+                inode: header.inode,
+            },
             &raw_payload,
         ) {
             Ok(p) => p,
-            Err(e) => return Some(Err(e.into())),
+            Err(e) => return Some(Err(e)),
         };
 
         Some(Ok(LogRecord {

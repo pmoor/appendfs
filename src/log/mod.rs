@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod codec;
 pub mod extent;
 pub mod flusher;
 pub mod manifest;
@@ -9,6 +10,7 @@ pub mod summary;
 pub mod writer;
 
 pub use cache::LogFileCache;
+pub use codec::{RecordId, decode as decode_record, encode as encode_record};
 pub use extent::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION, zero_extent_fields, zero_extent_len};
 pub use flusher::BackgroundFlusher;
 pub use manifest::{GenerationLiveStats, LogFileInfo, LogManifest};

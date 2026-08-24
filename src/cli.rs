@@ -105,6 +105,15 @@ pub struct InitArgs {
     /// Combine with --key-file to require both.
     #[arg(long = "passphrase", default_value_t = false)]
     pub passphrase: bool,
+
+    /// Compress record payloads with zstd before storing them
+    ///
+    /// Records that do not compress by at least an eighth are stored as-is, so
+    /// already-compressed data costs only the check. Fixed for the life of the volume.
+    /// Note that compressed sizes reveal roughly how compressible each record was, which
+    /// plain encryption does not.
+    #[arg(long = "compress", default_value_t = false)]
+    pub compress: bool,
 }
 
 impl InitArgs {
@@ -121,6 +130,15 @@ impl InitArgs {
             (true, false) => KeySource::KeyFile,
             (false, true) => KeySource::Passphrase,
             (false, false) => KeySource::None,
+        }
+    }
+
+    /// The compression policy to record in the volume header. Also fixed at init.
+    pub fn compression(&self) -> crate::compress::Compression {
+        if self.compress {
+            crate::compress::Compression::Zstd
+        } else {
+            crate::compress::Compression::None
         }
     }
 }
