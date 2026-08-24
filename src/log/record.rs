@@ -55,15 +55,15 @@ impl FileHeader {
     pub fn to_bytes(&self) -> [u8; FILE_HEADER_SIZE] {
         let mut buf = [0u8; FILE_HEADER_SIZE];
         buf[0..4].copy_from_slice(&self.magic);
-        buf[4..8].copy_from_slice(&self.version.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.generation.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.version.to_be_bytes());
+        buf[8..16].copy_from_slice(&self.generation.to_be_bytes());
         // Seconds are stored as a full signed 64-bit count. Narrowing them to u32 - as this
         // header briefly did - silently wraps every timestamp past 2106 back to 1970 and
         // every pre-1970 one forward to ~2106, which corrupts the ordering that
         // `mount-ro --at-time` selects generations by.
         let (secs, nsecs) = crate::clock::system_time_to_unix(self.created_at);
-        buf[16..24].copy_from_slice(&secs.to_le_bytes());
-        buf[24..28].copy_from_slice(&nsecs.to_le_bytes());
+        buf[16..24].copy_from_slice(&secs.to_be_bytes());
+        buf[24..28].copy_from_slice(&nsecs.to_be_bytes());
         buf
     }
 
@@ -72,13 +72,13 @@ impl FileHeader {
         if magic != FILE_MAGIC {
             return Err("invalid magic bytes");
         }
-        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let version = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
         if version != CURRENT_VERSION {
             return Err("unsupported file version");
         }
-        let generation = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let secs = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let nsecs = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let generation = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let secs = i64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let nsecs = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
         let created_at = crate::clock::unix_to_system_time(secs, nsecs);
 
         Ok(Self {
@@ -147,18 +147,18 @@ impl RecordHeader {
     pub fn to_bytes(&self) -> [u8; RECORD_HEADER_SIZE] {
         let mut buf = [0u8; RECORD_HEADER_SIZE];
         buf[0] = self.op_code as u8;
-        buf[1..9].copy_from_slice(&self.tx_id.to_le_bytes());
-        buf[9..17].copy_from_slice(&self.inode.to_le_bytes());
-        buf[17..21].copy_from_slice(&self.payload_len.to_le_bytes());
+        buf[1..9].copy_from_slice(&self.tx_id.to_be_bytes());
+        buf[9..17].copy_from_slice(&self.inode.to_be_bytes());
+        buf[17..21].copy_from_slice(&self.payload_len.to_be_bytes());
         buf[21..25].copy_from_slice(&self.checksum);
         buf
     }
 
     pub fn from_bytes(bytes: &[u8; RECORD_HEADER_SIZE]) -> Result<Self, &'static str> {
         let op_code = OpCode::try_from(bytes[0])?;
-        let tx_id = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
-        let inode = u64::from_le_bytes(bytes[9..17].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(bytes[17..21].try_into().unwrap());
+        let tx_id = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
+        let inode = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(bytes[17..21].try_into().unwrap());
         let checksum = bytes[21..25].try_into().unwrap();
 
         Ok(Self {

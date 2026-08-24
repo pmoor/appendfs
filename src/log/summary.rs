@@ -209,14 +209,14 @@ fn write_summary_body(
             offset: sink.offset(),
         });
 
-        sink.append(&inode.to_le_bytes())?;
-        sink.append(&(payload.len() as u32).to_le_bytes())?;
+        sink.append(&inode.to_be_bytes())?;
+        sink.append(&(payload.len() as u32).to_be_bytes())?;
         sink.append(&payload)?;
     }
 
     let manifest_offset = sink.offset();
     let manifest_bytes = bincode::serialize(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    sink.append(&(manifest_bytes.len() as u32).to_le_bytes())?;
+    sink.append(&(manifest_bytes.len() as u32).to_be_bytes())?;
     sink.append(&manifest_bytes)?;
 
     index_entries.sort_by_key(|entry| entry.inode);
@@ -626,7 +626,7 @@ impl SummaryReader {
             // 4. Read LogManifest from manifest_offset
             let mut manifest_len_buf = [0u8; 4];
             reader.read_exact_at(footer.manifest_offset, &mut manifest_len_buf)?;
-            let manifest_len = u32::from_le_bytes(manifest_len_buf) as usize;
+            let manifest_len = u32::from_be_bytes(manifest_len_buf) as usize;
             let mut manifest_buf = vec![0u8; manifest_len];
             reader.read_exact_at(footer.manifest_offset + 4, &mut manifest_buf)?;
             let manifest: crate::log::LogManifest =
@@ -677,7 +677,7 @@ impl SummaryReader {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             let len_bytes = body_slice(&decrypted, footer.manifest_offset, 4, "manifest length")?;
-            let manifest_len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as u64;
+            let manifest_len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as u64;
             let manifest_bytes = body_slice(&decrypted, footer.manifest_offset + 4, manifest_len, "manifest")?;
             let manifest: crate::log::LogManifest =
                 bincode::deserialize(manifest_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -732,14 +732,14 @@ impl SummaryReader {
             if off + 12 > body.len() {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupted summary body"));
             }
-            let read_inode = u64::from_le_bytes(body[off..off + 8].try_into().unwrap());
+            let read_inode = u64::from_be_bytes(body[off..off + 8].try_into().unwrap());
             if read_inode != inode {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("summary index mismatch: expected inode {}, found {}", inode, read_inode),
                 ));
             }
-            let payload_len = u32::from_le_bytes(body[off + 8..off + 12].try_into().unwrap()) as usize;
+            let payload_len = u32::from_be_bytes(body[off + 8..off + 12].try_into().unwrap()) as usize;
             if off + 12 + payload_len > body.len() {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupted summary body"));
             }
@@ -751,7 +751,7 @@ impl SummaryReader {
 
         let mut meta_buf = [0u8; 12];
         self.reader.read_exact_at(offset, &mut meta_buf)?;
-        let read_inode = u64::from_le_bytes(meta_buf[0..8].try_into().unwrap());
+        let read_inode = u64::from_be_bytes(meta_buf[0..8].try_into().unwrap());
         if read_inode != inode {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -759,7 +759,7 @@ impl SummaryReader {
             ));
         }
 
-        let payload_len = u32::from_le_bytes(meta_buf[8..12].try_into().unwrap()) as usize;
+        let payload_len = u32::from_be_bytes(meta_buf[8..12].try_into().unwrap()) as usize;
         let mut payload = vec![0u8; payload_len];
         self.reader.read_exact_at(offset + 12, &mut payload)?;
 
