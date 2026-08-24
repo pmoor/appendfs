@@ -175,7 +175,7 @@ pub fn recover_fs(
                     last_tx_id = header.tx_id;
                 }
 
-                let commit = bincode::deserialize::<FlushCommitPayload>(&record.payload).map_err(|e| {
+                let commit = crate::wire::deserialize::<FlushCommitPayload>(&record.payload).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("malformed FlushCommit payload in generation {}: {}", gen_num, e),

@@ -13,12 +13,14 @@ use std::sync::Arc;
 pub const SUMMARY_FOOTER_SIZE: usize = 60;
 pub const SUMMARY_INDEX_ENTRY_SIZE: usize = 16;
 pub const SUMMARY_MAGIC: &[u8; 4] = b"APPS";
-// Bumped to 9: the plaintext VolumeHeader blob is now written for every volume, not only
-// encrypted ones, and carries a compression setting. Version 8 dropped SummaryHeader's
-// redundant `cipher` and `key_id` bytes and moved the volume header out of LogManifest. Every
-// one of these layouts deserializes from the others' bytes without erroring, so this version
-// check is the only thing standing between an older volume and being silently misread.
-pub const CURRENT_SUMMARY_VERSION: u32 = 9;
+// Bumped to 10: every integer in a summary is now big-endian - both the hand-written framing
+// and everything routed through bincode. Version 9 wrote the plaintext VolumeHeader blob for
+// every volume and gave it a compression setting; 8 dropped SummaryHeader's redundant
+// `cipher` and `key_id` bytes and moved the volume header out of LogManifest. Every one of
+// these layouts deserializes from the others' bytes without erroring - an older file is a
+// valid encoding of different values - so this version check is the only thing standing
+// between an older volume and being silently misread.
+pub const CURRENT_SUMMARY_VERSION: u32 = 10;
 pub const SUMMARY_HEADER_SIZE: usize = 60;
 
 /// Fixed-size header written at offset 0 of `{:06}.summary`, exactly `SUMMARY_HEADER_SIZE`
@@ -63,11 +65,11 @@ impl SummaryHeader {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("SummaryHeader serialization failed")
+        crate::wire::serialize(self).expect("SummaryHeader serialization failed")
     }
 
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
-        let header: Self = bincode::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let header: Self = crate::wire::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         if header.magic != *SUMMARY_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -112,11 +114,11 @@ impl SummaryFooter {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("SummaryFooter serialization failed")
+        crate::wire::serialize(self).expect("SummaryFooter serialization failed")
     }
 
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
-        bincode::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        crate::wire::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -129,11 +131,11 @@ pub struct SummaryIndexEntry {
 
 impl SummaryIndexEntry {
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("SummaryIndexEntry serialization failed")
+        crate::wire::serialize(self).expect("SummaryIndexEntry serialization failed")
     }
 
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
-        bincode::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        crate::wire::deserialize(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -202,7 +204,7 @@ fn write_summary_body(
         }
 
         let payload =
-            bincode::serialize(&node_to_serialize).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            crate::wire::serialize(&node_to_serialize).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         index_entries.push(SummaryIndexEntry {
             inode: *inode,
@@ -215,7 +217,7 @@ fn write_summary_body(
     }
 
     let manifest_offset = sink.offset();
-    let manifest_bytes = bincode::serialize(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let manifest_bytes = crate::wire::serialize(manifest).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     sink.append(&(manifest_bytes.len() as u32).to_be_bytes())?;
     sink.append(&manifest_bytes)?;
 
@@ -339,7 +341,7 @@ pub fn export_summary(
     // which silently discarded any other volume-wide setting it carries - compression was
     // lost on plaintext volumes because there was nowhere to record it.
     let volume_header_bytes =
-        bincode::serialize(volume_header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        crate::wire::serialize(volume_header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let header = SummaryHeader::new(
         generation,
@@ -517,7 +519,7 @@ fn parse_volume_header_blob(
 
     let mut buf = vec![0u8; header.volume_header_len as usize];
     reader.read_exact_at(SUMMARY_HEADER_SIZE as u64, &mut buf)?;
-    bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    crate::wire::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 impl SummaryReader {
@@ -630,7 +632,7 @@ impl SummaryReader {
             let mut manifest_buf = vec![0u8; manifest_len];
             reader.read_exact_at(footer.manifest_offset + 4, &mut manifest_buf)?;
             let manifest: crate::log::LogManifest =
-                bincode::deserialize(&manifest_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                crate::wire::deserialize(&manifest_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             // 5. Read index array from index_offset
             let mut index_entries = Vec::with_capacity(footer.entry_count as usize);
@@ -680,7 +682,7 @@ impl SummaryReader {
             let manifest_len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as u64;
             let manifest_bytes = body_slice(&decrypted, footer.manifest_offset + 4, manifest_len, "manifest")?;
             let manifest: crate::log::LogManifest =
-                bincode::deserialize(manifest_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                crate::wire::deserialize(manifest_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             let mut index_entries = Vec::with_capacity(footer.entry_count as usize);
             let mut index_offset = footer.index_offset;
@@ -745,7 +747,7 @@ impl SummaryReader {
             }
             let payload = &body[off + 12..off + 12 + payload_len];
             let node =
-                bincode::deserialize::<Node>(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                crate::wire::deserialize::<Node>(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             return Ok(Some(node));
         }
 
@@ -763,7 +765,8 @@ impl SummaryReader {
         let mut payload = vec![0u8; payload_len];
         self.reader.read_exact_at(offset + 12, &mut payload)?;
 
-        let node = bincode::deserialize::<Node>(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let node =
+            crate::wire::deserialize::<Node>(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(Some(node))
     }
@@ -990,7 +993,7 @@ mod tests {
         // blob that follows would still deserialize into something plausible, so without
         // an explicit version check this would be misread rather than refused.
         let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
-        bytes[4..8].copy_from_slice(&(CURRENT_SUMMARY_VERSION - 1).to_le_bytes());
+        bytes[4..8].copy_from_slice(&(CURRENT_SUMMARY_VERSION - 1).to_be_bytes());
         storage.insert_file("000000.summary", bytes);
 
         let Err(err) = SummaryReader::open(storage.as_ref(), "000000.summary", VolumeKey::plaintext_arc()) else {

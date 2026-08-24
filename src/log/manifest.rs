@@ -137,8 +137,8 @@ mod tests {
         assert_eq!(manifest.next_generation, 3);
         assert_eq!(manifest.next_filename, "000003.log");
 
-        let bytes = bincode::serialize(&manifest).unwrap();
-        let deserialized: LogManifest = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::wire::serialize(&manifest).unwrap();
+        let deserialized: LogManifest = crate::wire::deserialize(&bytes).unwrap();
         assert_eq!(manifest, deserialized);
     }
 }

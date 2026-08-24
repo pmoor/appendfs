@@ -238,8 +238,8 @@ mod tests {
             opt_none: None,
         };
 
-        let bytes = bincode::serialize(&test_obj).unwrap();
-        let deserialized: TimestampTestWrapper = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::wire::serialize(&test_obj).unwrap();
+        let deserialized: TimestampTestWrapper = crate::wire::deserialize(&bytes).unwrap();
         assert_eq!(test_obj, deserialized);
     }
 

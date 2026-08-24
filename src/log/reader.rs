@@ -20,9 +20,11 @@ impl LogRecord {
     pub fn decode(&self) -> Result<DecodedPayload<'_>, bincode::Error> {
         match self.header.op_code {
             OpCode::Data => Ok(DecodedPayload::Data(&self.payload)),
-            OpCode::InodeDelta => bincode::deserialize::<LogEntryDelta>(&self.payload).map(DecodedPayload::InodeDelta),
+            OpCode::InodeDelta => {
+                crate::wire::deserialize::<LogEntryDelta>(&self.payload).map(DecodedPayload::InodeDelta)
+            }
             OpCode::FlushCommit => {
-                bincode::deserialize::<FlushCommitPayload>(&self.payload).map(DecodedPayload::FlushCommit)
+                crate::wire::deserialize::<FlushCommitPayload>(&self.payload).map(DecodedPayload::FlushCommit)
             }
         }
     }

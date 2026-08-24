@@ -550,8 +550,8 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
     for ino in written_keys {
         let live_node = (*written_inodes[&ino]).clone();
         let replayed_node = (*regenerated_inodes[&ino]).clone();
-        let live_bytes = bincode::serialize(&normalize_for_compare(ino, live_node.clone())).unwrap();
-        let replayed_bytes = bincode::serialize(&normalize_for_compare(ino, replayed_node.clone())).unwrap();
+        let live_bytes = appendfs::wire::serialize(&normalize_for_compare(ino, live_node.clone())).unwrap();
+        let replayed_bytes = appendfs::wire::serialize(&normalize_for_compare(ino, replayed_node.clone())).unwrap();
         if live_bytes != replayed_bytes {
             eprintln!("content divergence (seed {}) at inode {}:", seed, ino);
             eprintln!("  live:     {:?}", live_node);

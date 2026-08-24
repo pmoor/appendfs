@@ -157,7 +157,7 @@ impl InMemoryFS {
             for &ino in &inos {
                 if let Some(entry_delta) = frozen.get(&ino) {
                     let log_entry = LogEntryDelta::from(entry_delta);
-                    let payload = bincode::serialize(&log_entry)
+                    let payload = crate::wire::serialize(&log_entry)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                     writer.append_record(OpCode::InodeDelta, ino, &payload)?;
                     written_count += 1;

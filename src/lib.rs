@@ -12,6 +12,7 @@ pub mod range_map;
 pub mod shim;
 pub mod stats;
 pub mod storage;
+pub mod wire;
 
 // Only the two types callers routinely name are lifted to the crate root; everything else
 // crypto exposes stays reachable at its canonical `appendfs::crypto::` path.

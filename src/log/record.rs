@@ -7,12 +7,14 @@ use std::time::SystemTime;
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
 // Bumped for RecordHeader's new key_id field - a breaking format change, so old logs
 // are cleanly rejected (FileHeader::from_bytes) rather than silently misparsed.
-// Bumped to 7: every record payload now carries a one-byte compression envelope inside the
+// Bumped to 8: log integers are now big-endian; an older file's bytes still decode, just to
+// different values, so this version check is what refuses them.
+// Version 7: every record payload carries a one-byte compression envelope inside the
 // encrypted region, so a v6 payload read as v7 would lose its first byte and gain a bogus
 // tag. Version 6 had removed RecordHeader's `key_id` (25 bytes rather than 26) and widened
 // FileHeader's timestamp to a full i64 of seconds. The header is validated on open, so an
 // older file is refused rather than read with the wrong layout.
-pub const CURRENT_VERSION: u32 = 7;
+pub const CURRENT_VERSION: u32 = 8;
 /// magic(4) + version(4) + generation(8) + created_at seconds(8) + nanoseconds(4).
 pub const FILE_HEADER_SIZE: usize = 28;
 pub const RECORD_HEADER_SIZE: usize = 25;
@@ -605,8 +607,8 @@ mod tests {
         }));
 
         let log_delta = LogEntryDelta::from(&dir_delta);
-        let serialized = bincode::serialize(&log_delta).unwrap();
-        let deserialized: LogEntryDelta = bincode::deserialize(&serialized).unwrap();
+        let serialized = crate::wire::serialize(&log_delta).unwrap();
+        let deserialized: LogEntryDelta = crate::wire::deserialize(&serialized).unwrap();
         let reconstructed = EntryDelta::from(deserialized);
 
         match (dir_delta, reconstructed) {

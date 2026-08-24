@@ -269,7 +269,7 @@ impl LogWriter {
         };
 
         let payload_bytes =
-            bincode::serialize(&commit_payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            crate::wire::serialize(&commit_payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let (tx, _, _) = self.append_record(OpCode::FlushCommit, 0, &payload_bytes)?;
         Ok(tx)
@@ -422,7 +422,7 @@ mod tests {
             .collect();
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].header.op_code, OpCode::FlushCommit);
-        let payload: FlushCommitPayload = bincode::deserialize(&records[2].payload).unwrap();
+        let payload: FlushCommitPayload = crate::wire::deserialize(&records[2].payload).unwrap();
         assert_eq!(payload.record_count, 2);
     }
 

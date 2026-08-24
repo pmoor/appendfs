@@ -1187,7 +1187,7 @@ mod tests {
                 ..Default::default()
             },
         }));
-        let delta_bytes = bincode::serialize(&dir_delta).unwrap();
+        let delta_bytes = crate::wire::serialize(&dir_delta).unwrap();
         writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
 
         // Write Data record with 100 bytes
@@ -1247,7 +1247,7 @@ mod tests {
                 ..Default::default()
             },
         }));
-        let delta_bytes = bincode::serialize(&dir_delta).unwrap();
+        let delta_bytes = crate::wire::serialize(&dir_delta).unwrap();
         writer.append_record(OpCode::InodeDelta, 1, &delta_bytes).unwrap();
         drop(writer);
 
