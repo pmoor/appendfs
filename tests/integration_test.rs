@@ -1992,3 +1992,50 @@ fn test_fallocate_punch_hole_zero_range_and_recovery() {
     assert_eq!(recovered.len(), 6144);
     assert_eq!(recovered, before_unmount, "content must be identical after recovery");
 }
+
+/// A volume whose summaries all fail to open must be refused, not silently rebuilt empty.
+///
+/// Skipping a bad summary is only safe while another still describes the volume. When none
+/// can be read the state is unknown, and continuing produces an empty filesystem that
+/// `check` then pronounces healthy - which is exactly what an on-disk format change looks
+/// like from here, since older bytes remain a valid encoding of different values.
+#[test]
+fn test_recovery_refuses_a_volume_with_no_readable_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+    appendfs::init_volume(storage.clone(), Some("main")).unwrap();
+
+    // Truncate the only summary so it cannot be opened at all. Truncation is used rather
+    // than a corrupted field because it fails the same way regardless of which fields a
+    // given build validates - the guard under test is about there being no readable summary,
+    // not about why any particular one failed.
+    let path = dir.path().join("000000.summary");
+    std::fs::write(&path, &std::fs::read(&path).unwrap()[..16]).unwrap();
+
+    let Err(err) = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        std::sync::Arc::new(appendfs::SystemClock),
+    ) else {
+        panic!("recovery must refuse a volume it cannot describe");
+    };
+    assert!(
+        err.to_string().contains("none could be read"),
+        "unexpected error: {}",
+        err
+    );
+
+    // A volume with no summaries at all is a different case and must still work: there is
+    // nothing to contradict, so recovery legitimately starts from empty.
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh_storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(fresh.path()));
+    assert!(
+        appendfs::recover_fs(
+            fresh_storage,
+            appendfs::RecoveryTarget::Latest,
+            std::sync::Arc::new(appendfs::SystemClock),
+        )
+        .is_ok(),
+        "an empty directory has no state to contradict"
+    );
+}

@@ -34,6 +34,7 @@ pub fn recover_fs(
 
     // 1. Scan for eligible single-file .summary snapshots matching the target
     let mut latest_summary: Option<(u64, SummaryReader)> = None;
+    let mut unreadable: Vec<String> = Vec::new();
     for file in &files {
         if file.ends_with(".summary") {
             let stem = file.trim_end_matches(".summary");
@@ -52,10 +53,27 @@ pub fn recover_fs(
                     }
                     Err(e) => {
                         log::warn!("Ignoring unreadable summary {}: {}", file, e);
+                        unreadable.push(format!("{}: {}", file, e));
                     }
                 }
             }
         }
+    }
+
+    // Skipping a bad summary is only safe while some other summary still describes the
+    // volume. If every one of them failed, the volume's state is simply unknown, and
+    // continuing would rebuild an empty filesystem and present it as healthy - which is what
+    // a format change looks like from here, since older bytes stay a valid encoding of
+    // different values. Refuse instead of inventing an answer.
+    if latest_summary.is_none() && !unreadable.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "volume has {} summary file(s) but none could be read, so its state is unknown: {}",
+                unreadable.len(),
+                unreadable.join("; ")
+            ),
+        ));
     }
 
     let mut log_files = Vec::new();
