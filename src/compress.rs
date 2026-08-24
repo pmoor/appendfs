@@ -81,7 +81,7 @@ pub fn pack(payload: &[u8], compression: Compression) -> Vec<u8> {
         if saved >= payload.len() / MIN_SAVING_DENOMINATOR * MIN_SAVING_NUMERATOR && !compressed.is_empty() {
             let mut out = Vec::with_capacity(1 + 4 + compressed.len());
             out.push(TAG_ZSTD);
-            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             out.extend_from_slice(&compressed);
             return out;
         }
@@ -105,7 +105,7 @@ pub fn unpack(bytes: &[u8]) -> io::Result<Vec<u8>> {
             let len_bytes = rest
                 .get(..4)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed record is missing its length"))?;
-            let original_len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+            let original_len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
 
             if original_len > MAX_DECOMPRESSED_RECORD {
                 return Err(io::Error::new(
@@ -197,7 +197,7 @@ mod tests {
 
         // A forged expansion length must be refused before it sizes an allocation.
         let mut bomb = vec![TAG_ZSTD];
-        bomb.extend_from_slice(&u32::MAX.to_le_bytes());
+        bomb.extend_from_slice(&u32::MAX.to_be_bytes());
         bomb.extend_from_slice(&[0u8; 8]);
         let err = unpack(&bomb).unwrap_err();
         assert!(err.to_string().contains("beyond the"), "unexpected: {}", err);
