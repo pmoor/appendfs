@@ -40,6 +40,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # Compile up front so the sweeps below measure only their own run time. Otherwise
+      # the first sweep silently absorbs the whole release build and its duration is not
+      # comparable to the second's, or to the same sweep on another day when the cache was
+      # warmer. FUZZ_SEEDS and FUZZ_STEPS are read through std::env::var at run time, not
+      # env!(), so setting them per step below does not invalidate anything built here.
+      - name: Build test binaries
+        id: build
+        run: cargo test --release --no-run --test concurrency_test --test fuzz_test
+
       # Release, unlike the per-PR job: these sweeps are far too slow unoptimised. The
       # sweep sizes are the ones AGENTS.md documents.
       - name: Concurrent stress sweep
@@ -48,12 +57,12 @@ jobs:
           FUZZ_STEPS: 8000
         run: cargo test --release --test concurrency_test -- --nocapture
 
-      # `always()` so a failure in the sweep above still leaves us with the result of this
-      # one. Running them as separate jobs used to give that for free; sharing a runner
-      # would otherwise mean the first failure hides whatever the second would have found,
-      # which is exactly the information a nightly exists to collect.
+      # Runs even when the sweep above failed, so one failure does not hide what the other
+      # would have found - that independence came for free when these were separate jobs.
+      # It is explicitly *not* `always()`: a build failure must abort the run rather than
+      # push a second doomed sweep through a compile that has already been shown broken.
       - name: Differential fuzzing and crash recovery sweep
-        if: always()
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           FUZZ_SEEDS: 500
           FUZZ_STEPS: 10000
