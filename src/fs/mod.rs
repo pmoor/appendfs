@@ -124,6 +124,16 @@ pub struct InMemoryFS {
     pub remote_registry: RwLock<Option<Arc<RwLock<crate::remote::RemoteRegistry>>>>,
     /// Live telemetry counters and synchronization state across all remotes.
     pub replication_telemetry: Arc<RwLock<crate::remote::worker::ReplicationTelemetry>>,
+    /// Threshold in bytes of committed log data before automatically exporting an intermediate .summary file on log roll (0 to disable).
+    pub summary_interval_bytes: AtomicU64,
+    /// Threshold in rolled generations before automatically exporting an intermediate .summary file on log roll (0 to disable).
+    pub summary_interval_generations: AtomicU64,
+    /// Cumulative data bytes flushed to the log since the last summary was exported.
+    pub bytes_since_last_summary: AtomicU64,
+    /// Number of generations rolled since the last summary was exported.
+    pub generations_since_last_summary: AtomicU64,
+    /// Generation number of the last exported summary file.
+    pub last_summary_generation: AtomicU64,
 }
 
 impl InMemoryFS {
@@ -209,7 +219,17 @@ impl InMemoryFS {
             virtual_handles: RwLock::new(HashMap::new()),
             remote_registry: RwLock::new(None),
             replication_telemetry: Arc::new(RwLock::new(crate::remote::worker::ReplicationTelemetry::new())),
+            summary_interval_bytes: AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_BYTES),
+            summary_interval_generations: AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_GENERATIONS),
+            bytes_since_last_summary: AtomicU64::new(0),
+            generations_since_last_summary: AtomicU64::new(0),
+            last_summary_generation: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_summary_intervals(&self, bytes: u64, generations: u64) {
+        self.summary_interval_bytes.store(bytes, Ordering::SeqCst);
+        self.summary_interval_generations.store(generations, Ordering::SeqCst);
     }
 
     pub fn set_remote_registry(&self, registry: Arc<RwLock<crate::remote::RemoteRegistry>>) {

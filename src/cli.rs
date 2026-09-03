@@ -27,6 +27,12 @@ pub const DEFAULT_MAX_FLUSH_QUEUE_DEPTH: usize = 4;
 
 pub use crate::remote::block_cache::DEFAULT_DECRYPTED_CACHE_SIZE;
 
+/// Default interval in bytes of committed log data before generating a new .summary snapshot file during log rolls (10 GiB).
+pub const DEFAULT_SUMMARY_INTERVAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Default interval in rolled log generations before generating a new .summary snapshot file during log rolls (10 generations).
+pub const DEFAULT_SUMMARY_INTERVAL_GENERATIONS: u64 = 10;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "appendfs",
@@ -333,6 +339,14 @@ pub struct MountArgs {
     /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
     #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
     pub decrypted_cache_size: usize,
+
+    /// Interval in bytes of committed log data before generating a new .summary snapshot file during log rolls (default: 10 GiB, 0 to disable byte-based trigger)
+    #[arg(long = "summary-interval-bytes", default_value_t = DEFAULT_SUMMARY_INTERVAL_BYTES)]
+    pub summary_interval_bytes: u64,
+
+    /// Interval in rolled log generations before generating a new .summary snapshot file during log rolls (default: 10, 0 to disable generation-based trigger)
+    #[arg(long = "summary-interval-generations", default_value_t = DEFAULT_SUMMARY_INTERVAL_GENERATIONS)]
+    pub summary_interval_generations: u64,
 }
 
 impl MountArgs {

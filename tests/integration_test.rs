@@ -2809,3 +2809,193 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
         );
     }
 }
+
+#[test]
+fn test_periodic_summary_generation_on_log_rolls() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
+    let key = Arc::new(appendfs::crypto::VolumeKey::plaintext());
+
+    // 1. Initialize empty volume (creates 000000.summary)
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        key.as_ref(),
+        appendfs::crypto::VolumeHeader::plaintext(),
+    )
+    .unwrap();
+
+    assert!(storage.exists("000000.summary"));
+    assert!(!storage.exists("000001.summary"));
+    assert!(!storage.exists("000002.summary"));
+
+    // 2. Open filesystem with small max_log_size (1500 bytes) and summary_interval_generations = 2
+    {
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::clock::SystemClock),
+            key.clone(),
+        )
+        .unwrap();
+
+        let writer = Arc::new(
+            appendfs::LogWriter::create_lazy(
+                storage.clone(),
+                1,
+                1500, // 1500 bytes max log size forces rapid rolling
+                0,
+                key.clone(),
+            )
+            .unwrap(),
+        );
+
+        fs.log_writer = Some(writer);
+        fs.set_log_dir(log_path);
+        // Configure to emit summary every 2 rolled generations (and 0 byte trigger)
+        fs.set_summary_intervals(0, 2);
+
+        // Generation 1: write file1 (1000 bytes). Total log size becomes ~1100 bytes.
+        let file1_data = vec![0x11u8; 1000];
+        let a1 = appendfs::operations::read_write::create_core(&fs, 1, "file1.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a1.ino, &file1_data, 0).unwrap();
+        fs.flush_log().unwrap();
+
+        // Generation 2: write file2 (1000 bytes). This will exceed 1500 bytes, causing roll to gen 2!
+        // Roll 1: gen 1 is sealed. generations_since_last_summary becomes 1 (< 2). No summary yet.
+        let file2_data = vec![0x22u8; 1000];
+        let a2 = appendfs::operations::read_write::create_core(&fs, 1, "file2.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a2.ino, &file2_data, 0).unwrap();
+        fs.flush_log().unwrap();
+
+        assert!(
+            !storage.exists("000001.summary"),
+            "Gen 1 roll should not emit summary yet (threshold is 2)"
+        );
+
+        // Generation 3: write file3 (1000 bytes). Exceeds 1500 bytes, causing roll to gen 3!
+        // Roll 2: gen 2 is sealed. generations_since_last_summary becomes 2 (>= 2).
+        // 000002.summary MUST be emitted!
+        let file3_data = vec![0x33u8; 1000];
+        let a3 = appendfs::operations::read_write::create_core(&fs, 1, "file3.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a3.ino, &file3_data, 0).unwrap();
+        fs.flush_log().unwrap();
+
+        assert!(
+            storage.exists("000002.summary"),
+            "Gen 2 roll must automatically emit 000002.summary while filesystem is mounted!"
+        );
+
+        // Generation 4: write file4 (1000 bytes) in gen 3.
+        let file4_data = vec![0x44u8; 1000];
+        let a4 = appendfs::operations::read_write::create_core(&fs, 1, "file4.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a4.ino, &file4_data, 0).unwrap();
+        fs.flush_log().unwrap();
+
+        // Simulate sudden crash: do NOT call sync_and_export_summary()!
+        // 000003.summary must NOT exist.
+        assert!(!storage.exists("000003.summary"));
+    }
+
+    // 3. Crash recovery: recover_fs should find 000002.summary, fast-recover base from it, and replay gen 3!
+    let recovered_fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::clock::SystemClock),
+        key.clone(),
+    )
+    .unwrap();
+
+    // Verify all 4 files exist and have correct contents!
+    let root_entries = recovered_fs.list_directory(1).unwrap();
+    let names: Vec<String> = root_entries.into_iter().map(|e| e.0).collect();
+    assert!(names.contains(&"file1.bin".to_string()));
+    assert!(names.contains(&"file2.bin".to_string()));
+    assert!(names.contains(&"file3.bin".to_string()));
+    assert!(names.contains(&"file4.bin".to_string()));
+
+    let f1_ino = recovered_fs.lookup_child(1, "file1.bin").unwrap();
+    let buf1 = appendfs::operations::read_write::read_core(&recovered_fs, f1_ino, 1000, 0).unwrap();
+    assert_eq!(buf1, vec![0x11u8; 1000]);
+
+    let f4_ino = recovered_fs.lookup_child(1, "file4.bin").unwrap();
+    let buf4 = appendfs::operations::read_write::read_core(&recovered_fs, f4_ino, 1000, 0).unwrap();
+    assert_eq!(buf4, vec![0x44u8; 1000]);
+}
+
+#[test]
+fn test_periodic_summary_generation_by_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path();
+    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
+    let key = Arc::new(appendfs::crypto::VolumeKey::plaintext());
+
+    appendfs::init_volume(
+        storage.clone(),
+        Some("main"),
+        key.as_ref(),
+        appendfs::crypto::VolumeHeader::plaintext(),
+    )
+    .unwrap();
+
+    // Configure 2500 bytes threshold and 1500 max log size
+    {
+        let mut fs = appendfs::recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            Arc::new(appendfs::clock::SystemClock),
+            key.clone(),
+        )
+        .unwrap();
+
+        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1500, 0, key.clone()).unwrap());
+
+        fs.log_writer = Some(writer);
+        fs.set_log_dir(log_path);
+        // Byte threshold = 2500, generations threshold = 0 (disabled)
+        fs.set_summary_intervals(2500, 0);
+
+        // 1. Write file1 (1000 bytes). Gen 1.
+        let a1 = appendfs::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a1.ino, &vec![1u8; 1000], 0).unwrap();
+        fs.flush_log().unwrap();
+
+        // 2. Write file2 (1000 bytes). Rolls to gen 2. bytes_since = 1000 (< 2500). No summary.
+        let a2 = appendfs::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a2.ino, &vec![2u8; 1000], 0).unwrap();
+        fs.flush_log().unwrap();
+        assert!(!storage.exists("000001.summary"));
+
+        // 3. Write file3 (1000 bytes). Rolls to gen 3. bytes_since = 2000 (< 2500). No summary.
+        let a3 = appendfs::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a3.ino, &vec![3u8; 1000], 0).unwrap();
+        fs.flush_log().unwrap();
+        assert!(!storage.exists("000002.summary"));
+
+        // 4. Write file4 (1000 bytes). Rolls to gen 4. bytes_since = 3000 (>= 2500).
+        // 000003.summary must be emitted!
+        let a4 = appendfs::operations::read_write::create_core(&fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
+        appendfs::operations::read_write::write_core(&fs, a4.ino, &vec![4u8; 1000], 0).unwrap();
+        fs.flush_log().unwrap();
+        assert!(
+            storage.exists("000003.summary"),
+            "Gen 3 roll must automatically emit 000003.summary based on byte threshold!"
+        );
+    }
+
+    let recovered_fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        Arc::new(appendfs::clock::SystemClock),
+        key.clone(),
+    )
+    .unwrap();
+
+    let root_entries = recovered_fs.list_directory(1).unwrap();
+    let names: Vec<String> = root_entries.into_iter().map(|e| e.0).collect();
+    assert!(names.contains(&"f1.bin".to_string()));
+    assert!(names.contains(&"f2.bin".to_string()));
+    assert!(names.contains(&"f3.bin".to_string()));
+    assert!(names.contains(&"f4.bin".to_string()));
+}

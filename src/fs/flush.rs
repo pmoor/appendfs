@@ -72,23 +72,69 @@ impl InMemoryFS {
         if let Some((next_gen, sealed_md5)) =
             writer.roll_if_needed(estimate_batch_bytes(frozen, max_extent_size), &*self.clock)?
         {
-            let mut manifest = self.manifest.write().unwrap();
             if let Some(md5) = sealed_md5 {
-                manifest.set_generation_md5(next_gen - 1, md5);
+                let sealed_gen = next_gen - 1;
+                {
+                    let mut manifest = self.manifest.write().unwrap();
+                    manifest.set_generation_md5(sealed_gen, md5);
+                    manifest.record_roll(
+                        next_gen,
+                        format!("{:06}.log", next_gen),
+                        self.clock.now(),
+                        crate::log::record::FILE_HEADER_SIZE as u64,
+                    );
+                }
+
+                self.generations_since_last_summary.fetch_add(1, Ordering::SeqCst);
+
+                let bytes_interval = self.summary_interval_bytes.load(Ordering::SeqCst);
+                let gen_interval = self.summary_interval_generations.load(Ordering::SeqCst);
+                let bytes_since = self.bytes_since_last_summary.load(Ordering::SeqCst);
+                let gens_since = self.generations_since_last_summary.load(Ordering::SeqCst);
+
+                let should_emit_summary = (bytes_interval > 0 && bytes_since >= bytes_interval)
+                    || (gen_interval > 0 && gens_since >= gen_interval);
+
+                if should_emit_summary {
+                    let storage = writer.storage();
+                    let last_tx_id = writer.last_tx_id();
+                    match self.export_summary_for_base(storage.as_ref(), sealed_gen, last_tx_id) {
+                        Ok(filename) => {
+                            self.bytes_since_last_summary.store(0, Ordering::SeqCst);
+                            self.generations_since_last_summary.store(0, Ordering::SeqCst);
+                            self.last_summary_generation.store(sealed_gen, Ordering::SeqCst);
+                            log::info!(
+                                "Exported periodic summary snapshot {} for sealed generation {} (last_tx_id: {})",
+                                filename,
+                                sealed_gen,
+                                last_tx_id
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to export periodic summary for sealed generation {}: {}",
+                                sealed_gen,
+                                e
+                            );
+                        }
+                    }
+                }
+            } else {
+                let mut manifest = self.manifest.write().unwrap();
+                manifest.record_roll(
+                    next_gen,
+                    format!("{:06}.log", next_gen),
+                    self.clock.now(),
+                    crate::log::record::FILE_HEADER_SIZE as u64,
+                );
             }
-            manifest.record_roll(
-                next_gen,
-                format!("{:06}.log", next_gen),
-                self.clock.now(),
-                crate::log::record::FILE_HEADER_SIZE as u64,
-            );
         }
 
         let batch_gen = writer.generation();
         let batch_start_offset = writer.current_offset();
         writer.checkpoint_batch_start();
 
-        let write_res = (|| -> std::io::Result<()> {
+        let write_res = (|| -> std::io::Result<u64> {
             let mut written_count = 0u32;
             let mut flushed_data_bytes = 0u64;
 
@@ -184,13 +230,19 @@ impl InMemoryFS {
                     entry.total_bytes = active_offset;
                 }
             }
-            Ok(())
+            Ok(flushed_data_bytes)
         })();
 
-        if let Err(e) = write_res {
-            let _ = writer.rollback_to(batch_gen, batch_start_offset);
-            return Err(e);
-        }
+        let flushed_data_bytes = match write_res {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = writer.rollback_to(batch_gen, batch_start_offset);
+                return Err(e);
+            }
+        };
+
+        self.bytes_since_last_summary
+            .fetch_add(flushed_data_bytes, Ordering::SeqCst);
 
         Ok(())
     }
@@ -384,12 +436,61 @@ impl InMemoryFS {
             ));
         }
 
-        crate::log::summary::export_summary(
+        let result = crate::log::summary::export_summary(
             &crate::log::summary::SummarySnapshot {
                 inodes: &snapshot,
                 manifest: &manifest,
                 volume_header: &self.volume_header,
                 generation,
+                last_tx_id,
+                next_inode,
+                created_at: now,
+            },
+            storage,
+            &self.volume_key,
+        );
+
+        if result.is_ok() {
+            self.bytes_since_last_summary.store(0, Ordering::SeqCst);
+            self.generations_since_last_summary.store(0, Ordering::SeqCst);
+            self.last_summary_generation.store(generation, Ordering::SeqCst);
+        }
+
+        result
+    }
+
+    /// Exports a single-file summary snapshot capturing the committed `base` layer for a sealed generation.
+    pub fn export_summary_for_base(
+        &self,
+        storage: &dyn Storage,
+        sealed_gen: u64,
+        last_tx_id: u64,
+    ) -> std::io::Result<String> {
+        let snapshot = self.base.read().unwrap().clone();
+        let next_inode = self.next_inode.load(Ordering::SeqCst);
+        let mut manifest = self.manifest.read().unwrap().clone();
+        manifest.populate_sealed_md5s(storage, sealed_gen + 1);
+        *self.manifest.write().unwrap() = manifest.clone();
+        let now = self.clock.now();
+
+        if self.volume_header.cipher != self.volume_key.cipher() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to export an unreadable summary: volume header describes a {} volume \
+                     but the key in use is for {}",
+                    self.volume_header.cipher,
+                    self.volume_key.cipher()
+                ),
+            ));
+        }
+
+        crate::log::summary::export_summary(
+            &crate::log::summary::SummarySnapshot {
+                inodes: &snapshot,
+                manifest: &manifest,
+                volume_header: &self.volume_header,
+                generation: sealed_gen,
                 last_tx_id,
                 next_inode,
                 created_at: now,

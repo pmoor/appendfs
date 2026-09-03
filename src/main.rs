@@ -364,6 +364,7 @@ fn main() {
             ));
             log_cache.set_decrypted_cache_size(args.decrypted_cache_size);
             fs_instance.log_cache = Some(log_cache);
+            fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
 
             let fs_instance = Arc::new(fs_instance);
 
