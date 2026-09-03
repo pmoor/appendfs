@@ -1,0 +1,51 @@
+# TEMPORARY diagnostic workflow. Delete once the CI-only EACCES failures are understood.
+name: Diagnose FUSE permissions
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    name: diagnose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config
+
+      - name: Runner identity and FUSE environment
+        run: |
+          echo "--- identity ---"
+          id
+          echo "umask: $(umask)"
+          echo "--- kernel / fuse ---"
+          uname -a
+          fusermount3 --version || true
+          ls -l /dev/fuse || true
+          echo "--- fuse.conf ---"
+          cat /etc/fuse.conf 2>/dev/null || echo "(no /etc/fuse.conf)"
+          echo "--- temp dir ---"
+          echo "TMPDIR=${TMPDIR:-<unset>}"
+          ls -ld "${TMPDIR:-/tmp}"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Must not fail the job: the point is to read the printed output, and one of the
+      # two shapes is expected to report the EACCES we are chasing.
+      - name: Root ownership diagnostic
+        run: cargo test --test diagnose_fuse_perms -- --nocapture --test-threads=1
+
+      # Run the four failing tests on their own, single-threaded, to confirm the failure
+      # is not an artifact of running them alongside the rest of the suite.
+      - name: The four failing tests, isolated
+        continue-on-error: true
+        run: |
+          cargo test --test integration_test -- --test-threads=1 \
+            test_recovery_after_remount \
+            test_fuse_flock_and_posix_locks \
+            test_mount_ro_rejects_mutations_and_enables_point_in_time_time_travel \
+            test_volume_init_mount_and_stats_flow
