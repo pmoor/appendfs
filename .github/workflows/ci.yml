@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch supersedes the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Deliberately has no FUSE dependency and no cargo build: rustfmt only parses the
+  # sources, so this reports a formatting failure in well under a minute rather than
+  # after a full dependency compile.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # build.rs probes fuse3 through pkg-config and fails hard without it, so the
+      # headers must be present before anything is compiled.
+      - name: Install FUSE build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfuse3-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --all-features so the `testing` feature's store implementations are linted too;
+      # they are gated out of a default build and would otherwise never be checked.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `fuse3` is needed in addition to the -dev package: the integration tests mount a
+      # real filesystem and call the fusermount3 binary to tear it down.
+      - name: Install FUSE build and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Debug rather than release: overflow checks and debug assertions are active, and
+      # the suite still finishes in well under a minute.
+      - run: cargo test
