@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::fs::InMemoryFS;
-use crate::log::{LogWriter, init_volume_with_clock};
+use crate::log::{LogWriter, init_volume_with_clock_and_uids};
 use crate::operations::dir::mkdir_core;
 use crate::operations::links::{link_core, readlink_core, symlink_core};
 use crate::operations::read_write::{
@@ -23,6 +23,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Fixed base timestamp used for all canonical v1 compatibility fixtures:
 /// 2023-11-14 22:13:20 UTC (1,700,000,000 seconds since UNIX epoch).
 pub const COMPAT_BASE_TIMESTAMP_SECS: u64 = 1_700_000_000;
+
+/// Root owner pinned into the canonical fixtures.
+///
+/// Fixture bytes are checked in and compared for equality, so the root directory's owner
+/// cannot come from whoever happens to run the generator. Real volumes take it from the
+/// invoking user instead - see `init_volume_with_clock_and_uids`.
+pub const COMPAT_UID: u32 = 1000;
+pub const COMPAT_GID: u32 = 1000;
 
 pub fn compat_time(offset_secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(COMPAT_BASE_TIMESTAMP_SECS + offset_secs)
@@ -434,13 +442,18 @@ pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(out_dir));
     let clock = Arc::new(CompatClock::new());
 
-    // 1. Initialize volume -> writes 000000.summary with deterministic clock
-    init_volume_with_clock(
+    // 1. Initialize volume -> writes 000000.summary with deterministic clock.
+    // The root owner is pinned rather than taken from the invoking user, because these
+    // bytes are checked in and must reproduce on any machine. Matches the uid/gid the rest
+    // of the canonical tree is built with below.
+    init_volume_with_clock_and_uids(
         storage.clone(),
         Some("main"),
         &VolumeKey::plaintext(),
         VolumeHeader::plaintext(),
         clock.clone(),
+        COMPAT_UID,
+        COMPAT_GID,
     )?;
 
     // 2. Open log writer for generation 1 with deterministic clock
@@ -456,7 +469,7 @@ pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
         .map_err(io::Error::other)?,
     );
 
-    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+    let mut fs = InMemoryFS::with_clock_and_uids(clock.clone(), COMPAT_UID, COMPAT_GID);
     fs.log_writer = Some(writer);
     fs.set_log_dir(out_dir);
 

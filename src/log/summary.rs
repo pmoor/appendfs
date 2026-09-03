@@ -419,12 +419,34 @@ pub fn init_volume(
     )
 }
 
+/// Initializes a volume whose root directory is owned by the invoking user.
 pub fn init_volume_with_clock(
     storage: Arc<dyn Storage>,
     branch: Option<&str>,
     volume_key: &VolumeKey,
     volume_header: crate::crypto::VolumeHeader,
     clock: Arc<dyn crate::clock::Clock>,
+) -> io::Result<String> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    init_volume_with_clock_and_uids(storage, branch, volume_key, volume_header, clock, uid, gid)
+}
+
+/// Initializes a volume with an explicit root owner.
+///
+/// Only for callers that need the resulting bytes to be identical on every machine, which
+/// means the compat fixture generator and nothing else. Ordinary callers want
+/// [`init_volume`], because a root owned by anyone other than the invoking user produces a
+/// volume that mounts and then refuses every write: the FUSE shim always passes
+/// `-odefault_permissions`, so the kernel enforces the recorded uid against the caller.
+pub fn init_volume_with_clock_and_uids(
+    storage: Arc<dyn Storage>,
+    branch: Option<&str>,
+    volume_key: &VolumeKey,
+    volume_header: crate::crypto::VolumeHeader,
+    clock: Arc<dyn crate::clock::Clock>,
+    uid: u32,
+    gid: u32,
 ) -> io::Result<String> {
     let files = storage.list_files()?;
     for file in files {
@@ -436,7 +458,7 @@ pub fn init_volume_with_clock(
         }
     }
 
-    let fs = InMemoryFS::with_clock_and_uids(clock.clone(), 1000, 1000);
+    let fs = InMemoryFS::with_clock_and_uids(clock.clone(), uid, gid);
     let snapshot = fs.snapshot_all();
     let branch_name = branch.unwrap_or("main");
     let manifest = crate::log::LogManifest {
