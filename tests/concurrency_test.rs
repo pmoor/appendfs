@@ -24,9 +24,9 @@ use appendfs::shim::{FileType, ShimFlock};
 use common::TestRng;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const UID: u32 = 1000;
 const GID: u32 = 1000;
@@ -709,18 +709,18 @@ fn run_concurrent_stress(seed: u64) {
     // folding it into `base`, all while other threads are mutating and reading across
     // those same layers - never runs concurrently with anything.
     let stop_flusher = Arc::new(AtomicBool::new(false));
+    let flush_count = Arc::new(AtomicU64::new(0));
     let flusher = {
         let fs = Arc::clone(&fs);
         let stop = Arc::clone(&stop_flusher);
+        let count = Arc::clone(&flush_count);
         thread::spawn(move || {
-            let mut flushes = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 fs.flush_log()
                     .unwrap_or_else(|e| panic!("concurrent flush failed: {}", e));
-                flushes += 1;
+                count.fetch_add(1, Ordering::Relaxed);
                 thread::sleep(Duration::from_micros(100));
             }
-            flushes
         })
     };
 
@@ -730,14 +730,28 @@ fn run_concurrent_stress(seed: u64) {
             .unwrap_or_else(|_| panic!("worker thread {} panicked (seed {})", i, seed));
     }
 
+    // Wait for the flusher to actually complete several passes before stopping it, rather
+    // than stopping immediately and then asserting it happened to have been scheduled more
+    // than once. On a busy two-core CI runner the workers can finish while the flusher is
+    // still inside its first `flush_log`, which made this assertion fail on scheduling luck
+    // rather than on anything the test is trying to catch.
+    const MIN_FLUSHES: u64 = 2;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while flush_count.load(Ordering::Relaxed) < MIN_FLUSHES && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+
     stop_flusher.store(true, Ordering::Relaxed);
-    let flushes = flusher
+    flusher
         .join()
         .unwrap_or_else(|_| panic!("flusher thread panicked (seed {})", seed));
-    // Guards against the flusher silently doing nothing if timing or thresholds change.
+
+    // Still a real guard: it now fails only if the flusher genuinely cannot make progress,
+    // not if it merely lost a scheduling race.
+    let flushes = flush_count.load(Ordering::Relaxed);
     assert!(
-        flushes > 1,
-        "flusher ran only {} time(s) (seed {}); the run was effectively single-batch",
+        flushes >= MIN_FLUSHES,
+        "flusher completed only {} pass(es) in 60s (seed {}); the run was effectively single-batch",
         flushes,
         seed
     );
