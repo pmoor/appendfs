@@ -1,6 +1,6 @@
 use crate::log::record::{FILE_HEADER_SIZE, FileHeader};
 use crate::remote::RemoteReadTarget;
-use crate::remote::block_cache::{DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, OnDiskBlockCache};
+use crate::remote::block_cache::{BlockCache, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache};
 use crate::remote::tiered_reader::TieredStorageReader;
 use crate::storage::{OsStorage, Storage, StorageReader};
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ pub struct LogFileCache {
     storage: Arc<dyn Storage>,
     cache: Mutex<HashMap<u64, Arc<dyn StorageReader>>>,
     pub decrypted_cache: Arc<DecryptedRecordCache>,
-    pub block_cache: Option<Arc<OnDiskBlockCache>>,
+    pub block_cache: Option<Arc<dyn BlockCache>>,
     pub remotes: Arc<RwLock<Vec<RemoteReadTarget>>>,
     pub manifest: Option<Arc<RwLock<crate::log::LogManifest>>>,
 }
@@ -40,7 +40,7 @@ impl LogFileCache {
 
     pub fn with_remote_support(
         storage: Arc<dyn Storage>,
-        block_cache: Option<Arc<OnDiskBlockCache>>,
+        block_cache: Option<Arc<dyn BlockCache>>,
         remotes: impl IntoIterator<Item = impl Into<RemoteReadTarget>>,
         manifest: Option<Arc<RwLock<crate::log::LogManifest>>>,
     ) -> Self {

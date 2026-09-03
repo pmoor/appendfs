@@ -6,8 +6,8 @@ use appendfs::shim::{FileAttr, FileType};
 use appendfs::storage::{FaultStorage, OsStorage, Storage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 /// Per-inode snapshot entry produced by `TestFS::get_tree_snapshot` - built entirely
@@ -73,6 +73,11 @@ pub struct TestFS {
     /// be injected repeatedly across a run.
     pub fault: Option<Arc<FaultStorage>>,
     pub _temp_dir: Option<Arc<tempfile::TempDir>>,
+    pub remotes: Vec<Arc<appendfs::FailingRemoteStore>>,
+    pub latency_remotes: Vec<Arc<appendfs::LatencyRemoteStore>>,
+    pub memory_remotes: Vec<Arc<appendfs::MemoryRemoteStore>>,
+    pub remote_registry: Option<Arc<RwLock<appendfs::RemoteRegistry>>>,
+    pub block_cache: Option<Arc<dyn appendfs::BlockCache>>,
 }
 
 #[allow(dead_code)]
@@ -133,6 +138,118 @@ impl TestFS {
             log_dir,
             fault,
             _temp_dir: Some(Arc::new(temp_dir)),
+            remotes: Vec::new(),
+            latency_remotes: Vec::new(),
+            memory_remotes: Vec::new(),
+            remote_registry: None,
+            block_cache: None,
+        }
+    }
+
+    pub fn new_temp_with_remotes(max_log_size: Option<u64>, clock: Arc<dyn Clock>, num_remotes: usize) -> Self {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let writer = make_writer(
+            &log_dir,
+            None,
+            1,
+            &*clock,
+            max_log_size.unwrap_or(appendfs::cli::DEFAULT_MAX_LOG_SIZE),
+            1,
+        );
+
+        let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        fs.set_log_dir(&log_dir);
+
+        // Export initial 000000.summary snapshot
+        let snapshot = fs.snapshot_all();
+        let manifest = fs.manifest.read().unwrap().clone();
+        let storage = fs.log_writer.as_ref().unwrap().storage();
+        let _ = appendfs::log::export_summary(
+            &appendfs::log::SummarySnapshot {
+                inodes: &snapshot,
+                manifest: &manifest,
+                volume_header: &fs.volume_header,
+                generation: 0,
+                last_tx_id: 0,
+                next_inode: 2,
+                created_at: clock.now(),
+            },
+            storage.as_ref(),
+            &fs.volume_key,
+        );
+
+        let block_cache: Arc<dyn appendfs::BlockCache> = Arc::new(appendfs::MemoryBlockCache::new(50 * 1024 * 1024));
+
+        let mut memory_remotes = Vec::new();
+        let mut latency_remotes = Vec::new();
+        let mut failing_remotes = Vec::new();
+        let mut remote_read_targets = Vec::new();
+
+        let mut registry = appendfs::RemoteRegistry::new();
+        registry.policy.min_synced_remotes = 1;
+        registry.policy.local_retention_secs = Some(0); // aggressive local eviction once verified
+        registry.policy.max_log_age_secs = 3600;
+        registry.policy.active_sync_interval_secs = 0;
+
+        for i in 0..num_remotes {
+            let name = format!("remote{}", i);
+            let mem = Arc::new(appendfs::MemoryRemoteStore::new());
+            let lat = Arc::new(appendfs::LatencyRemoteStore::new(mem.clone()));
+            let failing = Arc::new(appendfs::FailingRemoteStore::new(lat.clone()));
+
+            memory_remotes.push(mem);
+            latency_remotes.push(lat);
+            failing_remotes.push(failing.clone());
+
+            let mut cfg = appendfs::RemoteTargetConfig::new(format!("bucket-{}", i));
+            cfg.read_priority = 10 + i as u32;
+            registry.add_remote(&name, cfg);
+            registry.set_store_override(&name, failing.clone());
+
+            remote_read_targets.push(appendfs::RemoteReadTarget {
+                name,
+                store: failing,
+                priority: 10 + i as u32,
+            });
+        }
+
+        let log_cache = Arc::new(appendfs::LogFileCache::with_remote_support(
+            storage.clone(),
+            Some(block_cache.clone()),
+            remote_read_targets,
+            Some(Arc::clone(&fs.manifest)),
+        ));
+        fs.log_cache = Some(log_cache);
+
+        let registry_arc = Arc::new(RwLock::new(registry));
+        fs.set_remote_registry(Arc::clone(&registry_arc));
+
+        Self {
+            fs,
+            log_dir,
+            fault: None,
+            _temp_dir: Some(Arc::new(temp_dir)),
+            remotes: failing_remotes,
+            latency_remotes,
+            memory_remotes,
+            remote_registry: Some(registry_arc),
+            block_cache: Some(block_cache),
+        }
+    }
+
+    /// Triggers an immediate, synchronous remote replication cycle across all remotes.
+    pub fn sync_remotes(&self) {
+        if let Some(ref reg) = self.remote_registry {
+            let mut last_part_sync = SystemTime::UNIX_EPOCH;
+            let mut uploaded_parts = HashMap::new();
+            let _ = appendfs::RemoteReplicationWorker::run_cycle(
+                &self.fs,
+                reg,
+                &self.log_dir,
+                &mut last_part_sync,
+                &mut uploaded_parts,
+            );
         }
     }
 
@@ -142,6 +259,11 @@ impl TestFS {
             log_dir: log_dir.to_path_buf(),
             fault: None,
             _temp_dir: temp_dir,
+            remotes: Vec::new(),
+            latency_remotes: Vec::new(),
+            memory_remotes: Vec::new(),
+            remote_registry: None,
+            block_cache: None,
         }
     }
 
@@ -336,7 +458,8 @@ impl TestFS {
             let xattrs = self.xattr_snapshot(ino);
             match attr.file_type {
                 FileType::Directory => {
-                    let entries = appendfs::operations::dir::list_dir_core(&self.fs, ino).unwrap_or_default();
+                    let mut entries = appendfs::operations::dir::list_dir_core(&self.fs, ino).unwrap_or_default();
+                    entries.retain(|(_, child_ino)| *child_ino < 0xFFFF_FFFF_0000_0000);
                     for (_, child_ino) in &entries {
                         if visited.insert(*child_ino) {
                             queue.push_back(*child_ino);
@@ -439,6 +562,11 @@ impl TestFS {
             log_dir: log_dir.to_path_buf(),
             fault,
             _temp_dir: temp_dir,
+            remotes: Vec::new(),
+            latency_remotes: Vec::new(),
+            memory_remotes: Vec::new(),
+            remote_registry: None,
+            block_cache: None,
         }
     }
 }

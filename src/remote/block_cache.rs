@@ -254,6 +254,93 @@ impl OnDiskBlockCache {
     }
 }
 
+/// Common interface for local 1 MiB raw block caches (on-disk or in-memory).
+pub trait BlockCache: Send + Sync + std::fmt::Debug {
+    /// Reads a 1 MiB block from cache if present.
+    fn read_block(&self, generation: u64, block_idx: u64) -> io::Result<Option<Vec<u8>>>;
+    /// Writes a 1 MiB block into cache, pruning oldest entries if capacity is exceeded.
+    fn write_block(&self, generation: u64, block_idx: u64, data: &[u8]) -> io::Result<()>;
+    /// Prunes excess cached blocks if capacity is exceeded.
+    fn prune_if_needed(&self) -> io::Result<()>;
+    /// Reference to the single-flight request coalescer associated with this block cache.
+    fn coalescer(&self) -> &Arc<super::RemoteReadCoalescer>;
+}
+
+impl BlockCache for OnDiskBlockCache {
+    fn read_block(&self, generation: u64, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
+        self.read_block(generation, block_idx)
+    }
+
+    fn write_block(&self, generation: u64, block_idx: u64, data: &[u8]) -> io::Result<()> {
+        self.write_block(generation, block_idx, data)
+    }
+
+    fn prune_if_needed(&self) -> io::Result<()> {
+        self.prune_if_needed()
+    }
+
+    fn coalescer(&self) -> &Arc<super::RemoteReadCoalescer> {
+        self.coalescer()
+    }
+}
+
+/// In-memory LRU block cache storing raw encrypted 1 MiB chunks without touching local disk.
+#[derive(Debug)]
+pub struct MemoryBlockCache {
+    entries: Mutex<HashMap<(u64, u64), Vec<u8>>>,
+    max_bytes: usize,
+    coalescer: Arc<super::RemoteReadCoalescer>,
+}
+
+impl MemoryBlockCache {
+    pub fn new(max_bytes: usize) -> Self {
+        Self::with_coalescer(max_bytes, Arc::new(super::RemoteReadCoalescer::new()))
+    }
+
+    pub fn with_coalescer(max_bytes: usize, coalescer: Arc<super::RemoteReadCoalescer>) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            max_bytes,
+            coalescer,
+        }
+    }
+}
+
+impl BlockCache for MemoryBlockCache {
+    fn read_block(&self, generation: u64, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
+        let guard = self.entries.lock().unwrap();
+        Ok(guard.get(&(generation, block_idx)).cloned())
+    }
+
+    fn write_block(&self, generation: u64, block_idx: u64, data: &[u8]) -> io::Result<()> {
+        let mut guard = self.entries.lock().unwrap();
+        guard.insert((generation, block_idx), data.to_vec());
+        drop(guard);
+        self.prune_if_needed()
+    }
+
+    fn prune_if_needed(&self) -> io::Result<()> {
+        let mut guard = self.entries.lock().unwrap();
+        let mut current_bytes: usize = guard.values().map(|v| v.len()).sum();
+        if current_bytes > self.max_bytes {
+            let keys: Vec<(u64, u64)> = guard.keys().copied().collect();
+            for k in keys {
+                if current_bytes <= self.max_bytes {
+                    break;
+                }
+                if let Some(removed) = guard.remove(&k) {
+                    current_bytes = current_bytes.saturating_sub(removed.len());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn coalescer(&self) -> &Arc<super::RemoteReadCoalescer> {
+        &self.coalescer
+    }
+}
+
 /// Unified two-tiered cache containing on-disk raw blocks and in-memory decrypted payloads.
 #[derive(Debug)]
 pub struct TieredCache {
@@ -340,6 +427,30 @@ mod tests {
         cache.write_block(1, 2, &data3).unwrap();
 
         // One of the older blocks was pruned to stay under 2500 bytes
+        let remaining = [
+            cache.read_block(1, 0).unwrap().is_some(),
+            cache.read_block(1, 1).unwrap().is_some(),
+            cache.read_block(1, 2).unwrap().is_some(),
+        ];
+        assert_eq!(remaining.iter().filter(|&&b| b).count(), 2);
+    }
+
+    #[test]
+    fn test_memory_block_cache_write_read_and_prune() {
+        let cache = MemoryBlockCache::new(2500);
+
+        assert_eq!(cache.read_block(1, 0).unwrap(), None);
+
+        let data1 = vec![0xAA; 1000];
+        cache.write_block(1, 0, &data1).unwrap();
+        assert_eq!(cache.read_block(1, 0).unwrap().unwrap(), data1);
+
+        let data2 = vec![0xBB; 1000];
+        cache.write_block(1, 1, &data2).unwrap();
+
+        let data3 = vec![0xCC; 1000];
+        cache.write_block(1, 2, &data3).unwrap();
+
         let remaining = [
             cache.read_block(1, 0).unwrap().is_some(),
             cache.read_block(1, 1).unwrap().is_some(),

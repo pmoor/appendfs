@@ -237,14 +237,30 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
 pub struct RemoteReplicationWorker {
     running: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
+    fs: Arc<InMemoryFS>,
+    registry: Arc<RwLock<RemoteRegistry>>,
+    log_dir: PathBuf,
 }
 
 impl RemoteReplicationWorker {
-    /// Starts the background replication worker thread.
+    /// Starts the background replication worker thread with default 5-second interval.
     pub fn start(fs: Arc<InMemoryFS>, registry: Arc<RwLock<RemoteRegistry>>, log_dir: PathBuf) -> Self {
+        Self::start_with_interval(fs, registry, log_dir, Duration::from_secs(5))
+    }
+
+    /// Starts the background replication worker thread with a configurable maintenance poll interval.
+    pub fn start_with_interval(
+        fs: Arc<InMemoryFS>,
+        registry: Arc<RwLock<RemoteRegistry>>,
+        log_dir: PathBuf,
+        poll_interval: Duration,
+    ) -> Self {
         fs.set_remote_registry(Arc::clone(&registry));
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
+        let fs_clone = Arc::clone(&fs);
+        let registry_clone = Arc::clone(&registry);
+        let log_dir_clone = log_dir.clone();
 
         let thread_handle = thread::spawn(move || {
             let mut last_part_sync = SystemTime::now();
@@ -253,30 +269,31 @@ impl RemoteReplicationWorker {
 
             while running_clone.load(Ordering::SeqCst) {
                 if let Err(e) = Self::run_cycle(
-                    &fs,
-                    &registry,
-                    &log_dir,
+                    &fs_clone,
+                    &registry_clone,
+                    &log_dir_clone,
                     &mut last_part_sync,
                     &mut uploaded_part_offsets,
                 ) {
                     log::warn!("Remote replication worker cycle error: {}", e);
                 }
 
-                // Sleep for 5 seconds between periodic maintenance checks
-                for _ in 0..50 {
+                let check_slice = Duration::from_millis(50).min(poll_interval);
+                let slices = (poll_interval.as_millis() / check_slice.as_millis().max(1)).max(1);
+                for _ in 0..slices {
                     if !running_clone.load(Ordering::SeqCst) {
                         break;
                     }
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(check_slice);
                 }
             }
 
             // Final drain cycle on unmount/shutdown
             log::info!("Flushing remaining remote sync tasks before shutdown...");
             let _ = Self::run_cycle(
-                &fs,
-                &registry,
-                &log_dir,
+                &fs_clone,
+                &registry_clone,
+                &log_dir_clone,
                 &mut last_part_sync,
                 &mut uploaded_part_offsets,
             );
@@ -285,11 +302,27 @@ impl RemoteReplicationWorker {
         Self {
             running,
             thread_handle: Some(thread_handle),
+            fs,
+            registry,
+            log_dir,
         }
     }
 
+    /// Explicitly and synchronously triggers an immediate remote replication and cross-copy cycle.
+    pub fn sync_now(&self) -> io::Result<()> {
+        let mut last_part_sync = SystemTime::UNIX_EPOCH;
+        let mut uploaded_parts = std::collections::HashMap::new();
+        Self::run_cycle(
+            &self.fs,
+            &self.registry,
+            &self.log_dir,
+            &mut last_part_sync,
+            &mut uploaded_parts,
+        )
+    }
+
     pub fn run_cycle(
-        fs: &Arc<InMemoryFS>,
+        fs: &InMemoryFS,
         registry: &Arc<RwLock<RemoteRegistry>>,
         _log_dir: &Path,
         last_part_sync: &mut SystemTime,
@@ -416,20 +449,72 @@ impl RemoteReplicationWorker {
             }
         }
 
-        // 3. Sync latest .summary checkpoint file to writable remotes
+        // 3. Sync .summary checkpoint files to writable remotes
         let local_files = storage.list_files()?;
-        let latest_summary = local_files.iter().filter(|f| f.ends_with(".summary")).max().cloned();
+        let mut summary_files: std::collections::BTreeSet<String> = local_files
+            .iter()
+            .filter(|f| f.ends_with(".summary"))
+            .cloned()
+            .collect();
+        // Also check if any remotes have summary files not in local storage
+        for (_, remote, _, _) in &stores {
+            if let Ok(objs) = remote.list_objects("") {
+                for obj in objs {
+                    if obj.key.ends_with(".summary") {
+                        summary_files.insert(obj.key);
+                    }
+                }
+            }
+        }
 
-        if let Some(ref sum_file) = latest_summary {
+        for sum_file in &summary_files {
+            let local_exists = storage.exists(sum_file);
+            let local_len = if local_exists {
+                storage.file_len(sum_file).unwrap_or(0)
+            } else {
+                0
+            };
+
             for (remote_name, remote, read_only, _) in &stores {
                 if *read_only {
                     continue;
                 }
                 let head = remote.head_object(sum_file)?;
-                let local_len = storage.file_len(sum_file).unwrap_or(0);
-                if head.is_none() || head.map(|h| h.size) != Some(local_len) {
-                    log::info!("Syncing latest checkpoint {} to remote '{}'...", sum_file, remote_name);
-                    let _ = upload_storage_file(storage.as_ref(), remote.as_ref(), sum_file, None);
+                let needs_sync = match head {
+                    None => true,
+                    Some(h) if local_exists => h.size != local_len,
+                    _ => false,
+                };
+
+                if needs_sync {
+                    if local_exists {
+                        log::info!("Syncing summary {} to remote '{}'...", sum_file, remote_name);
+                        let _ = upload_storage_file(storage.as_ref(), remote.as_ref(), sum_file, None);
+                    } else {
+                        // Find a peer remote that has this summary
+                        for (src_name, src_remote, _, _) in &stores {
+                            if src_name == remote_name {
+                                continue;
+                            }
+                            if let Ok(Some(src_head)) = src_remote.head_object(sum_file) {
+                                log::info!(
+                                    "Cross-copying summary {} ({} bytes) from remote '{}' to '{}'...",
+                                    sum_file,
+                                    src_head.size,
+                                    src_name,
+                                    remote_name
+                                );
+                                let _ = cross_copy_file(
+                                    src_remote.as_ref(),
+                                    remote.as_ref(),
+                                    sum_file,
+                                    src_head.size,
+                                    None,
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -491,7 +576,10 @@ impl RemoteReplicationWorker {
         stores: &[(String, Arc<dyn RemoteStore>, bool, bool)],
     ) {
         let now = SystemTime::now();
-        let retention_dur = Duration::from_secs(policy.local_retention_days * 86400);
+        let retention_dur = policy
+            .local_retention_secs
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(policy.local_retention_days * 86400));
 
         for log_entry in &manifest.logs {
             let gen_num = log_entry.generation;

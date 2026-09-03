@@ -1,5 +1,6 @@
 mod common;
 use appendfs::LogWriter;
+use appendfs::RemoteStore;
 use appendfs::clock::{AdvancingClock, Clock, MockClock, SystemClock};
 use appendfs::log::{LogAttrDelta, LogDirectoryDelta, LogEntryDelta, LogFileDelta, LogNodeDelta, OpCode, recover_fs};
 use appendfs::node::NodeKind;
@@ -30,6 +31,10 @@ fn test_differential_fuzzing_and_crash_recovery() {
         // (the permanent wedge, mid-batch torn records, the unbounded flush queue) lived in
         // that seam and was invisible to a fuzzer that only ever saw a healthy disk.
         let mut fs_crash = TestFS::new_temp_with_fault_injection(None, Arc::new(clock.clone()));
+        // The remote instance is backed by N=3 in-memory remotes with latency injection,
+        // fault injection, aggressive local log pruning (local_retention_secs = 0), and
+        // spontaneous file deletion with single-survivor invariants.
+        let mut fs_remote = TestFS::new_temp_with_remotes(Some(256), Arc::new(clock.clone()), 3);
 
         // Split data records aggressively on every instance except the baseline, so extent
         // chunking is itself under differential test: the same content must come back no
@@ -40,6 +45,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
         fs_micro.set_max_extent_size(37 + (seed as usize % 23));
         fs_remount.set_max_extent_size(64);
         fs_crash.set_max_extent_size(101);
+        fs_remote.set_max_extent_size(83);
+
+        for lat in &fs_remote.latency_remotes {
+            lat.set_random_delay(Duration::from_millis(0), Duration::from_millis(1));
+        }
 
         let mut observed_flush_failures = 0usize;
 
@@ -53,6 +63,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
             fh2: u64,
             fh3: u64,
             fh4: u64,
+            fh5: u64,
             expected_snapshot: Vec<(String, u64)>,
         }
 
@@ -62,6 +73,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
             fh2: u64,
             fh3: u64,
             fh4: u64,
+            fh5: u64,
         }
 
         let mut open_dir_handles: Vec<FuzzDirHandle> = Vec::new();
@@ -94,10 +106,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     let res2 = fs_micro.mkdir(parent, &name, 0o755);
                     let res3 = fs_remount.mkdir(parent, &name, 0o755);
                     let res4 = fs_crash.mkdir(parent, &name, 0o755);
+                    let res5 = fs_remote.mkdir(parent, &name, 0o755);
 
                     assert_eq!(res1, res2);
                     assert_eq!(res1, res3);
                     assert_eq!(res1, res4);
+                    assert_eq!(res1, res5);
 
                     if let Ok(ino) = res1 {
                         active_dirs.push(ino);
@@ -111,10 +125,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     let res2 = fs_micro.create(parent, &name, 0o644);
                     let res3 = fs_remount.create(parent, &name, 0o644);
                     let res4 = fs_crash.create(parent, &name, 0o644);
+                    let res5 = fs_remote.create(parent, &name, 0o644);
 
                     assert_eq!(res1, res2);
                     assert_eq!(res1, res3);
                     assert_eq!(res1, res4);
+                    assert_eq!(res1, res5);
 
                     if let Ok(ino) = res1 {
                         active_files.push(ino);
@@ -132,10 +148,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let res2 = fs_micro.write(ino, offset, &payload);
                         let res3 = fs_remount.write(ino, offset, &payload);
                         let res4 = fs_crash.write(ino, offset, &payload);
+                        let res5 = fs_remote.write(ino, offset, &payload);
 
                         assert_eq!(res1, res2);
                         assert_eq!(res1, res3);
                         assert_eq!(res1, res4);
+                        assert_eq!(res1, res5);
                     }
                 }
                 3 => {
@@ -159,10 +177,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             let res2 = fs_micro.unlink(parent_to_unlink, &name);
                             let res3 = fs_remount.unlink(parent_to_unlink, &name);
                             let res4 = fs_crash.unlink(parent_to_unlink, &name);
+                            let res5 = fs_remote.unlink(parent_to_unlink, &name);
 
                             assert_eq!(res1, res2);
                             assert_eq!(res1, res3);
                             assert_eq!(res1, res4);
+                            assert_eq!(res1, res5);
 
                             if res1.is_ok() {
                                 let still_alive = fs_baseline.fs.get_attr(ino).is_some();
@@ -222,10 +242,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             let res2 = fs_micro.rename(src_parent, &src_name, dest_parent, &dest_name);
                             let res3 = fs_remount.rename(src_parent, &src_name, dest_parent, &dest_name);
                             let res4 = fs_crash.rename(src_parent, &src_name, dest_parent, &dest_name);
+                            let res5 = fs_remote.rename(src_parent, &src_name, dest_parent, &dest_name);
 
                             assert_eq!(res1, res2, "rename result mismatch (baseline vs micro)");
                             assert_eq!(res1, res3, "rename result mismatch (baseline vs remount)");
                             assert_eq!(res1, res4, "rename result mismatch (baseline vs crash)");
+                            assert_eq!(res1, res5, "rename result mismatch (baseline vs remote)");
                         }
                     }
                 }
@@ -254,10 +276,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             let res2 = fs_micro.rmdir(parent, &name);
                             let res3 = fs_remount.rmdir(parent, &name);
                             let res4 = fs_crash.rmdir(parent, &name);
+                            let res5 = fs_remote.rmdir(parent, &name);
 
                             assert_eq!(res1, res2, "rmdir result mismatch (baseline vs micro)");
                             assert_eq!(res1, res3, "rmdir result mismatch (baseline vs remount)");
                             assert_eq!(res1, res4, "rmdir result mismatch (baseline vs crash)");
+                            assert_eq!(res1, res5, "rmdir result mismatch (baseline vs remote)");
 
                             if res1.is_ok() {
                                 active_dirs.retain(|&i| i != ino);
@@ -275,10 +299,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     let res2 = fs_micro.symlink(parent, &name, &target);
                     let res3 = fs_remount.symlink(parent, &name, &target);
                     let res4 = fs_crash.symlink(parent, &name, &target);
+                    let res5 = fs_remote.symlink(parent, &name, &target);
 
                     assert_eq!(res1, res2, "symlink result mismatch (baseline vs micro)");
                     assert_eq!(res1, res3, "symlink result mismatch (baseline vs remount)");
                     assert_eq!(res1, res4, "symlink result mismatch (baseline vs crash)");
+                    assert_eq!(res1, res5, "symlink result mismatch (baseline vs remote)");
 
                     if let Ok(ino) = res1 {
                         active_files.push(ino);
@@ -295,10 +321,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let res2 = fs_micro.link(ino, newparent, &newname);
                         let res3 = fs_remount.link(ino, newparent, &newname);
                         let res4 = fs_crash.link(ino, newparent, &newname);
+                        let res5 = fs_remote.link(ino, newparent, &newname);
 
                         assert_eq!(res1, res2, "link result mismatch (baseline vs micro)");
                         assert_eq!(res1, res3, "link result mismatch (baseline vs remount)");
                         assert_eq!(res1, res4, "link result mismatch (baseline vs crash)");
+                        assert_eq!(res1, res5, "link result mismatch (baseline vs remote)");
                     }
                 }
                 8 => {
@@ -345,10 +373,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let res2 = fs_micro.setattr(ino, mode, uid, gid, size, None, None);
                         let res3 = fs_remount.setattr(ino, mode, uid, gid, size, None, None);
                         let res4 = fs_crash.setattr(ino, mode, uid, gid, size, None, None);
+                        let res5 = fs_remote.setattr(ino, mode, uid, gid, size, None, None);
 
                         assert_eq!(res1, res2, "setattr result mismatch (baseline vs micro)");
                         assert_eq!(res1, res3, "setattr result mismatch (baseline vs remount)");
                         assert_eq!(res1, res4, "setattr result mismatch (baseline vs crash)");
+                        assert_eq!(res1, res5, "setattr result mismatch (baseline vs remote)");
                     }
                 }
                 9 => {
@@ -361,10 +391,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let res2 = fs_micro.readlink(ino);
                         let res3 = fs_remount.readlink(ino);
                         let res4 = fs_crash.readlink(ino);
+                        let res5 = fs_remote.readlink(ino);
 
                         assert_eq!(res1, res2, "readlink result mismatch (baseline vs micro)");
                         assert_eq!(res1, res3, "readlink result mismatch (baseline vs remount)");
                         assert_eq!(res1, res4, "readlink result mismatch (baseline vs crash)");
+                        assert_eq!(res1, res5, "readlink result mismatch (baseline vs remote)");
                     }
                 }
                 10 => {
@@ -375,10 +407,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let res2 = fs_micro.read(ino, 0, 4096);
                         let res3 = fs_remount.read(ino, 0, 4096);
                         let res4 = fs_crash.read(ino, 0, 4096);
+                        let res5 = fs_remote.read(ino, 0, 4096);
 
                         assert_eq!(res1, res2);
                         assert_eq!(res1, res3);
                         assert_eq!(res1, res4);
+                        assert_eq!(res1, res5);
                     }
                 }
                 11 => {
@@ -388,20 +422,32 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     let res2 = fs_micro.opendir(ino);
                     let res3 = fs_remount.opendir(ino);
                     let res4 = fs_crash.opendir(ino);
+                    let res5 = fs_remote.opendir(ino);
 
                     assert_eq!(res1.is_ok(), res2.is_ok());
                     assert_eq!(res1.is_ok(), res3.is_ok());
                     assert_eq!(res1.is_ok(), res4.is_ok());
+                    assert_eq!(res1.is_ok(), res5.is_ok());
 
-                    if let (Ok(fh1), Ok(fh2), Ok(fh3), Ok(fh4)) = (res1, res2, res3, res4) {
+                    if let (Ok(fh1), Ok(fh2), Ok(fh3), Ok(fh4), Ok(fh5)) = (res1, res2, res3, res4, res5) {
                         let snap1 = fs_baseline.fs.get_dir_handle(fh1).expect("baseline dir handle");
                         let snap2 = fs_micro.fs.get_dir_handle(fh2).expect("micro dir handle");
                         let snap3 = fs_remount.fs.get_dir_handle(fh3).expect("remount dir handle");
                         let snap4 = fs_crash.fs.get_dir_handle(fh4).expect("crash dir handle");
+                        let snap5 = fs_remote.fs.get_dir_handle(fh5).expect("remote dir handle");
+                        let snap5_filtered: Vec<(String, u64)> = snap5
+                            .iter()
+                            .filter(|(_, child_ino)| *child_ino < 0xFFFF_FFFF_0000_0000)
+                            .cloned()
+                            .collect();
 
                         assert_eq!(&*snap1, &*snap2, "opendir snapshot mismatch (baseline vs micro)");
                         assert_eq!(&*snap1, &*snap3, "opendir snapshot mismatch (baseline vs remount)");
                         assert_eq!(&*snap1, &*snap4, "opendir snapshot mismatch (baseline vs crash)");
+                        assert_eq!(
+                            &*snap1, &snap5_filtered,
+                            "opendir snapshot mismatch (baseline vs remote)"
+                        );
 
                         open_dir_handles.push(FuzzDirHandle {
                             ino,
@@ -409,6 +455,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             fh2,
                             fh3,
                             fh4,
+                            fh5,
                             expected_snapshot: (*snap1).clone(),
                         });
                     }
@@ -424,20 +471,32 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let snap2 = fs_micro.fs.get_dir_handle(h.fh2).expect("micro handle");
                         let snap3 = fs_remount.fs.get_dir_handle(h.fh3).expect("remount handle");
                         let snap4 = fs_crash.fs.get_dir_handle(h.fh4).expect("crash handle");
+                        let snap5 = fs_remote.fs.get_dir_handle(h.fh5).expect("remote handle");
+                        let snap5_filtered: Vec<(String, u64)> = snap5
+                            .iter()
+                            .filter(|(_, child_ino)| *child_ino < 0xFFFF_FFFF_0000_0000)
+                            .cloned()
+                            .collect();
 
                         assert_eq!(&*snap1, &h.expected_snapshot, "Snapshot isolation violated in baseline");
                         assert_eq!(&*snap2, &h.expected_snapshot, "Snapshot isolation violated in micro");
                         assert_eq!(&*snap3, &h.expected_snapshot, "Snapshot isolation violated in remount");
                         assert_eq!(&*snap4, &h.expected_snapshot, "Snapshot isolation violated in crash");
+                        assert_eq!(
+                            &snap5_filtered, &h.expected_snapshot,
+                            "Snapshot isolation violated in remote"
+                        );
 
                         let res1 = fs_baseline.releasedir(h.ino, h.fh1);
                         let res2 = fs_micro.releasedir(h.ino, h.fh2);
                         let res3 = fs_remount.releasedir(h.ino, h.fh3);
                         let res4 = fs_crash.releasedir(h.ino, h.fh4);
+                        let res5 = fs_remote.releasedir(h.ino, h.fh5);
 
                         assert_eq!(res1, res2);
                         assert_eq!(res1, res3);
                         assert_eq!(res1, res4);
+                        assert_eq!(res1, res5);
                     }
                 }
                 13 => {
@@ -448,18 +507,21 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let res2 = fs_micro.open(ino, libc::O_RDWR as u32);
                         let res3 = fs_remount.open(ino, libc::O_RDWR as u32);
                         let res4 = fs_crash.open(ino, libc::O_RDWR as u32);
+                        let res5 = fs_remote.open(ino, libc::O_RDWR as u32);
 
                         assert_eq!(res1.is_ok(), res2.is_ok());
                         assert_eq!(res1.is_ok(), res3.is_ok());
                         assert_eq!(res1.is_ok(), res4.is_ok());
+                        assert_eq!(res1.is_ok(), res5.is_ok());
 
-                        if let (Ok(fh1), Ok(fh2), Ok(fh3), Ok(fh4)) = (res1, res2, res3, res4) {
+                        if let (Ok(fh1), Ok(fh2), Ok(fh3), Ok(fh4), Ok(fh5)) = (res1, res2, res3, res4, res5) {
                             open_file_handles.push(FuzzFileHandle {
                                 ino,
                                 fh1,
                                 fh2,
                                 fh3,
                                 fh4,
+                                fh5,
                             });
                         }
                     }
@@ -491,40 +553,48 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 let res2 = fs_micro.setxattr(ino, name, &value, flags);
                                 let res3 = fs_remount.setxattr(ino, name, &value, flags);
                                 let res4 = fs_crash.setxattr(ino, name, &value, flags);
+                                let res5 = fs_remote.setxattr(ino, name, &value, flags);
 
                                 assert_eq!(res1, res2, "setxattr result mismatch (baseline vs micro)");
                                 assert_eq!(res1, res3, "setxattr result mismatch (baseline vs remount)");
                                 assert_eq!(res1, res4, "setxattr result mismatch (baseline vs crash)");
+                                assert_eq!(res1, res5, "setxattr result mismatch (baseline vs remote)");
                             }
                             1 => {
                                 let res1 = fs_baseline.removexattr(ino, name);
                                 let res2 = fs_micro.removexattr(ino, name);
                                 let res3 = fs_remount.removexattr(ino, name);
                                 let res4 = fs_crash.removexattr(ino, name);
+                                let res5 = fs_remote.removexattr(ino, name);
 
                                 assert_eq!(res1, res2, "removexattr result mismatch (baseline vs micro)");
                                 assert_eq!(res1, res3, "removexattr result mismatch (baseline vs remount)");
                                 assert_eq!(res1, res4, "removexattr result mismatch (baseline vs crash)");
+                                assert_eq!(res1, res5, "removexattr result mismatch (baseline vs remote)");
                             }
                             2 => {
                                 let res1 = fs_baseline.getxattr(ino, name);
                                 let res2 = fs_micro.getxattr(ino, name);
                                 let res3 = fs_remount.getxattr(ino, name);
                                 let res4 = fs_crash.getxattr(ino, name);
+                                let res5 = fs_remote.getxattr(ino, name);
 
                                 assert_eq!(res1, res2, "getxattr result mismatch (baseline vs micro)");
                                 assert_eq!(res1, res3, "getxattr result mismatch (baseline vs remount)");
                                 assert_eq!(res1, res4, "getxattr result mismatch (baseline vs crash)");
+                                assert_eq!(res1, res5, "getxattr result mismatch (baseline vs remote)");
                             }
                             _ => {
                                 let res1 = fs_baseline.listxattr(ino);
                                 let res2 = fs_micro.listxattr(ino);
                                 let res3 = fs_remount.listxattr(ino);
                                 let res4 = fs_crash.listxattr(ino);
+                                let res5 = fs_remote.listxattr(ino);
 
                                 assert_eq!(res1, res2, "listxattr result mismatch (baseline vs micro)");
                                 assert_eq!(res1, res3, "listxattr result mismatch (baseline vs remount)");
                                 assert_eq!(res1, res4, "listxattr result mismatch (baseline vs crash)");
+                                assert_eq!(res1, res5, "listxattr result mismatch (baseline vs remote)");
                             }
                         }
                     }
@@ -544,10 +614,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let res2 = fs_micro.punch(ino, offset, len);
                         let res3 = fs_remount.punch(ino, offset, len);
                         let res4 = fs_crash.punch(ino, offset, len);
+                        let res5 = fs_remote.punch(ino, offset, len);
 
                         assert_eq!(res1, res2);
                         assert_eq!(res1, res3);
                         assert_eq!(res1, res4);
+                        assert_eq!(res1, res5);
                     }
                 }
                 _ => {
@@ -560,10 +632,53 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let res2 = fs_micro.release(h.ino, h.fh2);
                         let res3 = fs_remount.release(h.ino, h.fh3);
                         let res4 = fs_crash.release(h.ino, h.fh4);
+                        let res5 = fs_remote.release(h.ino, h.fh5);
 
                         assert_eq!(res1, res2);
                         assert_eq!(res1, res3);
                         assert_eq!(res1, res4);
+                        assert_eq!(res1, res5);
+                    }
+                }
+            }
+
+            // Inject periodic remote chaos:
+            // 1. Injected transient faults on a single remote (so peer remotes remain healthy for failover)
+            if step % 5 == 0 {
+                let r_idx = prng.gen_range(0, fs_remote.remotes.len() - 1);
+                fs_remote.remotes[r_idx].fail_next_n_requests(1);
+            }
+            // 2. Periodic sync cycle (progressing replication and local log pruning)
+            if step % 3 == 0 {
+                fs_remote.sync_remotes();
+            }
+            // 3. Spontaneous deletion with single-survivor invariant:
+            // Hash of object key determines single keeper remote.
+            // Only delete from non-keeper remotes IF keeper remote actually holds the object!
+            if step % 7 == 0 {
+                let n_remotes = fs_remote.memory_remotes.len();
+                let mut all_keys = std::collections::HashSet::new();
+                for mem in &fs_remote.memory_remotes {
+                    if let Ok(objs) = mem.list_objects("") {
+                        for o in objs {
+                            all_keys.insert(o.key);
+                        }
+                    }
+                }
+                for key in all_keys {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(&key, &mut hasher);
+                    let keeper = (std::hash::Hasher::finish(&hasher) as usize) % n_remotes;
+                    let keeper_has_it = fs_remote.memory_remotes[keeper]
+                        .head_object(&key)
+                        .map(|o| o.is_some())
+                        .unwrap_or(false);
+                    if keeper_has_it {
+                        for (i, mem) in fs_remote.memory_remotes.iter().enumerate() {
+                            if i != keeper && prng.gen_range(0, 100) < 50 {
+                                let _ = mem.delete_object(&key);
+                            }
+                        }
                     }
                 }
             }
@@ -583,12 +698,14 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     let _ = fs_micro.releasedir(h.ino, h.fh2);
                     let _ = fs_remount.releasedir(h.ino, h.fh3);
                     let _ = fs_crash.releasedir(h.ino, h.fh4);
+                    let _ = fs_remote.releasedir(h.ino, h.fh5);
                 }
                 for h in open_file_handles.drain(..) {
                     let _ = fs_baseline.release(h.ino, h.fh1);
                     let _ = fs_micro.release(h.ino, h.fh2);
                     let _ = fs_remount.release(h.ino, h.fh3);
                     let _ = fs_crash.release(h.ino, h.fh4);
+                    let _ = fs_remote.release(h.ino, h.fh5);
                 }
 
                 // Fail a flush partway through writing this batch, then clear the fault.
@@ -608,22 +725,53 @@ fn test_differential_fuzzing_and_crash_recovery() {
                 fs_remount = fs_remount.clean_remount();
                 fs_crash = fs_crash.unclean_crash();
 
-                // Assert complete tree & content parity across all 4 instances
+                // Quiesce and heal fs_remote
+                let _ = fs_remote.fs.flush_log();
+                for r in &fs_remote.remotes {
+                    r.clear_faults();
+                }
+                for _ in 0..10 {
+                    fs_remote.sync_remotes();
+                }
+
+                // Verify that cross-copying healed all remotes and all remotes agree on objects
+                let r0_objs = fs_remote.memory_remotes[0].list_objects("").unwrap();
+                for (i, mem) in fs_remote.memory_remotes.iter().enumerate().skip(1) {
+                    let objs = mem.list_objects("").unwrap();
+                    assert_eq!(
+                        r0_objs.len(),
+                        objs.len(),
+                        "Remote {} object count mismatch with remote 0 at checkpoint (seed {}, step {})",
+                        i,
+                        seed,
+                        step
+                    );
+                    for (o0, o_other) in r0_objs.iter().zip(objs.iter()) {
+                        assert_eq!(o0.key, o_other.key);
+                        assert_eq!(o0.size, o_other.size);
+                        assert_eq!(o0.etag, o_other.etag);
+                    }
+                }
+
+                // Assert complete tree & content parity across all 5 instances
                 let snap_baseline = fs_baseline.get_tree_snapshot();
                 let snap_micro = fs_micro.get_tree_snapshot();
                 let snap_remount = fs_remount.get_tree_snapshot();
                 let snap_crash = fs_crash.get_tree_snapshot();
+                let snap_remote = fs_remote.get_tree_snapshot();
 
                 assert_eq!(snap_baseline.len(), snap_micro.len());
                 assert_eq!(snap_baseline.len(), snap_remount.len());
                 assert_eq!(snap_baseline.len(), snap_crash.len());
+                assert_eq!(snap_baseline.len(), snap_remote.len());
 
                 for (ino, snap) in &snap_baseline {
                     let micro_snap = snap_micro.get(ino).expect("inode missing in micro");
                     let remount_snap = snap_remount.get(ino).expect("inode missing in remount");
                     let crash_snap = snap_crash.get(ino).expect("inode missing in crash");
+                    let remote_snap = snap_remote.get(ino).expect("inode missing in remote");
 
-                    match (snap, micro_snap, remount_snap, crash_snap) {
+                    match (snap, micro_snap, remount_snap, crash_snap, remote_snap) {
                         (
                             SnapshotNode::Directory {
                                 attr: a1,
@@ -644,6 +792,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 attr: a4,
                                 entries: e4,
                                 xattrs: x4,
+                            },
+                            SnapshotNode::Directory {
+                                attr: a5,
+                                entries: e5,
+                                xattrs: x5,
                             },
                         ) => {
                             // Exact Vec order, not just set-equality: live rename does
@@ -671,6 +824,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 ino
                             );
                             assert_eq!(
+                                e1, e5,
+                                "Directory entries mismatch at inode {} (baseline vs remote)",
+                                ino
+                            );
+                            assert_eq!(
                                 (a1.atime, a1.mtime, a1.ctime),
                                 (a2.atime, a2.mtime, a2.ctime),
                                 "Directory atime/mtime/ctime mismatch at inode {} (baseline vs micro)",
@@ -680,6 +838,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 (a1.atime, a1.mtime, a1.ctime),
                                 (a3.atime, a3.mtime, a3.ctime),
                                 "Directory atime/mtime/ctime mismatch at inode {} (baseline vs remount)",
+                                ino
+                            );
+                            assert_eq!(
+                                (a1.atime, a1.mtime, a1.ctime),
+                                (a5.atime, a5.mtime, a5.ctime),
+                                "Directory atime/mtime/ctime mismatch at inode {} (baseline vs remote)",
                                 ino
                             );
                             // atime deliberately excluded here: reads bump atime in
@@ -700,6 +864,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 ino
                             );
                             assert_eq!(x1, x4, "Directory xattrs mismatch at inode {} (baseline vs crash)", ino);
+                            assert_eq!(
+                                x1, x5,
+                                "Directory xattrs mismatch at inode {} (baseline vs remote)",
+                                ino
+                            );
                         }
                         (
                             SnapshotNode::File {
@@ -722,10 +891,16 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 content: c4,
                                 xattrs: x4,
                             },
+                            SnapshotNode::File {
+                                attr: a5,
+                                content: c5,
+                                xattrs: x5,
+                            },
                         ) => {
                             assert_eq!(c1, c2, "Content mismatch at inode {} (baseline vs micro)", ino);
                             assert_eq!(c1, c3, "Content mismatch at inode {} (baseline vs remount)", ino);
                             assert_eq!(c1, c4, "Content mismatch at inode {} (baseline vs crash)", ino);
+                            assert_eq!(c1, c5, "Content mismatch at inode {} (baseline vs remote)", ino);
                             assert_eq!(
                                 a1.size, a2.size,
                                 "File size mismatch at inode {} (baseline vs micro)",
@@ -742,6 +917,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 ino
                             );
                             assert_eq!(
+                                a1.size, a5.size,
+                                "File size mismatch at inode {} (baseline vs remote)",
+                                ino
+                            );
+                            assert_eq!(
                                 a1.nlink, a2.nlink,
                                 "File nlink mismatch at inode {} (baseline vs micro)",
                                 ino
@@ -754,6 +934,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             assert_eq!(
                                 a1.nlink, a4.nlink,
                                 "File nlink mismatch at inode {} (baseline vs crash)",
+                                ino
+                            );
+                            assert_eq!(
+                                a1.nlink, a5.nlink,
+                                "File nlink mismatch at inode {} (baseline vs remote)",
                                 ino
                             );
                             assert_eq!(
@@ -775,6 +960,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 ino
                             );
                             assert_eq!(
+                                (a1.perm, a1.uid, a1.gid),
+                                (a5.perm, a5.uid, a5.gid),
+                                "File perm/uid/gid mismatch at inode {} (baseline vs remote)",
+                                ino
+                            );
+                            assert_eq!(
                                 (a1.atime, a1.mtime, a1.ctime),
                                 (a2.atime, a2.mtime, a2.ctime),
                                 "File atime/mtime/ctime mismatch at inode {} (baseline vs micro)",
@@ -784,6 +975,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 (a1.atime, a1.mtime, a1.ctime),
                                 (a3.atime, a3.mtime, a3.ctime),
                                 "File atime/mtime/ctime mismatch at inode {} (baseline vs remount)",
+                                ino
+                            );
+                            assert_eq!(
+                                (a1.atime, a1.mtime, a1.ctime),
+                                (a5.atime, a5.mtime, a5.ctime),
+                                "File atime/mtime/ctime mismatch at inode {} (baseline vs remote)",
                                 ino
                             );
                             // atime deliberately excluded - see the Directory arm's
@@ -797,6 +994,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             assert_eq!(x1, x2, "File xattrs mismatch at inode {} (baseline vs micro)", ino);
                             assert_eq!(x1, x3, "File xattrs mismatch at inode {} (baseline vs remount)", ino);
                             assert_eq!(x1, x4, "File xattrs mismatch at inode {} (baseline vs crash)", ino);
+                            assert_eq!(x1, x5, "File xattrs mismatch at inode {} (baseline vs remote)", ino);
                         }
                         (
                             SnapshotNode::Symlink {
@@ -819,10 +1017,16 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 target: t4,
                                 xattrs: x4,
                             },
+                            SnapshotNode::Symlink {
+                                attr: a5,
+                                target: t5,
+                                xattrs: x5,
+                            },
                         ) => {
                             assert_eq!(t1, t2, "Symlink target mismatch at inode {} (baseline vs micro)", ino);
                             assert_eq!(t1, t3, "Symlink target mismatch at inode {} (baseline vs remount)", ino);
                             assert_eq!(t1, t4, "Symlink target mismatch at inode {} (baseline vs crash)", ino);
+                            assert_eq!(t1, t5, "Symlink target mismatch at inode {} (baseline vs remote)", ino);
                             assert_eq!(
                                 a1.nlink, a2.nlink,
                                 "Symlink nlink mismatch at inode {} (baseline vs micro)",
@@ -836,6 +1040,11 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             assert_eq!(
                                 a1.nlink, a4.nlink,
                                 "Symlink nlink mismatch at inode {} (baseline vs crash)",
+                                ino
+                            );
+                            assert_eq!(
+                                a1.nlink, a5.nlink,
+                                "Symlink nlink mismatch at inode {} (baseline vs remote)",
                                 ino
                             );
                             assert_eq!(
@@ -857,6 +1066,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 ino
                             );
                             assert_eq!(
+                                (a1.uid, a1.gid),
+                                (a5.uid, a5.gid),
+                                "Symlink uid/gid mismatch at inode {} (baseline vs remote)",
+                                ino
+                            );
+                            assert_eq!(
                                 (a1.atime, a1.mtime, a1.ctime),
                                 (a2.atime, a2.mtime, a2.ctime),
                                 "Symlink atime/mtime/ctime mismatch at inode {} (baseline vs micro)",
@@ -866,6 +1081,12 @@ fn test_differential_fuzzing_and_crash_recovery() {
                                 (a1.atime, a1.mtime, a1.ctime),
                                 (a3.atime, a3.mtime, a3.ctime),
                                 "Symlink atime/mtime/ctime mismatch at inode {} (baseline vs remount)",
+                                ino
+                            );
+                            assert_eq!(
+                                (a1.atime, a1.mtime, a1.ctime),
+                                (a5.atime, a5.mtime, a5.ctime),
+                                "Symlink atime/mtime/ctime mismatch at inode {} (baseline vs remote)",
                                 ino
                             );
                             // atime deliberately excluded - see the Directory arm's
@@ -879,6 +1100,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
                             assert_eq!(x1, x2, "Symlink xattrs mismatch at inode {} (baseline vs micro)", ino);
                             assert_eq!(x1, x3, "Symlink xattrs mismatch at inode {} (baseline vs remount)", ino);
                             assert_eq!(x1, x4, "Symlink xattrs mismatch at inode {} (baseline vs crash)", ino);
+                            assert_eq!(x1, x5, "Symlink xattrs mismatch at inode {} (baseline vs remote)", ino);
                         }
                         _ => panic!("Node type mismatch for inode {}", ino),
                     }
@@ -914,6 +1136,21 @@ fn test_differential_fuzzing_and_crash_recovery() {
         assert!(
             fs_micro.fs.open_counts.read().unwrap().is_empty(),
             "seed {}: open_counts leak in micro",
+            seed
+        );
+        assert!(
+            fs_remote.fs.dir_handles.read().unwrap().is_empty(),
+            "seed {}: dir handle leak in remote",
+            seed
+        );
+        assert!(
+            fs_remote.fs.file_handles.read().unwrap().is_empty(),
+            "seed {}: file handle leak in remote",
+            seed
+        );
+        assert!(
+            fs_remote.fs.open_counts.read().unwrap().is_empty(),
+            "seed {}: open_counts leak in remote",
             seed
         );
 

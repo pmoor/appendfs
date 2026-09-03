@@ -11,6 +11,7 @@ use std::time::Duration;
 pub struct LatencyRemoteStore {
     inner: Arc<dyn RemoteStore>,
     fixed_delay: RwLock<Option<Duration>>,
+    random_delay: RwLock<Option<(Duration, Duration)>>,
     method_delays: RwLock<HashMap<String, Duration>>,
     bytes_per_sec: RwLock<Option<u64>>,
 }
@@ -20,6 +21,7 @@ impl LatencyRemoteStore {
         Self {
             inner,
             fixed_delay: RwLock::new(None),
+            random_delay: RwLock::new(None),
             method_delays: RwLock::new(HashMap::new()),
             bytes_per_sec: RwLock::new(None),
         }
@@ -60,9 +62,20 @@ impl LatencyRemoteStore {
         *self.bytes_per_sec.write().unwrap() = None;
     }
 
+    /// Injects a random delay between `min` and `max` on each remote store operation.
+    pub fn set_random_delay(&self, min: Duration, max: Duration) {
+        *self.random_delay.write().unwrap() = Some((min, max));
+    }
+
+    /// Clears any configured random delay.
+    pub fn clear_random_delay(&self) {
+        *self.random_delay.write().unwrap() = None;
+    }
+
     /// Clears all configured delays and limits.
     pub fn clear_delays(&self) {
         *self.fixed_delay.write().unwrap() = None;
+        *self.random_delay.write().unwrap() = None;
         self.method_delays.write().unwrap().clear();
         *self.bytes_per_sec.write().unwrap() = None;
     }
@@ -71,6 +84,19 @@ impl LatencyRemoteStore {
         let mut total = Duration::ZERO;
         if let Some(d) = *self.fixed_delay.read().unwrap() {
             total += d;
+        }
+        if let Some((min, max)) = *self.random_delay.read().unwrap() {
+            if max > min {
+                let range_micros = (max - min).as_micros();
+                if range_micros > 0 {
+                    let jitter = Duration::from_micros(rand::random::<u64>() % (range_micros as u64));
+                    total += min + jitter;
+                } else {
+                    total += min;
+                }
+            } else {
+                total += min;
+            }
         }
         if let Some(d) = self.method_delays.read().unwrap().get(method) {
             total += *d;
@@ -159,5 +185,26 @@ mod tests {
         let _ = latency_store.head_object("nonexistent");
         let elapsed2 = start2.elapsed();
         assert!(elapsed2 >= Duration::from_millis(19));
+    }
+
+    #[test]
+    fn test_latency_store_random_delay() {
+        let mock = Arc::new(MockRemoteStore::new());
+        let latency_store = LatencyRemoteStore::new(mock);
+
+        latency_store.set_random_delay(Duration::from_millis(10), Duration::from_millis(25));
+
+        let start = Instant::now();
+        let _ = latency_store.list_objects("");
+        let elapsed = start.elapsed();
+
+        assert!(elapsed >= Duration::from_millis(9), "elapsed was {:?}", elapsed);
+        assert!(elapsed <= Duration::from_millis(100), "elapsed was {:?}", elapsed);
+
+        latency_store.clear_random_delay();
+        let start2 = Instant::now();
+        let _ = latency_store.list_objects("");
+        let elapsed2 = start2.elapsed();
+        assert!(elapsed2 < Duration::from_millis(10), "elapsed was {:?}", elapsed2);
     }
 }

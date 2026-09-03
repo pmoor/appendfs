@@ -174,6 +174,9 @@ pub struct ReplicationPolicy {
     /// Keep sealed log files locally for at least this many days before eviction.
     #[serde(default = "default_retention_days")]
     pub local_retention_days: u64,
+    /// Optional fine-grained local retention duration in seconds (overrides local_retention_days if set).
+    #[serde(default)]
+    pub local_retention_secs: Option<u64>,
     /// Maximum disk footprint in GB of the local volume before LRU pruning.
     #[serde(default = "default_cache_max_gb")]
     pub local_cache_max_gb: u64,
@@ -206,6 +209,7 @@ impl Default for ReplicationPolicy {
         Self {
             min_synced_remotes: default_min_synced(),
             local_retention_days: default_retention_days(),
+            local_retention_secs: None,
             local_cache_max_gb: default_cache_max_gb(),
             max_log_age_secs: default_max_log_age(),
             active_sync_interval_secs: default_active_sync_interval(),

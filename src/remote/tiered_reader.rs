@@ -1,5 +1,5 @@
 use crate::remote::RemoteReadTarget;
-use crate::remote::block_cache::{BLOCK_SIZE, OnDiskBlockCache};
+use crate::remote::block_cache::{BLOCK_SIZE, BlockCache};
 use crate::storage::{Storage, StorageReader};
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -9,9 +9,9 @@ use std::sync::Arc;
 ///
 /// For sealed log files, `TieredStorageReader` provides a unified read path:
 /// 1. Checks `OnDiskBlockCache` first (`.cache/`).
-/// 2. On miss, reads from `local_storage` (if the file is still present on local disk before purge)
+/// 2. Falls back to local storage (if present). If found locally, it reads the chunk directly
 ///    and saves the 1 MiB block into `OnDiskBlockCache` (pre-warming the cache).
-/// 3. If the local file has been purged, fetches 1 MiB blocks from remote stores and caches them.
+/// 3. If missing locally, falls back to remote stores using streaming range queries (GET).
 ///    Remotes are queried by priority (lower numbers first). Equal-priority remotes are load-balanced
 ///    pseudo-randomly but deterministically via a hash of `(filename, block_idx)`.
 pub struct TieredStorageReader {
@@ -20,7 +20,7 @@ pub struct TieredStorageReader {
     pub expected_len: u64,
     pub local_storage: Option<Arc<dyn Storage>>,
     pub remotes: Vec<RemoteReadTarget>,
-    pub block_cache: Arc<OnDiskBlockCache>,
+    pub block_cache: Arc<dyn BlockCache>,
     pub coalescer: Arc<crate::remote::RemoteReadCoalescer>,
 }
 
@@ -30,7 +30,7 @@ impl TieredStorageReader {
         filename: impl Into<String>,
         expected_len: u64,
         remotes: impl IntoIterator<Item = impl Into<RemoteReadTarget>>,
-        block_cache: Arc<OnDiskBlockCache>,
+        block_cache: Arc<dyn BlockCache>,
     ) -> Self {
         Self::with_local_storage(generation, filename, expected_len, None, remotes, block_cache)
     }
@@ -41,7 +41,7 @@ impl TieredStorageReader {
         expected_len: u64,
         local_storage: Option<Arc<dyn Storage>>,
         remotes: impl IntoIterator<Item = impl Into<RemoteReadTarget>>,
-        block_cache: Arc<OnDiskBlockCache>,
+        block_cache: Arc<dyn BlockCache>,
     ) -> Self {
         let mut remotes: Vec<RemoteReadTarget> = remotes.into_iter().map(Into::into).collect();
         remotes.sort_by(|a, b| (a.priority, &a.name).cmp(&(b.priority, &b.name)));
@@ -220,6 +220,7 @@ impl StorageReader for TieredStorageReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::block_cache::OnDiskBlockCache;
     use crate::remote::mock::MockRemoteStore;
     use crate::remote::{CountingRemoteStore, RemoteStore};
 

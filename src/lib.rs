@@ -37,10 +37,10 @@ pub use log::{
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
 pub use range_map::{RangeEntry, RangeMap, RangeValue};
 pub use remote::{
-    CountingRemoteStore, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, FailingRemoteStore, LatencyRemoteStore,
-    MemoryRemoteStore, MockRemoteStore, OnDiskBlockCache, RemoteObject, RemoteReadCoalescer, RemoteReadTarget,
-    RemoteRegistry, RemoteReplicationWorker, RemoteStore, RemoteStoreMetrics, RemoteTargetConfig, ReplicationPolicy,
-    S3RemoteStore, TieredCache, TieredStorageReader,
+    BlockCache, CountingRemoteStore, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, FailingRemoteStore,
+    LatencyRemoteStore, MemoryBlockCache, MemoryRemoteStore, MockRemoteStore, OnDiskBlockCache, RemoteObject,
+    RemoteReadCoalescer, RemoteReadTarget, RemoteRegistry, RemoteReplicationWorker, RemoteStore, RemoteStoreMetrics,
+    RemoteTargetConfig, ReplicationPolicy, S3RemoteStore, TieredCache, TieredStorageReader,
 };
 pub use stats::VolumeStats;
 pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};

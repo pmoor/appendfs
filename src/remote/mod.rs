@@ -13,7 +13,10 @@ pub mod tiered_reader;
 pub mod worker;
 
 pub use crate::check::check_remote_integrity;
-pub use block_cache::{BLOCK_SIZE, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, OnDiskBlockCache, TieredCache};
+pub use block_cache::{
+    BLOCK_SIZE, BlockCache, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, MemoryBlockCache, OnDiskBlockCache,
+    TieredCache,
+};
 pub use bootstrap::bootstrap_from_remote;
 pub use coalesce::{CoalesceError, RemoteReadCoalescer};
 pub use config::{RemoteRegistry, RemoteTargetConfig, ReplicationPolicy};
