@@ -2,6 +2,15 @@
 
 AppendFS is a high-performance append-only log-structured filesystem with FUSE support, crash recovery, snapshots, and point-in-time time travel.
 
+## Core Philosophy & Design Principles
+
+1. **Correctness & Reliability First**:
+   - Correctness and reliability are the single most important aspects of this project. Data durability, crash safety, and POSIX compliance take precedence over premature optimization or convenience.
+2. **Determinism Everywhere**:
+   - Prefer determinism across the entire codebase.
+   - Use injected testable clocks (`Arc<dyn Clock>` / `Clock` trait) rather than unmocked calls to `SystemTime::now()`.
+   - Use injected randomness with fixed or reproducible seeds (e.g. `ChaCha8Rng::seed_from_u64(...)`) in tests, fuzzers, and stress suites so every failure can be reliably reproduced and investigated.
+
 ## Common Commands
 
 ### Build
