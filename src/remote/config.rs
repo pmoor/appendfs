@@ -186,6 +186,9 @@ pub struct ReplicationPolicy {
     /// Frequency of intermediate active log part uploads (default: 1800s / 30 minutes).
     #[serde(default = "default_active_sync_interval")]
     pub active_sync_interval_secs: u64,
+    /// Frequency of full remote consistency and healing audits (default: 14400s / 4 hours).
+    #[serde(default = "default_audit_interval")]
+    pub audit_interval_secs: u64,
 }
 
 fn default_min_synced() -> usize {
@@ -203,6 +206,9 @@ fn default_max_log_age() -> u64 {
 fn default_active_sync_interval() -> u64 {
     1800
 }
+fn default_audit_interval() -> u64 {
+    14400 // 4 hours
+}
 
 impl Default for ReplicationPolicy {
     fn default() -> Self {
@@ -213,6 +219,7 @@ impl Default for ReplicationPolicy {
             local_cache_max_gb: default_cache_max_gb(),
             max_log_age_secs: default_max_log_age(),
             active_sync_interval_secs: default_active_sync_interval(),
+            audit_interval_secs: default_audit_interval(),
         }
     }
 }

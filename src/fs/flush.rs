@@ -128,6 +128,7 @@ impl InMemoryFS {
                     crate::log::record::FILE_HEADER_SIZE as u64,
                 );
             }
+            self.notify_replication();
         }
 
         let batch_gen = writer.generation();
@@ -509,7 +510,10 @@ impl InMemoryFS {
             }
             let storage = writer.storage();
             match self.export_summary(storage.as_ref()) {
-                Ok(filename) => return Ok(Some(filename)),
+                Ok(filename) => {
+                    self.notify_replication();
+                    return Ok(Some(filename));
+                }
                 Err(e) => {
                     log::warn!("sync_and_export_summary error: {}", e);
                     return Err(e);

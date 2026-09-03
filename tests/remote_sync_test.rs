@@ -1093,3 +1093,188 @@ fn test_tiered_storage_reader_coalesces_concurrent_remote_reads() {
     // 3. Block 0 is now cached on disk
     assert!(cache.read_block(1, 0).unwrap().is_some());
 }
+
+#[test]
+fn test_event_driven_immediate_replication_on_log_roll() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(OsStorage::new(dir.path()));
+    let clock = Arc::new(SystemClock);
+    let volume_key = Arc::new(VolumeKey::plaintext());
+
+    let _summary_file = init_volume(storage.clone(), None, volume_key.as_ref(), VolumeHeader::plaintext()).unwrap();
+
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_log_dir(dir.path());
+    let fs_arc = Arc::new(fs);
+
+    let mut registry = RemoteRegistry::new();
+    let remote = Arc::new(MockRemoteStore::new());
+    registry.add_remote("mock", RemoteTargetConfig::new("mock-bucket"));
+    registry.set_store_override("mock", remote.clone());
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    // Start background replication worker with a 1-HOUR poll interval.
+    // If it were relying solely on periodic polling, it would take 3600s to replicate!
+    let mut worker = appendfs::remote::RemoteReplicationWorker::start_with_interval(
+        fs_arc.clone(),
+        registry_arc.clone(),
+        dir.path().to_path_buf(),
+        std::time::Duration::from_secs(3600),
+    );
+
+    // Write data to active log
+    let file1 = create_core(&fs_arc, 1, "test_file.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs_arc, file1.ino, b"Data to seal into generation 1", 0).unwrap();
+    fs_arc.sync_log().unwrap();
+
+    // Force roll generation 1 -> 2. This seals generation 1 and notifies the worker via Condvar!
+    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
+    {
+        let mut manifest = fs_arc.manifest.write().unwrap();
+        manifest.set_generation_md5(next_gen - 1, sealed_md5);
+        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+    }
+    fs_arc.notify_replication();
+
+    // Poll for up to 2 seconds for the remote to receive 000001.log
+    let start = std::time::Instant::now();
+    let mut replicated = false;
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        if remote.head_object("000001.log").unwrap().is_some() {
+            replicated = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        replicated,
+        "Log generation 1 must be replicated immediately via event-driven wake-up without waiting for the 3600s poll interval!"
+    );
+
+    worker.stop();
+}
+
+#[test]
+fn test_audit_interval_skips_confirmed_files_until_audit() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(OsStorage::new(dir.path()));
+    let clock = Arc::new(SystemClock);
+    let volume_key = Arc::new(VolumeKey::plaintext());
+
+    let _summary_file = init_volume(storage.clone(), None, volume_key.as_ref(), VolumeHeader::plaintext()).unwrap();
+
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_log_dir(dir.path());
+    let fs_arc = Arc::new(fs);
+
+    let raw_remote = Arc::new(MockRemoteStore::new());
+    let counting_store = Arc::new(CountingRemoteStore::new(raw_remote.clone()));
+
+    let mut registry = RemoteRegistry::new();
+    registry.policy.audit_interval_secs = 14400; // 4 hours
+    registry.add_remote("counting", RemoteTargetConfig::new("counting-bucket"));
+    registry.set_store_override("counting", counting_store.clone());
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    // Write data to active log
+    let file1 = create_core(&fs_arc, 1, "audit_test.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs_arc, file1.ino, b"Audit test data payload", 0).unwrap();
+    fs_arc.sync_log().unwrap();
+
+    // Seal generation 1
+    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
+    {
+        let mut manifest = fs_arc.manifest.write().unwrap();
+        manifest.set_generation_md5(next_gen - 1, sealed_md5);
+        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+    }
+
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+    let mut last_audit = std::time::SystemTime::now(); // Recent audit
+    let mut confirmed_gens = std::collections::HashMap::new();
+    let mut confirmed_sums = std::collections::HashMap::new();
+
+    // 1. First incremental cycle: generation 1 is not confirmed, so it gets probed and uploaded
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        counting_store.puts(),
+        2,
+        "000001.log and 000000.summary must be uploaded"
+    );
+    let head_calls_initial = counting_store.heads();
+    assert!(
+        head_calls_initial >= 2,
+        "head_object must be checked for log and summary"
+    );
+
+    // 2. Second incremental cycle (no new files, audit interval has not elapsed):
+    // Should skip head_object for confirmed 000001.log!
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        counting_store.heads(),
+        head_calls_initial,
+        "Incremental cycle must NOT call head_object on confirmed generations!"
+    );
+
+    // 3. Full audit cycle (force_audit = true, simulating 4-hour elapsed audit):
+    // Must re-probe head_object on all sealed files!
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        counting_store.heads() > head_calls_initial,
+        "Full audit cycle must re-probe head_object for remote integrity check"
+    );
+}

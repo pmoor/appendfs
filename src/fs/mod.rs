@@ -134,6 +134,8 @@ pub struct InMemoryFS {
     pub generations_since_last_summary: AtomicU64,
     /// Generation number of the last exported summary file.
     pub last_summary_generation: AtomicU64,
+    /// Condition variable and flag to immediately notify the background replication worker of new logs/summaries.
+    pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl InMemoryFS {
@@ -224,7 +226,16 @@ impl InMemoryFS {
             bytes_since_last_summary: AtomicU64::new(0),
             generations_since_last_summary: AtomicU64::new(0),
             last_summary_generation: AtomicU64::new(0),
+            replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
         }
+    }
+
+    /// Wakes up the background replication worker thread immediately.
+    pub fn notify_replication(&self) {
+        let (lock, cvar) = &*self.replication_notifier;
+        let mut pending = lock.lock().unwrap();
+        *pending = true;
+        cvar.notify_all();
     }
 
     pub fn set_summary_intervals(&self, bytes: u64, generations: u64) {

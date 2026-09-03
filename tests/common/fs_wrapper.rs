@@ -253,6 +253,28 @@ impl TestFS {
         }
     }
 
+    /// Triggers an immediate, synchronous remote replication cycle (fast path, skipping confirmed files).
+    pub fn sync_remotes_fast(&self) {
+        if let Some(ref reg) = self.remote_registry {
+            let mut last_part_sync = SystemTime::UNIX_EPOCH;
+            let mut uploaded_parts = HashMap::new();
+            let mut last_audit = SystemTime::now();
+            let mut confirmed_generations = HashMap::new();
+            let mut confirmed_summaries = HashMap::new();
+            let _ = appendfs::RemoteReplicationWorker::run_cycle_with_audit(
+                &self.fs,
+                reg,
+                &self.log_dir,
+                &mut last_part_sync,
+                &mut uploaded_parts,
+                &mut last_audit,
+                &mut confirmed_generations,
+                &mut confirmed_summaries,
+                false,
+            );
+        }
+    }
+
     pub fn from_instance(fs: InMemoryFS, log_dir: &Path, temp_dir: Option<Arc<tempfile::TempDir>>) -> Self {
         Self {
             fs,

@@ -266,36 +266,63 @@ impl RemoteReplicationWorker {
             let mut last_part_sync = SystemTime::now();
             let mut uploaded_part_offsets: std::collections::HashMap<u64, (u64, u32)> =
                 std::collections::HashMap::new();
+            let mut last_audit = SystemTime::UNIX_EPOCH; // Run initial audit on startup
+            let mut confirmed_generations: std::collections::HashMap<String, std::collections::HashSet<u64>> =
+                std::collections::HashMap::new();
+            let mut confirmed_summaries: std::collections::HashMap<String, std::collections::HashSet<String>> =
+                std::collections::HashMap::new();
+
+            let (notifier_lock, notifier_cvar) = &*fs_clone.replication_notifier;
 
             while running_clone.load(Ordering::SeqCst) {
-                if let Err(e) = Self::run_cycle(
+                if let Err(e) = Self::run_cycle_with_audit(
                     &fs_clone,
                     &registry_clone,
                     &log_dir_clone,
                     &mut last_part_sync,
                     &mut uploaded_part_offsets,
+                    &mut last_audit,
+                    &mut confirmed_generations,
+                    &mut confirmed_summaries,
+                    false,
                 ) {
                     log::warn!("Remote replication worker cycle error: {}", e);
                 }
 
-                let check_slice = Duration::from_millis(50).min(poll_interval);
+                // Wait on the replication notifier condition variable.
+                // When a log rolls or summary exports, notify_replication() wakes this thread immediately!
+                let check_slice = Duration::from_millis(100).min(poll_interval);
                 let slices = (poll_interval.as_millis() / check_slice.as_millis().max(1)).max(1);
                 for _ in 0..slices {
                     if !running_clone.load(Ordering::SeqCst) {
                         break;
                     }
-                    thread::sleep(check_slice);
+                    let mut guard = notifier_lock.lock().unwrap();
+                    if *guard {
+                        *guard = false;
+                        break;
+                    }
+                    let (new_guard, _) = notifier_cvar.wait_timeout(guard, check_slice).unwrap();
+                    guard = new_guard;
+                    if *guard {
+                        *guard = false;
+                        break;
+                    }
                 }
             }
 
             // Final drain cycle on unmount/shutdown
             log::info!("Flushing remaining remote sync tasks before shutdown...");
-            let _ = Self::run_cycle(
+            let _ = Self::run_cycle_with_audit(
                 &fs_clone,
                 &registry_clone,
                 &log_dir_clone,
                 &mut last_part_sync,
                 &mut uploaded_part_offsets,
+                &mut last_audit,
+                &mut confirmed_generations,
+                &mut confirmed_summaries,
+                true,
             );
         });
 
@@ -308,25 +335,73 @@ impl RemoteReplicationWorker {
         }
     }
 
-    /// Explicitly and synchronously triggers an immediate remote replication and cross-copy cycle.
+    /// Explicitly and synchronously triggers an immediate remote replication cycle (fast path).
     pub fn sync_now(&self) -> io::Result<()> {
+        self.sync_now_with_audit(false)
+    }
+
+    /// Explicitly and synchronously triggers an immediate remote replication cycle with full consistency audit.
+    pub fn audit_now(&self) -> io::Result<()> {
+        self.sync_now_with_audit(true)
+    }
+
+    pub fn sync_now_with_audit(&self, force_audit: bool) -> io::Result<()> {
         let mut last_part_sync = SystemTime::UNIX_EPOCH;
         let mut uploaded_parts = std::collections::HashMap::new();
-        Self::run_cycle(
+        let mut last_audit = if force_audit {
+            SystemTime::UNIX_EPOCH
+        } else {
+            SystemTime::now()
+        };
+        let mut confirmed_generations = std::collections::HashMap::new();
+        let mut confirmed_summaries = std::collections::HashMap::new();
+        Self::run_cycle_with_audit(
             &self.fs,
             &self.registry,
             &self.log_dir,
             &mut last_part_sync,
             &mut uploaded_parts,
+            &mut last_audit,
+            &mut confirmed_generations,
+            &mut confirmed_summaries,
+            force_audit,
         )
     }
 
     pub fn run_cycle(
         fs: &InMemoryFS,
         registry: &Arc<RwLock<RemoteRegistry>>,
+        log_dir: &Path,
+        last_part_sync: &mut SystemTime,
+        uploaded_parts: &mut std::collections::HashMap<u64, (u64, u32)>,
+    ) -> io::Result<()> {
+        let mut last_audit = SystemTime::UNIX_EPOCH;
+        let mut confirmed_generations = std::collections::HashMap::new();
+        let mut confirmed_summaries = std::collections::HashMap::new();
+        Self::run_cycle_with_audit(
+            fs,
+            registry,
+            log_dir,
+            last_part_sync,
+            uploaded_parts,
+            &mut last_audit,
+            &mut confirmed_generations,
+            &mut confirmed_summaries,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_cycle_with_audit(
+        fs: &InMemoryFS,
+        registry: &Arc<RwLock<RemoteRegistry>>,
         _log_dir: &Path,
         last_part_sync: &mut SystemTime,
         uploaded_parts: &mut std::collections::HashMap<u64, (u64, u32)>,
+        last_audit: &mut SystemTime,
+        confirmed_generations: &mut std::collections::HashMap<String, std::collections::HashSet<u64>>,
+        confirmed_summaries: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+        force_audit: bool,
     ) -> io::Result<()> {
         let (policy, stores) = {
             let reg = registry.read().unwrap();
@@ -346,6 +421,16 @@ impl RemoteReplicationWorker {
             Some(ref w) => (w.generation(), w.current_offset(), w.created_at()),
             None => return Ok(()),
         };
+
+        let now = SystemTime::now();
+        let audit_elapsed = now.duration_since(*last_audit).unwrap_or_default().as_secs();
+        let is_audit = force_audit || audit_elapsed >= policy.audit_interval_secs;
+
+        if is_audit {
+            *last_audit = now;
+            confirmed_generations.clear();
+            confirmed_summaries.clear();
+        }
 
         // 1. Time-based rolling check
         if let Some(created) = active_created {
@@ -389,6 +474,15 @@ impl RemoteReplicationWorker {
 
             for (remote_name, remote, read_only, _) in &stores {
                 if *read_only {
+                    continue;
+                }
+
+                // If not in a full audit cycle, skip if this remote already confirmed this generation
+                if !is_audit
+                    && confirmed_generations
+                        .get(remote_name)
+                        .is_some_and(|set| set.contains(&gen_num))
+                {
                     continue;
                 }
 
@@ -442,6 +536,11 @@ impl RemoteReplicationWorker {
                     }
                 }
 
+                confirmed_generations
+                    .entry(remote_name.clone())
+                    .or_default()
+                    .insert(gen_num);
+
                 fs.replication_telemetry
                     .write()
                     .unwrap()
@@ -456,12 +555,14 @@ impl RemoteReplicationWorker {
             .filter(|f| f.ends_with(".summary"))
             .cloned()
             .collect();
-        // Also check if any remotes have summary files not in local storage
-        for (_, remote, _, _) in &stores {
-            if let Ok(objs) = remote.list_objects("") {
-                for obj in objs {
-                    if obj.key.ends_with(".summary") {
-                        summary_files.insert(obj.key);
+        // Also check if any remotes have summary files not in local storage (during full audit)
+        if is_audit {
+            for (_, remote, _, _) in &stores {
+                if let Ok(objs) = remote.list_objects("") {
+                    for obj in objs {
+                        if obj.key.ends_with(".summary") {
+                            summary_files.insert(obj.key);
+                        }
                     }
                 }
             }
@@ -479,6 +580,16 @@ impl RemoteReplicationWorker {
                 if *read_only {
                     continue;
                 }
+
+                // If not in a full audit cycle, skip if this remote already confirmed this summary
+                if !is_audit
+                    && confirmed_summaries
+                        .get(remote_name)
+                        .is_some_and(|set| set.contains(sum_file))
+                {
+                    continue;
+                }
+
                 let head = remote.head_object(sum_file)?;
                 let needs_sync = match head {
                     None => true,
@@ -516,6 +627,11 @@ impl RemoteReplicationWorker {
                         }
                     }
                 }
+
+                confirmed_summaries
+                    .entry(remote_name.clone())
+                    .or_default()
+                    .insert(sum_file.clone());
             }
         }
 
@@ -630,6 +746,7 @@ impl RemoteReplicationWorker {
     /// Stops the background worker and joins its thread.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        self.fs.notify_replication();
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
