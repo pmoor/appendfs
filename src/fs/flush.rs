@@ -253,7 +253,11 @@ impl InMemoryFS {
         let Some(ref writer) = self.log_writer else {
             return Ok(());
         };
+        self.flush_log_locked(writer)
+    }
 
+    /// Internal flush implementation called while holding `flush_lock`.
+    fn flush_log_locked(&self, writer: &LogWriter) -> std::io::Result<()> {
         // Freeze any active live mutations into the flushing queue
         self.begin_flush();
 
@@ -284,6 +288,35 @@ impl InMemoryFS {
         self.staged_bytes.store(0, Ordering::Relaxed);
         self.staged_ops.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Safely rolls the active log generation under the flush lock, draining pending batches first.
+    pub fn force_roll_active_log(&self) -> std::io::Result<Option<(u64, [u8; 16])>> {
+        let _flush_guard = self.flush_lock.lock().unwrap();
+        let Some(ref writer) = self.log_writer else {
+            return Ok(None);
+        };
+
+        // Drain pending batches first so the current generation is cleanly flushed
+        self.flush_log_locked(writer)?;
+
+        if let Some((next_gen, sealed_md5)) = writer.force_roll(&*self.clock)? {
+            let sealed_gen = next_gen - 1;
+            {
+                let mut manifest = self.manifest.write().unwrap();
+                manifest.set_generation_md5(sealed_gen, sealed_md5);
+                manifest.record_roll(
+                    next_gen,
+                    format!("{:06}.log", next_gen),
+                    self.clock.now(),
+                    crate::log::record::FILE_HEADER_SIZE as u64,
+                );
+            }
+            self.notify_replication();
+            Ok(Some((next_gen, sealed_md5)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Number of frozen batches currently waiting to be written to the log.
@@ -405,6 +438,32 @@ impl InMemoryFS {
         crate::check::check_fs_integrity(self, log_dir, verify_data)
     }
 
+    fn sync_manifest_md5s_and_snapshot(&self, storage: &dyn Storage, active_gen: u64) -> crate::log::LogManifest {
+        let needed: Vec<(u64, String)> = {
+            let m = self.manifest.read().unwrap();
+            m.logs
+                .iter()
+                .filter(|l| l.generation < active_gen && l.md5.is_none())
+                .map(|l| (l.generation, l.filename.clone()))
+                .collect()
+        };
+
+        let mut computed = Vec::new();
+        for (generation_num, fname) in needed {
+            if storage.exists(&fname)
+                && let Ok(digest) = crate::log::manifest::compute_storage_file_md5(storage, &fname)
+            {
+                computed.push((generation_num, digest));
+            }
+        }
+
+        let mut m = self.manifest.write().unwrap();
+        for (generation_num, digest) in computed {
+            m.set_generation_md5(generation_num, digest);
+        }
+        m.clone()
+    }
+
     /// Exports a single-file summary snapshot of the current in-memory filesystem state to `storage`.
     pub fn export_summary(&self, storage: &dyn Storage) -> std::io::Result<String> {
         self.sync_log()?;
@@ -415,9 +474,7 @@ impl InMemoryFS {
             .as_ref()
             .map_or_else(|| self.last_tx_id.load(Ordering::SeqCst), |w| w.last_tx_id());
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let mut manifest = self.manifest.read().unwrap().clone();
-        manifest.populate_sealed_md5s(storage, generation);
-        *self.manifest.write().unwrap() = manifest.clone();
+        let manifest = self.sync_manifest_md5s_and_snapshot(storage, generation);
         let now = self.clock.now();
 
         // The header goes into the summary in plaintext while the key encrypts its body, so
@@ -469,9 +526,7 @@ impl InMemoryFS {
     ) -> std::io::Result<String> {
         let snapshot = self.base.read().unwrap().clone();
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let mut manifest = self.manifest.read().unwrap().clone();
-        manifest.populate_sealed_md5s(storage, sealed_gen + 1);
-        *self.manifest.write().unwrap() = manifest.clone();
+        let manifest = self.sync_manifest_md5s_and_snapshot(storage, sealed_gen + 1);
         let now = self.clock.now();
 
         if self.volume_header.cipher != self.volume_key.cipher() {

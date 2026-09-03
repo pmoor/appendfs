@@ -2,10 +2,14 @@ pub mod block_cache;
 pub mod bootstrap;
 pub mod coalesce;
 pub mod config;
+#[cfg(any(test, feature = "testing"))]
 pub mod counting;
+#[cfg(any(test, feature = "testing"))]
 pub mod failing;
 pub mod fs;
+#[cfg(any(test, feature = "testing"))]
 pub mod latency;
+#[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod s3;
 pub mod sigv4;
@@ -20,10 +24,14 @@ pub use block_cache::{
 pub use bootstrap::bootstrap_from_remote;
 pub use coalesce::{CoalesceError, RemoteReadCoalescer};
 pub use config::{RemoteRegistry, RemoteTargetConfig, ReplicationPolicy};
+#[cfg(any(test, feature = "testing"))]
 pub use counting::{CountingRemoteStore, RemoteStoreMetrics};
+#[cfg(any(test, feature = "testing"))]
 pub use failing::FailingRemoteStore;
 pub use fs::LocalDirRemoteStore;
+#[cfg(any(test, feature = "testing"))]
 pub use latency::LatencyRemoteStore;
+#[cfg(any(test, feature = "testing"))]
 pub use mock::{MemoryRemoteStore, MockRemoteStore};
 pub use s3::S3RemoteStore;
 pub use sigv4::SigV4Signer;

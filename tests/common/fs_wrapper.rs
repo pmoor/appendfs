@@ -525,6 +525,81 @@ impl TestFS {
         rec
     }
 
+    pub fn clean_remount_with_remotes(mut self) -> Self {
+        let log_dir = self.log_dir.clone();
+        let temp_dir = self._temp_dir.clone();
+        let clock = self.fs.clock.clone();
+        let next_inode = self.fs.next_inode.load(Ordering::SeqCst);
+        let max_extent_size = self.fs.max_extent_size;
+        let memory_remotes = self.memory_remotes.clone();
+        let latency_remotes = self.latency_remotes.clone();
+        let remotes = self.remotes.clone();
+        let remote_registry = self.remote_registry.clone();
+        let block_cache = self.block_cache.clone();
+
+        let _ = self.fs.force_roll_active_log();
+        let _ = self.fs.sync_and_export_summary();
+        self.fs.log_writer = None;
+        drop(self);
+
+        let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_dir));
+        let mut recovered = recover_fs(
+            storage.clone(),
+            appendfs::RecoveryTarget::Latest,
+            clock.clone(),
+            VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        let next_gen = recovered.manifest.read().unwrap().next_generation;
+        let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
+        let writer = make_writer(
+            &log_dir,
+            None,
+            next_gen,
+            &*clock,
+            appendfs::cli::DEFAULT_MAX_LOG_SIZE,
+            start_tx,
+        );
+        recovered.attach_log_writer(writer);
+        recovered.set_log_dir(&log_dir);
+        recovered.max_extent_size = max_extent_size;
+        recovered.next_inode.store(
+            recovered.next_inode.load(Ordering::SeqCst).max(next_inode),
+            Ordering::SeqCst,
+        );
+
+        let mut remote_read_targets = Vec::new();
+        for (i, failing) in remotes.iter().enumerate() {
+            let name = format!("remote{}", i);
+            remote_read_targets.push(appendfs::RemoteReadTarget {
+                name,
+                store: failing.clone(),
+                priority: 10 + i as u32,
+            });
+        }
+
+        let log_cache = Arc::new(appendfs::LogFileCache::with_remote_support(
+            storage.clone(),
+            block_cache.clone(),
+            remote_read_targets,
+            Some(Arc::clone(&recovered.manifest)),
+        ));
+        recovered.log_cache = Some(log_cache);
+
+        Self {
+            fs: recovered,
+            log_dir,
+            fault: None,
+            _temp_dir: temp_dir,
+            remotes,
+            latency_remotes,
+            memory_remotes,
+            remote_registry,
+            block_cache,
+        }
+    }
+
     pub fn unclean_crash(mut self) -> Self {
         let log_dir = self.log_dir.clone();
         let temp_dir = self._temp_dir.clone();
@@ -565,16 +640,17 @@ impl TestFS {
             VolumeKey::plaintext_arc(),
         )
         .unwrap();
-        let next_gen = appendfs::find_latest_generation_in_storage(storage.as_ref()) + 1;
+        let next_gen = recovered.manifest.read().unwrap().next_generation;
         let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
-        recovered.log_writer = Some(make_writer(
+        let writer = make_writer(
             log_dir,
             fault.as_ref(),
             next_gen,
             &*clock,
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
             start_tx,
-        ));
+        );
+        recovered.attach_log_writer(writer);
         match fault.as_ref() {
             Some(f) => recovered.set_storage(Arc::clone(f) as Arc<dyn Storage>),
             None => recovered.set_log_dir(log_dir),

@@ -95,6 +95,9 @@ pub fn bootstrap_from_remote(
         );
 
         let mut log_writer = storage.open_writer(&active_log_name, WriteMode::Overwrite)?;
+        let header = crate::log::record::FileHeader::new(next_gen, std::time::SystemTime::now());
+        log_writer.append(&header.to_bytes())?;
+
         for part in part_objects {
             struct LogPartWriterAdapter<'a>(&'a mut Box<dyn crate::storage::StorageWriter>);
             impl<'a> Write for LogPartWriterAdapter<'a> {
@@ -113,7 +116,7 @@ pub fn bootstrap_from_remote(
     }
 
     // 5. Save remote configuration to remotes.toml in log_dir
-    let mut registry = RemoteRegistry::load_from_dir(log_dir).unwrap_or_default();
+    let mut registry = RemoteRegistry::load_from_dir(log_dir)?;
     registry.add_remote(remote_name, remote_cfg);
     registry.save_to_dir(log_dir)?;
 

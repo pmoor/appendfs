@@ -284,10 +284,17 @@ impl BlockCache for OnDiskBlockCache {
     }
 }
 
+#[derive(Debug)]
+struct MemoryCacheEntry {
+    last_access: u64,
+    data: Vec<u8>,
+}
+
 /// In-memory LRU block cache storing raw encrypted 1 MiB chunks without touching local disk.
 #[derive(Debug)]
 pub struct MemoryBlockCache {
-    entries: Mutex<HashMap<(u64, u64), Vec<u8>>>,
+    entries: Mutex<HashMap<(u64, u64), MemoryCacheEntry>>,
+    access_counter: std::sync::atomic::AtomicU64,
     max_bytes: usize,
     coalescer: Arc<super::RemoteReadCoalescer>,
 }
@@ -300,6 +307,7 @@ impl MemoryBlockCache {
     pub fn with_coalescer(max_bytes: usize, coalescer: Arc<super::RemoteReadCoalescer>) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            access_counter: std::sync::atomic::AtomicU64::new(1),
             max_bytes,
             coalescer,
         }
@@ -308,28 +316,42 @@ impl MemoryBlockCache {
 
 impl BlockCache for MemoryBlockCache {
     fn read_block(&self, generation: u64, block_idx: u64) -> io::Result<Option<Vec<u8>>> {
-        let guard = self.entries.lock().unwrap();
-        Ok(guard.get(&(generation, block_idx)).cloned())
+        let mut guard = self.entries.lock().unwrap();
+        if let Some(entry) = guard.get_mut(&(generation, block_idx)) {
+            entry.last_access = self.access_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Some(entry.data.clone()));
+        }
+        Ok(None)
     }
 
     fn write_block(&self, generation: u64, block_idx: u64, data: &[u8]) -> io::Result<()> {
+        let ticket = self.access_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.entries.lock().unwrap();
-        guard.insert((generation, block_idx), data.to_vec());
+        guard.insert(
+            (generation, block_idx),
+            MemoryCacheEntry {
+                last_access: ticket,
+                data: data.to_vec(),
+            },
+        );
         drop(guard);
         self.prune_if_needed()
     }
 
     fn prune_if_needed(&self) -> io::Result<()> {
         let mut guard = self.entries.lock().unwrap();
-        let mut current_bytes: usize = guard.values().map(|v| v.len()).sum();
+        let mut current_bytes: usize = guard.values().map(|v| v.data.len()).sum();
         if current_bytes > self.max_bytes {
-            let keys: Vec<(u64, u64)> = guard.keys().copied().collect();
-            for k in keys {
+            let mut items: Vec<((u64, u64), u64, usize)> =
+                guard.iter().map(|(k, v)| (*k, v.last_access, v.data.len())).collect();
+            items.sort_by_key(|(_, access, _)| *access);
+
+            for (k, _, len) in items {
                 if current_bytes <= self.max_bytes {
                     break;
                 }
-                if let Some(removed) = guard.remove(&k) {
-                    current_bytes = current_bytes.saturating_sub(removed.len());
+                if guard.remove(&k).is_some() {
+                    current_bytes = current_bytes.saturating_sub(len);
                 }
             }
         }

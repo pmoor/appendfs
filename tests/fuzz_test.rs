@@ -753,6 +753,9 @@ fn test_differential_fuzzing_and_crash_recovery() {
                     }
                 }
 
+                // Exercise recovery on remote-backed instance with locally pruned logs
+                fs_remote = fs_remote.clean_remount_with_remotes();
+
                 // Assert complete tree & content parity across all 5 instances
                 let snap_baseline = fs_baseline.get_tree_snapshot();
                 let snap_micro = fs_micro.get_tree_snapshot();

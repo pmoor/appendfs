@@ -59,6 +59,12 @@ impl LogFileCache {
         self.decrypted_cache.set_max_bytes(max_bytes);
     }
 
+    /// Invalidates and drops any cached reader for the given generation so unlinked disk space is reclaimed.
+    pub fn invalidate(&self, generation: u64) {
+        let mut guard = self.cache.lock().unwrap();
+        guard.remove(&generation);
+    }
+
     /// Retrieves an open log reader handle, verifying the `FileHeader` on first open.
     /// If the log file was pruned locally, falls back to `TieredStorageReader` over S3 range requests.
     pub fn get_or_open(&self, generation: u64) -> io::Result<Arc<dyn StorageReader>> {

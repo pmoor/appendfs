@@ -230,6 +230,24 @@ impl InMemoryFS {
         }
     }
 
+    /// Attaches an active `LogWriter` to the filesystem instance, registering its active generation in the manifest.
+    pub fn attach_log_writer(&mut self, writer: Arc<LogWriter>) {
+        let generation = writer.generation();
+        let now = self.clock.now();
+        {
+            let mut manifest = self.manifest.write().unwrap();
+            if manifest.get_by_generation(generation).is_none() {
+                manifest.record_roll(
+                    generation,
+                    format!("{:06}.log", generation),
+                    now,
+                    crate::log::record::FILE_HEADER_SIZE as u64,
+                );
+            }
+        }
+        self.log_writer = Some(writer);
+    }
+
     /// Wakes up the background replication worker thread immediately.
     pub fn notify_replication(&self) {
         let (lock, cvar) = &*self.replication_notifier;

@@ -54,13 +54,46 @@ pub fn cross_copy_file(
     expected_len: u64,
     expected_md5: Option<&[u8; 16]>,
 ) -> io::Result<()> {
-    // Stream via a temporary local file or memory buffer if reasonably sized
     let dir = tempfile::tempdir()?;
     let tmp_file_path = dir.path().join(filename);
     {
         let mut tmp_file = std::fs::File::create(&tmp_file_path)?;
         src_remote.get_object(filename, &mut tmp_file)?;
         tmp_file.flush()?;
+    }
+
+    let meta = std::fs::metadata(&tmp_file_path)?;
+    if meta.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cross_copy_file {}: downloaded size {} does not match expected {}",
+                filename,
+                meta.len(),
+                expected_len
+            ),
+        ));
+    }
+
+    if let Some(expected_digest) = expected_md5 {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&tmp_file_path)?;
+        let mut ctx = md5::Context::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            ctx.consume(&buf[..n]);
+        }
+        let computed = ctx.compute();
+        if &*computed != expected_digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cross_copy_file {}: downloaded MD5 does not match expected", filename),
+            ));
+        }
     }
 
     let mut tmp_file = std::fs::File::open(&tmp_file_path)?;
@@ -442,19 +475,8 @@ impl RemoteReplicationWorker {
                     age.as_secs(),
                     policy.max_log_age_secs
                 );
-                if let Some(ref w) = fs.log_writer {
-                    if let Ok(Some((next_gen, sealed_md5))) = w.force_roll(&*fs.clock) {
-                        let mut manifest = fs.manifest.write().unwrap();
-                        manifest.set_generation_md5(next_gen - 1, sealed_md5);
-                        manifest.record_roll(
-                            next_gen,
-                            format!("{:06}.log", next_gen),
-                            fs.clock.now(),
-                            crate::log::record::FILE_HEADER_SIZE as u64,
-                        );
-                    }
-                    let _ = fs.sync_and_export_summary();
-                }
+                let _ = fs.force_roll_active_log();
+                let _ = fs.sync_and_export_summary();
             }
         }
 
@@ -486,12 +508,24 @@ impl RemoteReplicationWorker {
                     continue;
                 }
 
-                let remote_head = remote.head_object(filename)?;
+                let remote_head = match remote.head_object(filename) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        log::warn!("head_object {} on remote '{}' failed: {}", filename, remote_name, e);
+                        fs.replication_telemetry
+                            .write()
+                            .unwrap()
+                            .record_error(remote_name, &e.to_string());
+                        continue;
+                    }
+                };
+
                 let needs_upload = match remote_head {
                     Some(ref obj) => obj.size != expected_len,
                     None => true,
                 };
 
+                let mut upload_succeeded = false;
                 if needs_upload {
                     if storage.exists(filename) {
                         log::info!(
@@ -500,7 +534,21 @@ impl RemoteReplicationWorker {
                             expected_len,
                             remote_name
                         );
-                        upload_storage_file(storage.as_ref(), remote.as_ref(), filename, expected_md5)?;
+                        match upload_storage_file(storage.as_ref(), remote.as_ref(), filename, expected_md5) {
+                            Ok(()) => upload_succeeded = true,
+                            Err(e) => {
+                                log::warn!(
+                                    "upload_storage_file {} to remote '{}' failed: {}",
+                                    filename,
+                                    remote_name,
+                                    e
+                                );
+                                fs.replication_telemetry
+                                    .write()
+                                    .unwrap()
+                                    .record_error(remote_name, &e.to_string());
+                            }
+                        }
                     } else {
                         // Cross-copy from another remote holding this generation
                         for (src_name, src_remote, _, _) in &stores {
@@ -517,34 +565,55 @@ impl RemoteReplicationWorker {
                                     src_name,
                                     remote_name
                                 );
-                                let _ = cross_copy_file(
+                                match cross_copy_file(
                                     src_remote.as_ref(),
                                     remote.as_ref(),
                                     filename,
                                     expected_len,
                                     expected_md5,
-                                );
-                                break;
+                                ) {
+                                    Ok(()) => {
+                                        upload_succeeded = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "cross_copy_file {} from '{}' to '{}' failed: {}",
+                                            filename,
+                                            src_name,
+                                            remote_name,
+                                            e
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
+                } else {
+                    upload_succeeded = true;
+                }
 
-                    // Clean up any transient parts on this remote once consolidated log is verified
+                let verified_on_remote = upload_succeeded
+                    || remote
+                        .head_object(filename)
+                        .is_ok_and(|h| h.is_some_and(|o| o.size == expected_len));
+                if verified_on_remote {
+                    // Clean up any obsolete transient parts on this remote once consolidated log is verified
                     let parts = remote.list_objects(&format!("{:06}.part", gen_num)).unwrap_or_default();
                     for part in parts {
                         let _ = remote.delete_object(&part.key);
                     }
+
+                    confirmed_generations
+                        .entry(remote_name.clone())
+                        .or_default()
+                        .insert(gen_num);
+
+                    fs.replication_telemetry
+                        .write()
+                        .unwrap()
+                        .record_synced_gen(remote_name, gen_num);
                 }
-
-                confirmed_generations
-                    .entry(remote_name.clone())
-                    .or_default()
-                    .insert(gen_num);
-
-                fs.replication_telemetry
-                    .write()
-                    .unwrap()
-                    .record_synced_gen(remote_name, gen_num);
             }
         }
 
@@ -590,17 +659,42 @@ impl RemoteReplicationWorker {
                     continue;
                 }
 
-                let head = remote.head_object(sum_file)?;
+                let head = match remote.head_object(sum_file) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        log::warn!(
+                            "head_object summary {} on remote '{}' failed: {}",
+                            sum_file,
+                            remote_name,
+                            e
+                        );
+                        fs.replication_telemetry
+                            .write()
+                            .unwrap()
+                            .record_error(remote_name, &e.to_string());
+                        continue;
+                    }
+                };
                 let needs_sync = match head {
                     None => true,
                     Some(h) if local_exists => h.size != local_len,
                     _ => false,
                 };
 
+                let mut sync_succeeded = false;
                 if needs_sync {
                     if local_exists {
                         log::info!("Syncing summary {} to remote '{}'...", sum_file, remote_name);
-                        let _ = upload_storage_file(storage.as_ref(), remote.as_ref(), sum_file, None);
+                        match upload_storage_file(storage.as_ref(), remote.as_ref(), sum_file, None) {
+                            Ok(()) => sync_succeeded = true,
+                            Err(e) => {
+                                log::warn!("upload summary {} to '{}' failed: {}", sum_file, remote_name, e);
+                                fs.replication_telemetry
+                                    .write()
+                                    .unwrap()
+                                    .record_error(remote_name, &e.to_string());
+                            }
+                        }
                     } else {
                         // Find a peer remote that has this summary
                         for (src_name, src_remote, _, _) in &stores {
@@ -615,23 +709,38 @@ impl RemoteReplicationWorker {
                                     src_name,
                                     remote_name
                                 );
-                                let _ = cross_copy_file(
+                                match cross_copy_file(
                                     src_remote.as_ref(),
                                     remote.as_ref(),
                                     sum_file,
                                     src_head.size,
                                     None,
-                                );
-                                break;
+                                ) {
+                                    Ok(()) => {
+                                        sync_succeeded = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("cross_copy summary {} failed: {}", sum_file, e);
+                                    }
+                                }
                             }
                         }
                     }
+                } else {
+                    sync_succeeded = true;
                 }
 
-                confirmed_summaries
-                    .entry(remote_name.clone())
-                    .or_default()
-                    .insert(sum_file.clone());
+                if sync_succeeded
+                    || remote
+                        .head_object(sum_file)
+                        .is_ok_and(|h| h.is_some_and(|o| if local_exists { o.size == local_len } else { true }))
+                {
+                    confirmed_summaries
+                        .entry(remote_name.clone())
+                        .or_default()
+                        .insert(sum_file.clone());
+                }
             }
         }
 
@@ -653,6 +762,7 @@ impl RemoteReplicationWorker {
                     let mut part_bytes = vec![0u8; part_len as usize];
                     if reader.read_exact_at(*last_offset, &mut part_bytes).is_ok() {
                         let part_md5: [u8; 16] = *md5::compute(&part_bytes);
+                        let mut any_part_success = false;
                         for (remote_name, remote, read_only, _) in &stores {
                             if *read_only {
                                 continue;
@@ -663,15 +773,33 @@ impl RemoteReplicationWorker {
                                 part_len,
                                 remote_name
                             );
-                            let _ = remote.put_object(&part_filename, &mut &part_bytes[..], part_len, Some(&part_md5));
-                            fs.replication_telemetry.write().unwrap().record_active_part(
-                                remote_name,
-                                active_gen,
-                                *part_idx,
-                            );
+                            match remote.put_object(&part_filename, &mut &part_bytes[..], part_len, Some(&part_md5)) {
+                                Ok(()) => {
+                                    any_part_success = true;
+                                    fs.replication_telemetry.write().unwrap().record_active_part(
+                                        remote_name,
+                                        active_gen,
+                                        *part_idx,
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "put_object active part {} to '{}' failed: {}",
+                                        part_filename,
+                                        remote_name,
+                                        e
+                                    );
+                                    fs.replication_telemetry
+                                        .write()
+                                        .unwrap()
+                                        .record_error(remote_name, &e.to_string());
+                                }
+                            }
                         }
-                        *last_offset = active_offset;
-                        *part_idx += 1;
+                        if any_part_success {
+                            *last_offset = active_offset;
+                            *part_idx += 1;
+                        }
                     }
                 }
             }
@@ -679,12 +807,13 @@ impl RemoteReplicationWorker {
         }
 
         // 5. Tiered storage local eviction / pruning
-        Self::prune_eligible_local_logs(&storage, &manifest, active_gen, &policy, &stores);
+        Self::prune_eligible_local_logs(fs, &storage, &manifest, active_gen, &policy, &stores);
 
         Ok(())
     }
 
     fn prune_eligible_local_logs(
+        fs: &InMemoryFS,
         storage: &Arc<dyn Storage>,
         manifest: &crate::log::LogManifest,
         active_gen: u64,
@@ -697,12 +826,23 @@ impl RemoteReplicationWorker {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(policy.local_retention_days * 86400));
 
+        let last_summary_gen = fs.last_summary_generation.load(Ordering::SeqCst);
+
         for log_entry in &manifest.logs {
             let gen_num = log_entry.generation;
             let filename = &log_entry.filename;
 
             // Cannot prune active generation
             if gen_num >= active_gen {
+                continue;
+            }
+
+            // Finding 1: Cannot prune local log if no local summary covers it
+            if gen_num > last_summary_gen {
+                continue;
+            }
+            let summary_file = format!("{:06}.summary", last_summary_gen);
+            if !storage.exists(&summary_file) {
                 continue;
             }
 
@@ -738,7 +878,12 @@ impl RemoteReplicationWorker {
                     age.as_secs() / 86400,
                     verified_copies
                 );
-                let _ = storage.remove_file(filename);
+                if storage.remove_file(filename).is_ok() {
+                    // Finding 8: invalidate cached reader so unlinked fd is dropped and disk space is freed!
+                    if let Some(ref cache) = fs.log_cache {
+                        cache.invalidate(gen_num);
+                    }
+                }
             }
         }
     }

@@ -230,12 +230,9 @@ impl InMemoryFS {
     /// Resolves full `FileAttr` for an inode across `live` -> `flushing` -> `base`.
     pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
         if self.virtual_files.is_virtual_ino(ino) {
-            let size = self
-                .virtual_files
-                .generate_content(ino, self)
-                .map(|s| s.len() as u64)
-                .unwrap_or(0);
-            return Some(self.virtual_files.file_attr(ino, size, self.clock.now()));
+            // Dynamic virtual files report st_size = 0 (standard Linux procfs / sysfs convention),
+            // which prevents tools like `cat` from capping reads at an early stale size.
+            return Some(self.virtual_files.file_attr(ino, 0, self.clock.now()));
         }
         self.with_inode_layers(ino, |layers| layers.attr())
     }
@@ -248,12 +245,7 @@ impl InMemoryFS {
 
         for &ino in inos {
             if self.virtual_files.is_virtual_ino(ino) {
-                let size = self
-                    .virtual_files
-                    .generate_content(ino, self)
-                    .map(|s| s.len() as u64)
-                    .unwrap_or(0);
-                result.insert(ino, self.virtual_files.file_attr(ino, size, self.clock.now()));
+                result.insert(ino, self.virtual_files.file_attr(ino, 0, self.clock.now()));
             } else {
                 regular_inos.push(ino);
             }

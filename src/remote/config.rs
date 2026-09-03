@@ -146,9 +146,15 @@ impl RemoteTargetConfig {
         let signer = creds.map(|(k, s)| SigV4Signer::new(k, s, &self.region));
 
         let force_path = self.force_path_style.unwrap_or_else(|| {
-            // Default to path style if custom endpoint or IP address
+            // Default to path style if custom endpoint with explicit port, localhost, or IP address
             if let Some(ref ep) = self.endpoint {
-                ep.contains("localhost") || ep.contains("127.0.0.1") || ep.contains(':')
+                let host_part = ep
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or("");
+                host_part.contains("localhost") || host_part.contains("127.0.0.1") || host_part.contains(':')
             } else {
                 false
             }

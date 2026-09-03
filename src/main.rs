@@ -30,6 +30,22 @@ fn latest_summary_file(storage: &OsStorage) -> std::io::Result<Option<String>> {
     Ok(latest.map(|(_, f)| f))
 }
 
+fn load_remote_registry(log_dir: &Path) -> appendfs::remote::RemoteRegistry {
+    match appendfs::remote::RemoteRegistry::load_from_dir(log_dir) {
+        Ok(reg) => reg,
+        Err(e) => {
+            eprintln!(
+                "Error loading '{}': {}",
+                log_dir
+                    .join(appendfs::remote::config::DEFAULT_REMOTES_FILENAME)
+                    .display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 fn resolve_volume_key(log_dir: &Path, key_file: Option<&Path>) -> Result<Arc<VolumeKey>, String> {
     let storage = OsStorage::new(log_dir);
 
@@ -159,7 +175,7 @@ fn main() {
                 );
                 std::fs::create_dir_all(&args.log_dir).unwrap_or_default();
                 let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
-                let registry = appendfs::remote::RemoteRegistry::load_from_dir(&args.log_dir).unwrap_or_default();
+                let registry = load_remote_registry(&args.log_dir);
 
                 let remote_cfg = if let Some(cfg) = registry.get_remote(remote_name) {
                     cfg.clone()
@@ -339,13 +355,13 @@ fn main() {
                     }
                 };
 
-            fs_instance.log_writer = Some(Arc::clone(&writer));
+            fs_instance.attach_log_writer(Arc::clone(&writer));
             fs_instance.max_buffer_size = args.flush_threshold;
             fs_instance.max_staged_ops = args.flush_threshold_ops;
             fs_instance.max_extent_size = args.max_extent_size;
             fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
 
-            let registry = appendfs::remote::RemoteRegistry::load_from_dir(log_dir).unwrap_or_default();
+            let registry = load_remote_registry(log_dir);
             let cache_dir = log_dir.join(".cache");
             let block_cache = Arc::new(
                 appendfs::remote::OnDiskBlockCache::new(
@@ -562,7 +578,7 @@ fn main() {
             }
 
             if let Some(ref remote_name) = args.remote {
-                let registry = appendfs::remote::RemoteRegistry::load_from_dir(log_dir).unwrap_or_default();
+                let registry = load_remote_registry(log_dir);
                 let remote_cfg = match registry.get_remote(remote_name) {
                     Some(c) => c,
                     None => {
@@ -634,8 +650,7 @@ fn main() {
         }
         Commands::Remote(subargs) => match subargs.command {
             appendfs::cli::RemoteCommands::Add(add_args) => {
-                let mut registry =
-                    appendfs::remote::RemoteRegistry::load_from_dir(&add_args.log_dir).unwrap_or_default();
+                let mut registry = load_remote_registry(&add_args.log_dir);
                 let mut cfg = if let Some(ref p) = add_args.path {
                     appendfs::remote::RemoteTargetConfig::new_path(p)
                 } else if let Some(ref b) = add_args.bucket {
@@ -671,8 +686,7 @@ fn main() {
                 );
             }
             appendfs::cli::RemoteCommands::Rm(rm_args) => {
-                let mut registry =
-                    appendfs::remote::RemoteRegistry::load_from_dir(&rm_args.log_dir).unwrap_or_default();
+                let mut registry = load_remote_registry(&rm_args.log_dir);
                 if registry.remove_remote(&rm_args.name) {
                     if let Err(e) = registry.save_to_dir(&rm_args.log_dir) {
                         eprintln!("Failed to save remotes.toml in '{}': {}", rm_args.log_dir.display(), e);
@@ -685,7 +699,7 @@ fn main() {
                 }
             }
             appendfs::cli::RemoteCommands::List(list_args) => {
-                let registry = appendfs::remote::RemoteRegistry::load_from_dir(&list_args.log_dir).unwrap_or_default();
+                let registry = load_remote_registry(&list_args.log_dir);
                 if registry.remotes.is_empty() {
                     println!("No remotes configured in '{}'.", list_args.log_dir.display());
                 } else {

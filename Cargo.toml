@@ -28,6 +28,13 @@ url = "2.5"
 base64 = "0.22"
 tempfile = "3.8"
 
+[features]
+default = []
+testing = []
+
+[dev-dependencies]
+appendfs = { path = ".", features = ["testing"] }
+
 [build-dependencies]
 cc = "1.0"
 pkg-config = "0.3"

@@ -75,6 +75,7 @@ dependencies = [
 name = "appendfs"
 version = "0.1.0"
 dependencies = [
+ "appendfs",
  "argon2",
  "base64",
  "bincode",
