@@ -77,3 +77,24 @@ The generator produces:
 - `000000.summary`: Initial volume snapshot with deterministic mock timestamp.
 - `000001.log`: 3 flushed commit batches covering directories, files, symlinks, special files, and xattrs.
 - `000001.summary`: Exported snapshot of all populated inodes.
+
+## Pre-Release vs. Post-Release Compatibility Policy
+
+- **Pre-Release (v0 development)**:
+  - While AppendFS has no real-life production deployments, keep format versioning fresh at version 1.
+  - Do not add legacy deserializers, compatibility shims, or migration fallbacks for unreleased schema adjustments.
+  - When modifying persisted structs or headers, cleanly regenerate `tests/fixtures/v1`:
+    ```bash
+    cargo run --bin generate_compat_fixture tests/fixtures/v1
+    ```
+- **Post-Release (Production)**:
+  - Any breaking format modification requires bumping `CURRENT_VERSION` / `CURRENT_SUMMARY_VERSION`.
+  - Introduce a new fixture directory (`tests/fixtures/v2/`) and retain `tests/fixtures/v1/` to verify forward/backward compatibility.
+
+## Architectural & Recovery Invariants
+
+- **State Restoration Invariant**:
+  - Any runtime state, counter, or threshold in `InMemoryFS` that governs operational lifecycle decisions (e.g. `last_summary_generation` for log pruning/tiered eviction, `next_inode`, `last_tx_id`) **must be explicitly restored in `recover_fs`** from the recovered summary file or replayed log stream.
+  - An unmount/remount or crash recovery cycle must never reset operational progress or disable lifecycle tasks like tiered pruning.
+- **Test-Only Exports & Standalone Binaries**:
+  - Whenever mock stores, latency wrappers, or test doubles are gated behind `#[cfg(any(test, feature = "testing"))]` in submodules, ensure all top-level re-exports in `src/lib.rs` use the identical `cfg` gate so standalone binaries (`src/bin/*`, examples, benchmarks) compile cleanly without requiring test flags.
