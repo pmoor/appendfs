@@ -1,4 +1,3 @@
-use appendfs::Clock;
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::log::{LogFileCache, LogWriter, init_volume};
@@ -10,8 +9,10 @@ use appendfs::remote::{
     OnDiskBlockCache, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
 };
 use appendfs::storage::OsStorage;
+use appendfs::{Clock, Storage};
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 #[test]
@@ -1277,4 +1278,103 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
         counting_store.heads() > head_calls_initial,
         "Full audit cycle must re-probe head_object for remote integrity check"
     );
+}
+
+#[test]
+fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
+    let dir = TempDir::new().unwrap();
+    let nfs_dir = TempDir::new().unwrap();
+    let storage = Arc::new(OsStorage::new(dir.path()));
+    let clock = Arc::new(SystemClock);
+    let volume_key = VolumeKey::plaintext_arc();
+
+    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_log_dir(dir.path());
+
+    // Write file in generation 1
+    let root = 1u64;
+    let file_attr = create_core(&fs, root, "test.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs, file_attr.ino, b"data to replicate and prune", 0).unwrap();
+    fs.sync_log().unwrap();
+
+    fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(fs.last_summary_generation.load(Ordering::SeqCst), 1);
+
+    // Roll to generation 2
+    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
+    {
+        let mut manifest = fs.manifest.write().unwrap();
+        manifest.set_generation_md5(next_gen - 1, sealed_md5);
+        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+    }
+
+    // Drop filesystem and writer, simulating a restart/remount
+    drop(writer);
+    drop(fs);
+
+    // Remove 000002.summary (emitted on clean drop) to simulate recovery from 000001.summary
+    if storage.exists("000002.summary") {
+        storage.remove_file("000002.summary").unwrap();
+    }
+
+    // Recover filesystem
+    let mut recovered_fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+
+    // Verify last_summary_generation was restored from 000001.summary
+    assert_eq!(
+        recovered_fs.last_summary_generation.load(Ordering::SeqCst),
+        1,
+        "last_summary_generation must be seeded from recovered summary file"
+    );
+
+    let writer2 = Arc::new(LogWriter::create_lazy(storage.clone(), 2, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    recovered_fs.log_writer = Some(writer2);
+    recovered_fs.set_log_dir(dir.path());
+
+    // Configure remote registry with 0-second retention to test pruning
+    let mut registry = RemoteRegistry::new();
+    let nas_cfg = RemoteTargetConfig::new_path(nfs_dir.path());
+    registry.add_remote("nas", nas_cfg);
+    registry.policy.min_synced_remotes = 1;
+    registry.policy.local_retention_secs = Some(0);
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    let fs_arc = Arc::new(recovered_fs);
+    let mut last_part_sync = std::time::SystemTime::now();
+    let mut uploaded_parts = std::collections::HashMap::new();
+
+    // Run cycle: should replicate 000001.log and prune it immediately without waiting for a new summary!
+    assert!(dir.path().join("000001.log").exists());
+    appendfs::remote::RemoteReplicationWorker::run_cycle(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+    )
+    .unwrap();
+
+    // Verify 000001.log was pruned from local disk
+    assert!(
+        !dir.path().join("000001.log").exists(),
+        "000001.log must be pruned immediately after restart without waiting for a new summary"
+    );
+    // Verify it exists in the remote store
+    assert!(nfs_dir.path().join("000001.log").exists());
 }
