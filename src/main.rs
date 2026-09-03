@@ -151,6 +151,63 @@ fn main() {
 
     match cli.command {
         Commands::Init(args) => {
+            if let Some(ref remote_name) = args.from_remote {
+                println!(
+                    "Bootstrapping volume in '{}' from remote '{}'...",
+                    args.log_dir.display(),
+                    remote_name
+                );
+                std::fs::create_dir_all(&args.log_dir).unwrap_or_default();
+                let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
+                let registry = appendfs::remote::RemoteRegistry::load_from_dir(&args.log_dir).unwrap_or_default();
+
+                let remote_cfg = if let Some(cfg) = registry.get_remote(remote_name) {
+                    cfg.clone()
+                } else if let Some(ref path) = args.remote_path {
+                    let mut cfg = appendfs::remote::RemoteTargetConfig::new_path(path);
+                    cfg.read_only = args.remote_read_only;
+                    cfg
+                } else if let Some(ref bucket) = args.remote_bucket {
+                    let mut cfg = appendfs::remote::RemoteTargetConfig::new(bucket);
+                    cfg.endpoint = args.remote_endpoint.clone();
+                    cfg.region = args.remote_region.clone();
+                    cfg.prefix = args.remote_prefix.clone();
+                    cfg.read_only = args.remote_read_only;
+                    cfg
+                } else {
+                    eprintln!(
+                        "Error: Remote '{}' not found in remotes.toml, and neither --remote-path nor --remote-bucket was specified.",
+                        remote_name
+                    );
+                    std::process::exit(1);
+                };
+
+                let store = remote_cfg.build_store();
+                match appendfs::remote::bootstrap_from_remote(
+                    store.as_ref(),
+                    storage.as_ref(),
+                    &args.log_dir,
+                    remote_name,
+                    remote_cfg,
+                ) {
+                    Ok(summary_file) => {
+                        println!("Successfully bootstrapped volume from remote '{}'!", remote_name);
+                        println!("  Log Directory:   {}", args.log_dir.display());
+                        println!("  Latest Summary:  {}", summary_file);
+                        println!();
+                        println!(
+                            "You can now mount this volume with 'appendfs mount {} <mountpoint>'",
+                            args.log_dir.display()
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to bootstrap volume from remote: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             println!(
                 "Initializing appendfs volume at '{}' (branch: {})...",
                 args.log_dir.display(),
@@ -272,22 +329,60 @@ fn main() {
             // The volume header decides how writes are compressed; it was read back during
             // recovery, so a mount never has to be told separately.
             let compression = fs_instance.volume_header.compression;
-            let writer = match LogWriter::create_lazy(storage, next_gen, args.max_log_size, start_tx, volume_key) {
-                Ok(w) => Arc::new(w.with_compression(compression)),
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            };
+            let max_log_age = appendfs::cli::parse_duration(&args.max_log_age).ok();
+            let writer =
+                match LogWriter::create_lazy(storage.clone(), next_gen, args.max_log_size, start_tx, volume_key) {
+                    Ok(w) => Arc::new(w.with_compression(compression).with_max_log_age(max_log_age)),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                };
 
             fs_instance.log_writer = Some(Arc::clone(&writer));
             fs_instance.max_buffer_size = args.flush_threshold;
             fs_instance.max_staged_ops = args.flush_threshold_ops;
             fs_instance.max_extent_size = args.max_extent_size;
             fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
-            fs_instance.set_log_dir(log_dir);
+
+            let registry = appendfs::remote::RemoteRegistry::load_from_dir(log_dir).unwrap_or_default();
+            let cache_dir = log_dir.join(".cache");
+            let block_cache = Arc::new(
+                appendfs::remote::OnDiskBlockCache::new(
+                    &cache_dir,
+                    registry.policy.local_cache_max_gb * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
+            let remote_stores = registry.build_read_stores();
+
+            let log_cache = Arc::new(appendfs::log::LogFileCache::with_remote_support(
+                storage.clone(),
+                Some(block_cache),
+                remote_stores,
+                Some(Arc::clone(&fs_instance.manifest)),
+            ));
+            log_cache.set_decrypted_cache_size(args.decrypted_cache_size);
+            fs_instance.log_cache = Some(log_cache);
 
             let fs_instance = Arc::new(fs_instance);
+
+            let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+            fs_instance.set_remote_registry(Arc::clone(&registry_arc));
+
+            let _worker = if !args.no_sync && !registry_arc.read().unwrap().remotes.is_empty() {
+                println!(
+                    "Starting autonomous background replication worker for {} remote(s)...",
+                    registry_arc.read().unwrap().remotes.len()
+                );
+                Some(appendfs::remote::RemoteReplicationWorker::start(
+                    Arc::clone(&fs_instance),
+                    Arc::clone(&registry_arc),
+                    log_dir.to_path_buf(),
+                ))
+            } else {
+                None
+            };
 
             println!(
                 "Mounting appendfs at '{}' with log-dir '{}' (active generation: {}, flush-threshold: {} bytes, flush-ops: {}, flush-interval: {}s, max-log-size: {} bytes, max-extent-size: {} bytes, foreground: {})...",
@@ -345,7 +440,7 @@ fn main() {
                 log_dir.display()
             );
             let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
-            let mut fs_instance = match recover_fs(storage, target, Arc::new(SystemClock), volume_key) {
+            let mut fs_instance = match recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key) {
                 Ok(fs) => fs,
                 Err(e) => {
                     eprintln!("Failed to recover volume from '{}': {}", log_dir.display(), e);
@@ -354,6 +449,12 @@ fn main() {
             };
             fs_instance.set_log_dir(log_dir);
             fs_instance.set_read_only(true);
+            if fs_instance.log_cache.is_none() {
+                fs_instance.set_storage(storage.clone());
+            }
+            if let Some(ref lc) = fs_instance.log_cache {
+                lc.set_decrypted_cache_size(args.decrypted_cache_size);
+            }
 
             let effective_tx_id = fs_instance.last_tx_id.load(Ordering::SeqCst);
             let effective_gen = {
@@ -459,6 +560,55 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if let Some(ref remote_name) = args.remote {
+                let registry = appendfs::remote::RemoteRegistry::load_from_dir(log_dir).unwrap_or_default();
+                let remote_cfg = match registry.get_remote(remote_name) {
+                    Some(c) => c,
+                    None => {
+                        eprintln!("Error: Remote '{}' is not configured in remotes.toml.", remote_name);
+                        std::process::exit(1);
+                    }
+                };
+                let store = remote_cfg.build_store();
+                let storage = OsStorage::new(log_dir);
+                let summary_file = match latest_summary_file(&storage) {
+                    Ok(Some(f)) => f,
+                    _ => {
+                        eprintln!("Error: No summary files found in '{}'", log_dir.display());
+                        std::process::exit(1);
+                    }
+                };
+                let volume_key = match resolve_volume_key(log_dir, args.key_file.as_deref()) {
+                    Ok(kr) => kr,
+                    Err(e) => {
+                        eprintln!("Authentication error: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let snapshot = match SummaryReader::open(&storage, &summary_file, volume_key) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Failed to read summary '{}': {}", summary_file, e);
+                        std::process::exit(1);
+                    }
+                };
+                let target_descr = if let Some(ref p) = remote_cfg.path {
+                    format!("path: '{}'", p.display())
+                } else {
+                    format!("bucket: '{}'", remote_cfg.bucket.as_deref().unwrap_or(""))
+                };
+                println!(
+                    "Checking remote '{}' ({}) against summary manifest...",
+                    remote_name, target_descr
+                );
+                let report = appendfs::check_remote_integrity(store.as_ref(), remote_name, &snapshot.manifest);
+                print!("{}", report.format_report(Some(log_dir), args.verbose > 0));
+                if !report.is_clean() {
+                    std::process::exit(1);
+                }
+                return;
+            }
+
             let volume_key = match resolve_volume_key(log_dir, args.key_file.as_deref()) {
                 Ok(kr) => kr,
                 Err(e) => {
@@ -481,6 +631,91 @@ fn main() {
                 }
             }
         }
+        Commands::Remote(subargs) => match subargs.command {
+            appendfs::cli::RemoteCommands::Add(add_args) => {
+                let mut registry =
+                    appendfs::remote::RemoteRegistry::load_from_dir(&add_args.log_dir).unwrap_or_default();
+                let mut cfg = if let Some(ref p) = add_args.path {
+                    appendfs::remote::RemoteTargetConfig::new_path(p)
+                } else if let Some(ref b) = add_args.bucket {
+                    appendfs::remote::RemoteTargetConfig::new(b)
+                } else {
+                    eprintln!("Error: Either --path or --bucket must be specified when adding a remote.");
+                    std::process::exit(1);
+                };
+                cfg.endpoint = add_args.endpoint;
+                cfg.region = add_args.region;
+                cfg.prefix = add_args.prefix;
+                cfg.read_only = add_args.read_only;
+                cfg.replicate_ancestors = add_args.replicate_ancestors;
+                if let Some(prio) = add_args.read_priority {
+                    cfg.read_priority = prio;
+                }
+                cfg.access_key_id = add_args.access_key_id;
+                cfg.secret_access_key = add_args.secret_access_key;
+                cfg.access_key_id_env = add_args.access_key_id_env;
+                cfg.secret_access_key_env = add_args.secret_access_key_env;
+                cfg.credentials_file = add_args.credentials_file;
+                cfg.force_path_style = add_args.path_style;
+
+                registry.add_remote(&add_args.name, cfg);
+                if let Err(e) = registry.save_to_dir(&add_args.log_dir) {
+                    eprintln!("Failed to save remotes.toml in '{}': {}", add_args.log_dir.display(), e);
+                    std::process::exit(1);
+                }
+                println!(
+                    "Successfully added remote '{}' in '{}'",
+                    add_args.name,
+                    add_args.log_dir.display()
+                );
+            }
+            appendfs::cli::RemoteCommands::Rm(rm_args) => {
+                let mut registry =
+                    appendfs::remote::RemoteRegistry::load_from_dir(&rm_args.log_dir).unwrap_or_default();
+                if registry.remove_remote(&rm_args.name) {
+                    if let Err(e) = registry.save_to_dir(&rm_args.log_dir) {
+                        eprintln!("Failed to save remotes.toml in '{}': {}", rm_args.log_dir.display(), e);
+                        std::process::exit(1);
+                    }
+                    println!("Removed remote '{}' from '{}'", rm_args.name, rm_args.log_dir.display());
+                } else {
+                    eprintln!("Error: Remote '{}' was not configured.", rm_args.name);
+                    std::process::exit(1);
+                }
+            }
+            appendfs::cli::RemoteCommands::List(list_args) => {
+                let registry = appendfs::remote::RemoteRegistry::load_from_dir(&list_args.log_dir).unwrap_or_default();
+                if registry.remotes.is_empty() {
+                    println!("No remotes configured in '{}'.", list_args.log_dir.display());
+                } else {
+                    println!("Configured remotes in '{}':", list_args.log_dir.display());
+                    let mut sorted_remotes: Vec<_> = registry.remotes.iter().collect();
+                    sorted_remotes.sort_by_key(|(name, cfg)| (cfg.read_priority, (*name).clone()));
+                    for (name, cfg) in sorted_remotes {
+                        if let Some(ref p) = cfg.path {
+                            println!(
+                                "  - {}: type='local/nfs', path='{}', priority={}, mode='{}'",
+                                name,
+                                p.display(),
+                                cfg.read_priority,
+                                if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
+                            );
+                        } else {
+                            println!(
+                                "  - {}: type='s3', bucket='{}', priority={}, region='{}', mode='{}', endpoint={:?}, prefix='{}'",
+                                name,
+                                cfg.bucket.as_deref().unwrap_or(""),
+                                cfg.read_priority,
+                                cfg.region,
+                                if cfg.read_only { "ReadOnly (Fork)" } else { "ReadWrite" },
+                                cfg.endpoint,
+                                cfg.prefix
+                            );
+                        }
+                    }
+                }
+            }
+        },
         Commands::Key(args) => {
             let log_dir = args.log_dir;
             let storage = OsStorage::new(&log_dir);

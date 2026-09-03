@@ -10,6 +10,7 @@ pub mod log;
 pub mod node;
 pub mod operations;
 pub mod range_map;
+pub mod remote;
 pub mod shim;
 pub mod stats;
 pub mod storage;
@@ -19,7 +20,9 @@ pub mod wire;
 // crypto exposes stays reachable at its canonical `appendfs::crypto::` path.
 pub use crypto::{VolumeHeader, VolumeKey};
 
-pub use check::{IntegrityIssue, IntegrityReport, IssueLevel, check_fs_integrity, check_volume};
+pub use check::{
+    IntegrityIssue, IntegrityReport, IssueLevel, check_fs_integrity, check_remote_integrity, check_volume,
+};
 pub use cli::{
     CheckArgs, Cli, Commands, DumpArgs, InitArgs, KeyArgs, MountArgs, MountRoArgs, StatsArgs, find_latest_generation,
     find_latest_generation_in_storage,
@@ -33,6 +36,12 @@ pub use log::{
 };
 pub use node::{InodeMeta, Node, NodeDelta, NodeKind, SpecialDelta};
 pub use range_map::{RangeEntry, RangeMap, RangeValue};
+pub use remote::{
+    CountingRemoteStore, DEFAULT_DECRYPTED_CACHE_SIZE, DecryptedRecordCache, FailingRemoteStore, LatencyRemoteStore,
+    MemoryRemoteStore, MockRemoteStore, OnDiskBlockCache, RemoteObject, RemoteReadCoalescer, RemoteReadTarget,
+    RemoteRegistry, RemoteReplicationWorker, RemoteStore, RemoteStoreMetrics, RemoteTargetConfig, ReplicationPolicy,
+    S3RemoteStore, TieredCache, TieredStorageReader,
+};
 pub use stats::VolumeStats;
 pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};
 

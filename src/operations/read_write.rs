@@ -30,11 +30,37 @@ pub fn read_core(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Result<
     if offset < 0 {
         return Err(libc::EINVAL);
     }
+    if fs.virtual_files.is_virtual_ino(ino) {
+        if let Some(content) = fs.virtual_files.generate_content(ino, fs) {
+            let bytes = content.into_bytes();
+            let start = (offset as usize).min(bytes.len());
+            let end = (start + size).min(bytes.len());
+            return Ok(bytes[start..end].to_vec());
+        }
+        return Err(libc::ENOENT);
+    }
     fs.read_file_data(ino, offset as u64, size)
 }
 
 pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
     log::trace!("read(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
+    if (fh & crate::fs::VIRTUAL_FH_FLAG) != 0 {
+        let handles = fs.virtual_handles.read().unwrap();
+        if let Some(buf) = handles.get(&fh) {
+            if offset < 0 {
+                req.reply_err(libc::EINVAL);
+                return;
+            }
+            let start = (offset as usize).min(buf.len());
+            let end = (start + size).min(buf.len());
+            req.reply_buf(&buf[start..end]);
+            return;
+        } else {
+            req.reply_err(libc::EBADF);
+            return;
+        }
+    }
+
     let handle = match fs.get_file_handle(fh) {
         Some(h) => h,
         None => {
@@ -83,6 +109,9 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     log::trace!("write(ino={}, len={}, offset={})", ino, buf.len(), offset);
     if fs.is_read_only() {
         return Err(libc::EROFS);
+    }
+    if fs.virtual_files.is_virtual_ino(ino) {
+        return Err(libc::EPERM);
     }
     fs.check_flush_capacity()?;
 
@@ -180,6 +209,9 @@ pub fn setattr_core(
 
     if fs.is_read_only() {
         return Err(libc::EROFS);
+    }
+    if fs.virtual_files.is_virtual_ino(ino) {
+        return Err(libc::EPERM);
     }
     fs.check_flush_capacity()?;
 
@@ -358,6 +390,9 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
     );
     if fs.is_read_only() {
         return Err(libc::EROFS);
+    }
+    if fs.virtual_files.is_virtual_ino(ino) {
+        return Err(libc::EPERM);
     }
     if offset < 0 || length <= 0 {
         return Err(libc::EINVAL);

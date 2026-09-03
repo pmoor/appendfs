@@ -25,6 +25,8 @@ pub const DEFAULT_MAX_BUFFER_OPS: usize = 10_000;
 /// `DEFAULT_MAX_BUFFER_SIZE` when the log is not draining.
 pub const DEFAULT_MAX_FLUSH_QUEUE_DEPTH: usize = 4;
 
+pub use crate::remote::block_cache::DEFAULT_DECRYPTED_CACHE_SIZE;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "appendfs",
@@ -58,6 +60,105 @@ pub enum Commands {
     Fsck(CheckArgs),
     /// Show a volume's encryption state and identity (no key required)
     Key(KeyArgs),
+    /// Manage remote S3-compatible replication targets
+    Remote(RemoteSubcommandArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteSubcommandArgs {
+    #[command(subcommand)]
+    pub command: RemoteCommands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum RemoteCommands {
+    /// Add a new remote store target to remotes.toml
+    Add(RemoteAddArgs),
+    /// Remove a remote store target from remotes.toml
+    Rm(RemoteRmArgs),
+    /// List all configured remote store targets
+    List(RemoteListArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RemoteAddArgs {
+    /// Volume log directory containing remotes.toml
+    pub log_dir: PathBuf,
+
+    /// Unique friendly name for this remote target (e.g. "aws", "b2", "r2")
+    pub name: String,
+
+    /// Local filesystem path for local directory or NFS NAS share remotes (e.g. "/mnt/nfs_backup/appendfs_logs")
+    #[arg(long = "path")]
+    pub path: Option<PathBuf>,
+
+    /// S3 bucket name (required for S3 cloud remotes unless --path is specified)
+    #[arg(long = "bucket")]
+    pub bucket: Option<String>,
+
+    /// S3 endpoint URL (e.g. "https://s3.us-west-002.backblazeb2.com")
+    #[arg(long = "endpoint")]
+    pub endpoint: Option<String>,
+
+    /// S3 region (default: "us-east-1")
+    #[arg(long = "region", default_value = "us-east-1")]
+    pub region: String,
+
+    /// Key prefix inside the bucket (e.g. "backups/vol1/")
+    #[arg(long = "prefix", default_value = "")]
+    pub prefix: String,
+
+    /// Mark this remote as read-only (used for upstream volumes and zero-cost cloud forking)
+    #[arg(long = "read-only", default_value_t = false)]
+    pub read_only: bool,
+
+    /// When forking from a read-only remote, replicate ancestor logs to this remote (default: false)
+    #[arg(long = "replicate-ancestors", default_value_t = false)]
+    pub replicate_ancestors: bool,
+
+    /// Read priority (lower values are queried first during remote reads; default 10 for --path, 100 for S3)
+    #[arg(long = "read-priority")]
+    pub read_priority: Option<u32>,
+
+    /// S3 Access Key ID (literal)
+    #[arg(long = "access-key-id")]
+    pub access_key_id: Option<String>,
+
+    /// S3 Secret Access Key (literal)
+    #[arg(long = "secret-access-key")]
+    pub secret_access_key: Option<String>,
+
+    /// Name of environment variable containing Access Key ID (e.g. "B2_KEY_ID")
+    #[arg(long = "access-key-id-env")]
+    pub access_key_id_env: Option<String>,
+
+    /// Name of environment variable containing Secret Access Key (e.g. "B2_APPLICATION_KEY")
+    #[arg(long = "secret-access-key-env")]
+    pub secret_access_key_env: Option<String>,
+
+    /// Path to file containing credentials (line 1: access key, line 2: secret key)
+    #[arg(long = "credentials-file")]
+    pub credentials_file: Option<PathBuf>,
+
+    /// Force S3 path-style addressing (http://endpoint/bucket/key)
+    #[arg(long = "path-style")]
+    pub path_style: Option<bool>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RemoteRmArgs {
+    /// Volume log directory containing remotes.toml
+    pub log_dir: PathBuf,
+
+    /// Name of remote target to remove
+    pub name: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RemoteListArgs {
+    /// Volume log directory containing remotes.toml
+    pub log_dir: PathBuf,
 }
 
 /// Arguments for `key`, which reports a volume's encryption state.
@@ -124,6 +225,34 @@ pub struct InitArgs {
     /// plain encryption does not.
     #[arg(long = "compress", default_value_t = false)]
     pub compress: bool,
+
+    /// Bootstrap local volume by downloading latest checkpoint from this remote (e.g. "aws", "upstream")
+    #[arg(long = "from-remote")]
+    pub from_remote: Option<String>,
+
+    /// S3 bucket name for bootstrap remote if configuring an S3 store on the fly
+    #[arg(long = "remote-bucket")]
+    pub remote_bucket: Option<String>,
+
+    /// Local directory path for bootstrap remote if configuring a local/NFS share on the fly
+    #[arg(long = "remote-path")]
+    pub remote_path: Option<PathBuf>,
+
+    /// S3 endpoint URL for bootstrap remote
+    #[arg(long = "remote-endpoint")]
+    pub remote_endpoint: Option<String>,
+
+    /// S3 region for bootstrap remote (default: "us-east-1")
+    #[arg(long = "remote-region", default_value = "us-east-1")]
+    pub remote_region: String,
+
+    /// Key prefix inside bucket for bootstrap remote
+    #[arg(long = "remote-prefix", default_value = "")]
+    pub remote_prefix: String,
+
+    /// Mark bootstrap remote as read-only (for zero-cost CoW cloud forking)
+    #[arg(long = "remote-read-only", default_value_t = false)]
+    pub remote_read_only: bool,
 }
 
 impl InitArgs {
@@ -192,6 +321,18 @@ pub struct MountArgs {
     /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
+
+    /// Disable autonomous background remote synchronization (default: sync is ON if remotes configured)
+    #[arg(long = "no-sync", default_value_t = false)]
+    pub no_sync: bool,
+
+    /// Maximum age of active log file before rolling for cloud durability (e.g. "2h", "30m", default: "2h")
+    #[arg(long = "max-log-age", default_value = "2h")]
+    pub max_log_age: String,
+
+    /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
+    #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
+    pub decrypted_cache_size: usize,
 }
 
 impl MountArgs {
@@ -240,6 +381,10 @@ pub struct MountRoArgs {
     /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
+
+    /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
+    #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
+    pub decrypted_cache_size: usize,
 }
 
 impl MountRoArgs {
@@ -283,6 +428,32 @@ pub struct CheckArgs {
     /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
     #[arg(long = "key-file")]
     pub key_file: Option<PathBuf>,
+
+    /// Verify remote objects on specified remote against summary manifest authenticated MD5s
+    #[arg(long = "remote")]
+    pub remote: Option<String>,
+}
+
+/// Helper parsing duration strings such as "2h", "30m", "120s".
+pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    if let Some(rest) = s.strip_suffix('h') {
+        let hours: u64 = rest.parse().map_err(|e| format!("{}", e))?;
+        return Ok(std::time::Duration::from_secs(hours * 3600));
+    }
+    if let Some(rest) = s.strip_suffix('m') {
+        let mins: u64 = rest.parse().map_err(|e| format!("{}", e))?;
+        return Ok(std::time::Duration::from_secs(mins * 60));
+    }
+    if let Some(rest) = s.strip_suffix('s') {
+        let secs: u64 = rest.parse().map_err(|e| format!("{}", e))?;
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    let secs: u64 = s.parse().map_err(|e| format!("{}", e))?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 /// Helper scanning `storage` for existing `.log` files to find the highest generation number.

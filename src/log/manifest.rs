@@ -17,6 +17,9 @@ pub struct LogFileInfo {
     pub total_bytes: u64,
     /// Total uncompressed extent payload data bytes written.
     pub total_data_bytes: u64,
+    /// Authenticated MD5 digest of the completed, sealed generation log file.
+    #[serde(default)]
+    pub md5: Option<[u8; 16]>,
 }
 
 impl LogFileInfo {
@@ -28,6 +31,7 @@ impl LogFileInfo {
             record_count: 0,
             total_bytes: initial_header_size,
             total_data_bytes: 0,
+            md5: None,
         }
     }
 }
@@ -86,6 +90,13 @@ impl LogManifest {
         self.next_filename = format!("{:06}.log", self.next_generation);
     }
 
+    /// Sets the MD5 digest for a specific sealed generation.
+    pub fn set_generation_md5(&mut self, generation: u64, md5: [u8; 16]) {
+        if let Some(entry) = self.get_mut_by_generation(generation) {
+            entry.md5 = Some(md5);
+        }
+    }
+
     /// Finds a mutable reference to a log file entry by generation number.
     pub fn get_mut_by_generation(&mut self, generation: u64) -> Option<&mut LogFileInfo> {
         self.logs.iter_mut().find(|l| l.generation == generation)
@@ -95,6 +106,35 @@ impl LogManifest {
     pub fn get_by_generation(&self, generation: u64) -> Option<&LogFileInfo> {
         self.logs.iter().find(|l| l.generation == generation)
     }
+
+    /// Computes and populates MD5 for any sealed log generation whose MD5 is not yet recorded.
+    pub fn populate_sealed_md5s(&mut self, storage: &dyn crate::storage::Storage, active_gen: u64) {
+        for entry in &mut self.logs {
+            if entry.generation < active_gen
+                && entry.md5.is_none()
+                && storage.exists(&entry.filename)
+                && let Ok(digest) = compute_storage_file_md5(storage, &entry.filename)
+            {
+                entry.md5 = Some(digest);
+            }
+        }
+    }
+}
+
+/// Helper to compute MD5 digest of a stored file using streaming reads.
+pub fn compute_storage_file_md5(storage: &dyn crate::storage::Storage, name: &str) -> std::io::Result<[u8; 16]> {
+    let reader = storage.open_reader(name)?;
+    let len = reader.len()?;
+    let mut ctx = md5::Context::new();
+    let mut offset = 0;
+    let mut buf = [0u8; 64 * 1024];
+    while offset < len {
+        let chunk_len = ((len - offset) as usize).min(buf.len());
+        reader.read_exact_at(offset, &mut buf[..chunk_len])?;
+        ctx.consume(&buf[..chunk_len]);
+        offset += chunk_len as u64;
+    }
+    Ok(*ctx.compute())
 }
 
 /// Dynamically computed live extent statistics for a single log generation.

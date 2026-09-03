@@ -13,6 +13,13 @@ impl InMemoryFS {
     // --- POSIX File Handle Tracking ---
 
     pub fn open_file_handle(&self, ino: u64, flags: u32) -> u64 {
+        if self.virtual_files.is_virtual_ino(ino) {
+            let content = self.virtual_files.generate_content(ino, self).unwrap_or_default();
+            let fh = (self.allocate_fh() & !super::VIRTUAL_FH_FLAG) | super::VIRTUAL_FH_FLAG;
+            self.virtual_handles.write().unwrap().insert(fh, content.into_bytes());
+            return fh;
+        }
+
         let fh = self.allocate_fh();
         self.file_handles.write().unwrap().insert(fh, FileHandle { ino, flags });
         *self.open_counts.write().unwrap().entry(ino).or_insert(0) += 1;
@@ -20,10 +27,18 @@ impl InMemoryFS {
     }
 
     pub fn get_file_handle(&self, fh: u64) -> Option<FileHandle> {
+        if (fh & super::VIRTUAL_FH_FLAG) != 0 {
+            return None;
+        }
         self.file_handles.read().unwrap().get(&fh).copied()
     }
 
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
+        if (fh & super::VIRTUAL_FH_FLAG) != 0 {
+            self.virtual_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
+            return Ok(());
+        }
+
         let handle = self.file_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;
         if handle.ino != ino {
             return Err(libc::EBADF);
@@ -83,7 +98,15 @@ impl InMemoryFS {
     }
 
     pub fn open_dir_handle(&self, ino: u64) -> Option<u64> {
-        let entries = self.list_directory(ino)?;
+        let mut entries = self.list_directory(ino)?;
+        if ino == 1 {
+            for (name, v_ino) in self.virtual_files.list_entries() {
+                if !entries.iter().any(|(n, _)| n == &name) {
+                    entries.push((name, v_ino));
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+        }
         let fh = self.allocate_fh();
         self.dir_handles.write().unwrap().insert(fh, Arc::new(entries));
         Some(fh)

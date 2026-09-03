@@ -23,6 +23,9 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
         }
 
         let child_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
+        if fs.virtual_files.is_virtual_ino(child_ino) {
+            return Err(libc::EPERM);
+        }
         let child_attr = fs.get_attr(child_ino).ok_or(libc::ENOENT)?;
 
         if child_attr.file_type == FileType::Directory {
@@ -187,6 +190,9 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
         }
 
         let source_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
+        if fs.virtual_files.is_virtual_ino(source_ino) {
+            return Err(libc::EPERM);
+        }
         let source_attr = fs.get_attr(source_ino).ok_or(libc::ENOENT)?;
 
         if source_attr.file_type == FileType::Directory {
@@ -211,6 +217,9 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
 
         let mut dest_was_dir = false;
         if let Some(dest_ino) = fs.lookup_child(newparent, newname) {
+            if fs.virtual_files.is_virtual_ino(dest_ino) {
+                return Err(libc::EPERM);
+            }
             // POSIX: when old and new resolve to different directory entries for the same
             // file - two hardlinks to one inode - rename succeeds and does nothing. Without
             // this the destination is treated as a victim and its link count is dropped,

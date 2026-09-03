@@ -69,8 +69,13 @@ impl InMemoryFS {
         // chunking loop below never advance.
         let max_extent_size = self.max_extent_size.clamp(1, u32::MAX as usize);
 
-        if let Some(next_gen) = writer.roll_if_needed(estimate_batch_bytes(frozen, max_extent_size), &*self.clock)? {
+        if let Some((next_gen, sealed_md5)) =
+            writer.roll_if_needed(estimate_batch_bytes(frozen, max_extent_size), &*self.clock)?
+        {
             let mut manifest = self.manifest.write().unwrap();
+            if let Some(md5) = sealed_md5 {
+                manifest.set_generation_md5(next_gen - 1, md5);
+            }
             manifest.record_roll(
                 next_gen,
                 format!("{:06}.log", next_gen),
@@ -81,6 +86,7 @@ impl InMemoryFS {
 
         let batch_gen = writer.generation();
         let batch_start_offset = writer.current_offset();
+        writer.checkpoint_batch_start();
 
         let write_res = (|| -> std::io::Result<()> {
             let mut written_count = 0u32;
@@ -356,7 +362,9 @@ impl InMemoryFS {
             .as_ref()
             .map_or_else(|| self.last_tx_id.load(Ordering::SeqCst), |w| w.last_tx_id());
         let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let manifest = self.manifest.read().unwrap().clone();
+        let mut manifest = self.manifest.read().unwrap().clone();
+        manifest.populate_sealed_md5s(storage, generation);
+        *self.manifest.write().unwrap() = manifest.clone();
         let now = self.clock.now();
 
         // The header goes into the summary in plaintext while the key encrypts its body, so

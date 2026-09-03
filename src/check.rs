@@ -760,6 +760,84 @@ pub fn check_volume(
     Ok(check_fs_integrity(&fs, None, verify_data))
 }
 
+/// Verifies that objects on a remote store match the authenticated sizes and MD5 digests in the summary manifest.
+pub fn check_remote_integrity(
+    remote: &dyn crate::remote::RemoteStore,
+    remote_name: &str,
+    manifest: &crate::log::LogManifest,
+) -> IntegrityReport {
+    let mut report = IntegrityReport {
+        branch: manifest.branch.clone(),
+        ..Default::default()
+    };
+    for log_entry in &manifest.logs {
+        // Only verify sealed generations that have an authenticated MD5 ledger entry
+        let Some(expected_md5) = log_entry.md5 else {
+            continue;
+        };
+
+        match remote.head_object(&log_entry.filename) {
+            Ok(Some(remote_obj)) => {
+                if remote_obj.size != log_entry.total_bytes {
+                    report.issues.push(IntegrityIssue::error(
+                        "REMOTE_SIZE_MISMATCH",
+                        None,
+                        format!(
+                            "Remote '{}' object {} size mismatch: expected {} bytes, found {}",
+                            remote_name, log_entry.filename, log_entry.total_bytes, remote_obj.size
+                        ),
+                    ));
+                }
+                match remote_obj.etag_md5() {
+                    Some(remote_md5) => {
+                        if remote_md5 != expected_md5 {
+                            report.issues.push(IntegrityIssue::error(
+                                "REMOTE_MD5_MISMATCH",
+                                None,
+                                format!(
+                                    "Remote '{}' object {} MD5 mismatch: expected {}, got {}",
+                                    remote_name,
+                                    log_entry.filename,
+                                    hex::encode(expected_md5),
+                                    hex::encode(remote_md5)
+                                ),
+                            ));
+                        }
+                    }
+                    None => {
+                        report.issues.push(IntegrityIssue::warning(
+                            "REMOTE_ETAG_UNPARSABLE",
+                            None,
+                            format!(
+                                "Remote '{}' object {} has non-standard ETag: {:?}",
+                                remote_name, log_entry.filename, remote_obj.etag
+                            ),
+                        ));
+                    }
+                }
+            }
+            Ok(None) => {
+                report.issues.push(IntegrityIssue::error(
+                    "REMOTE_OBJECT_MISSING",
+                    None,
+                    format!("Remote '{}' is missing object {}", remote_name, log_entry.filename),
+                ));
+            }
+            Err(e) => {
+                report.issues.push(IntegrityIssue::error(
+                    "REMOTE_IO_ERROR",
+                    None,
+                    format!(
+                        "Error querying remote '{}' for {}: {}",
+                        remote_name, log_entry.filename, e
+                    ),
+                ));
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -229,15 +229,43 @@ impl InMemoryFS {
 
     /// Resolves full `FileAttr` for an inode across `live` -> `flushing` -> `base`.
     pub fn get_attr(&self, ino: u64) -> Option<FileAttr> {
+        if self.virtual_files.is_virtual_ino(ino) {
+            let size = self
+                .virtual_files
+                .generate_content(ino, self)
+                .map(|s| s.len() as u64)
+                .unwrap_or(0);
+            return Some(self.virtual_files.file_attr(ino, size, self.clock.now()));
+        }
         self.with_inode_layers(ino, |layers| layers.attr())
     }
 
     /// Resolves full `FileAttr`s for a slice of inode IDs across `live` -> `flushing` -> `base`
     /// in a single atomic snapshot pass while holding all three layer read locks concurrently.
     pub fn get_attrs_batch(&self, inos: &[u64]) -> HashMap<u64, FileAttr> {
-        self.with_layers(|live, flushing, base| {
-            let mut result = HashMap::with_capacity(inos.len());
-            for &ino in inos {
+        let mut result = HashMap::with_capacity(inos.len());
+        let mut regular_inos = Vec::with_capacity(inos.len());
+
+        for &ino in inos {
+            if self.virtual_files.is_virtual_ino(ino) {
+                let size = self
+                    .virtual_files
+                    .generate_content(ino, self)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0);
+                result.insert(ino, self.virtual_files.file_attr(ino, size, self.clock.now()));
+            } else {
+                regular_inos.push(ino);
+            }
+        }
+
+        if regular_inos.is_empty() {
+            return result;
+        }
+
+        let regular_attrs = self.with_layers(|live, flushing, base| {
+            let mut res = HashMap::with_capacity(regular_inos.len());
+            for &ino in &regular_inos {
                 let base_entry = base.get(&ino);
                 let mut deltas = Vec::with_capacity(flushing.len() + 1);
                 for batch in flushing.iter() {
@@ -254,15 +282,23 @@ impl InMemoryFS {
                     deltas,
                 };
                 if let Some(attr) = stack.attr() {
-                    result.insert(ino, attr);
+                    res.insert(ino, attr);
                 }
             }
-            result
-        })
+            res
+        });
+
+        result.extend(regular_attrs);
+        result
     }
 
     /// Looks up a child entry by `name` inside `parent` directory across layers.
     pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
+        if parent == 1
+            && let Some(ino) = self.virtual_files.get_ino_by_name(name)
+        {
+            return Some(ino);
+        }
         self.with_inode_layers(parent, |layers| layers.lookup_child(name))
     }
 

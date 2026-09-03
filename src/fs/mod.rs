@@ -14,8 +14,10 @@ mod flush;
 mod handles;
 mod layers;
 mod overlay;
+pub mod virtual_files;
 
 pub use layers::InodeLayerStack;
+pub use virtual_files::{VIRTUAL_FH_FLAG, VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
 use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
@@ -114,6 +116,14 @@ pub struct InMemoryFS {
     /// security-relevant fact with nothing checking they agree is the shape of bug this
     /// module has already paid for.
     pub volume_header: crate::crypto::VolumeHeader,
+    /// Dynamic virtual files registered in the filesystem root (`/`).
+    pub virtual_files: Arc<virtual_files::VirtualFileRegistry>,
+    /// Active open virtual file handles holding frozen point-in-time snapshot strings.
+    pub virtual_handles: RwLock<HashMap<u64, Vec<u8>>>,
+    /// Optional live RemoteRegistry instance for remote status reporting.
+    pub remote_registry: RwLock<Option<Arc<RwLock<crate::remote::RemoteRegistry>>>>,
+    /// Live telemetry counters and synchronization state across all remotes.
+    pub replication_telemetry: Arc<RwLock<crate::remote::worker::ReplicationTelemetry>>,
 }
 
 impl InMemoryFS {
@@ -160,6 +170,8 @@ impl InMemoryFS {
         let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
         let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(start_gen, "main", now)));
 
+        let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
+
         Self {
             base: RwLock::new(map),
             flushing: RwLock::new(VecDeque::new()),
@@ -193,7 +205,21 @@ impl InMemoryFS {
             dir_lock: Mutex::new(()),
             volume_key,
             volume_header: crate::crypto::VolumeHeader::plaintext(),
+            virtual_files,
+            virtual_handles: RwLock::new(HashMap::new()),
+            remote_registry: RwLock::new(None),
+            replication_telemetry: Arc::new(RwLock::new(crate::remote::worker::ReplicationTelemetry::new())),
         }
+    }
+
+    pub fn set_remote_registry(&self, registry: Arc<RwLock<crate::remote::RemoteRegistry>>) {
+        *self.remote_registry.write().unwrap() = Some(registry);
+        self.register_remote_status();
+    }
+
+    pub fn register_remote_status(&self) {
+        self.virtual_files
+            .register(".remotes", crate::remote::worker::format_remotes_status);
     }
 
     pub fn with_clock_and_storage(clock: Arc<dyn Clock>, storage: Arc<dyn Storage>) -> Self {

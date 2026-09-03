@@ -360,6 +360,9 @@ pub fn export_summary(
     let mut buffered = is_encrypted.then(Vec::new);
     let body_base = (header_bytes.len() + volume_header_bytes.len()) as u64;
 
+    let mut manifest_with_md5 = manifest.clone();
+    manifest_with_md5.populate_sealed_md5s(storage, generation);
+
     let (manifest_offset, index_offset, entry_count) = {
         let mut sink = match buffered {
             Some(ref mut buf) => BodySink::Buffered(buf),
@@ -369,7 +372,7 @@ pub fn export_summary(
                 offset: body_base,
             },
         };
-        write_summary_body(&mut sink, &inodes_snapshot, manifest)?
+        write_summary_body(&mut sink, &inodes_snapshot, &manifest_with_md5)?
     };
 
     // An encrypted body is sealed as a single AEAD message, so it can only be written once

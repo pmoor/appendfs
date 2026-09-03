@@ -57,7 +57,16 @@ pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i3
     if attr.file_type != FileType::Directory {
         return Err(libc::ENOTDIR);
     }
-    fs.list_directory(ino).ok_or(libc::ENOENT)
+    let mut entries = fs.list_directory(ino).ok_or(libc::ENOENT)?;
+    if ino == 1 {
+        for (name, v_ino) in fs.virtual_files.list_entries() {
+            if !entries.iter().any(|(n, _)| n == &name) {
+                entries.push((name, v_ino));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    Ok(entries)
 }
 
 pub struct DirItem<'a> {

@@ -12,8 +12,12 @@ struct ActiveLogFile {
     generation: u64,
     current_offset: u64,
     filename: String,
+    created_at: std::time::SystemTime,
+    md5_hasher: md5::Context,
+    batch_checkpoint_hasher: Option<md5::Context>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ActiveLogState {
     Unopened {
         generation: u64,
@@ -29,17 +33,22 @@ fn open_generation_file(
 ) -> io::Result<ActiveLogFile> {
     let filename = format!("{:06}.log", generation);
     let mut writer = storage.open_writer(&filename, WriteMode::CreateNew)?;
+    let mut md5_hasher = md5::Context::new();
 
     let file_header = FileHeader::new(generation, created_at);
     let header_bytes = file_header.to_bytes();
     writer.append(&header_bytes)?;
     writer.sync()?;
+    md5_hasher.consume(header_bytes);
 
     Ok(ActiveLogFile {
         writer,
         generation,
         current_offset: FILE_HEADER_SIZE as u64,
         filename,
+        created_at,
+        md5_hasher,
+        batch_checkpoint_hasher: None,
     })
 }
 
@@ -51,6 +60,7 @@ pub struct LogWriter {
     tx_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
+    max_log_age: Option<std::time::Duration>,
     volume_key: Arc<VolumeKey>,
     /// Compression applied to payloads before encryption. Set from the volume header via
     /// [`LogWriter::with_compression`] rather than passed to every constructor, which would
@@ -86,6 +96,7 @@ impl LogWriter {
             tx_id: AtomicU64::new(start_tx_id),
             storage,
             max_log_size,
+            max_log_age: None,
             volume_key,
             compression: crate::compress::Compression::None,
             _lock: Some(lock),
@@ -110,10 +121,17 @@ impl LogWriter {
             tx_id: AtomicU64::new(start_tx_id),
             storage,
             max_log_size,
+            max_log_age: None,
             volume_key,
             compression: crate::compress::Compression::None,
             _lock: Some(lock),
         })
+    }
+
+    /// Sets the maximum duration an active generation log can remain open before rolling.
+    pub fn with_max_log_age(mut self, max_age: Option<std::time::Duration>) -> Self {
+        self.max_log_age = max_age;
+        self
     }
 
     /// Sets the compression applied to record payloads before they are encrypted.
@@ -142,7 +160,11 @@ impl LogWriter {
     }
 
     /// Rolls to a new generation log file (or opens the initial lazy log file) if needed.
-    pub fn roll_if_needed(&self, estimated_additional_bytes: u64, clock: &dyn Clock) -> io::Result<Option<u64>> {
+    pub fn roll_if_needed(
+        &self,
+        estimated_additional_bytes: u64,
+        clock: &dyn Clock,
+    ) -> io::Result<Option<(u64, Option<[u8; 16]>)>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -155,25 +177,75 @@ impl LogWriter {
                 let active_file = open_generation_file(&self.storage, gen_num, c_time)?;
                 *state = ActiveLogState::Open(active_file);
                 log::info!("Lazily opened initial log file for generation {}", gen_num);
-                Ok(Some(gen_num))
+                Ok(Some((gen_num, None)))
             }
             ActiveLogState::Open(active) => {
-                if active.current_offset <= FILE_HEADER_SIZE as u64
-                    || active.current_offset + estimated_additional_bytes <= self.max_log_size
-                {
+                let size_exceeded = active.current_offset > FILE_HEADER_SIZE as u64
+                    && active.current_offset + estimated_additional_bytes > self.max_log_size;
+
+                let age_exceeded = if let Some(max_age) = self.max_log_age {
+                    active.current_offset > FILE_HEADER_SIZE as u64
+                        && clock.now().duration_since(active.created_at).unwrap_or_default() >= max_age
+                } else {
+                    false
+                };
+
+                if !size_exceeded && !age_exceeded {
                     return Ok(None);
                 }
 
                 active.writer.sync()?;
 
+                let sealed_md5 = active.md5_hasher.clone().compute().0;
                 let next_gen = active.generation + 1;
                 let next_active = open_generation_file(&self.storage, next_gen, clock.now())?;
 
                 log::info!("Rolled log file to generation {} ({})", next_gen, next_active.filename);
 
                 *active = next_active;
-                Ok(Some(next_gen))
+                Ok(Some((next_gen, Some(sealed_md5))))
             }
+        }
+    }
+
+    /// Forcefully rolls the active generation file to `generation + 1` if it has committed data,
+    /// returning the next generation number and the authenticated MD5 digest of the sealed generation.
+    pub fn force_roll(&self, clock: &dyn Clock) -> io::Result<Option<(u64, [u8; 16])>> {
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+
+        match &mut *state {
+            ActiveLogState::Unopened { .. } => Ok(None),
+            ActiveLogState::Open(active) => {
+                if active.current_offset <= FILE_HEADER_SIZE as u64 {
+                    return Ok(None);
+                }
+
+                active.writer.sync()?;
+                let sealed_md5 = active.md5_hasher.clone().compute().0;
+                let next_gen = active.generation + 1;
+                let next_active = open_generation_file(&self.storage, next_gen, clock.now())?;
+                log::info!(
+                    "Force-rolled log file to generation {} ({})",
+                    next_gen,
+                    next_active.filename
+                );
+                *active = next_active;
+                Ok(Some((next_gen, sealed_md5)))
+            }
+        }
+    }
+
+    /// Checkpoints the running MD5 hasher at the beginning of a flush batch for rollback safety.
+    pub fn checkpoint_batch_start(&self) {
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if let ActiveLogState::Open(active) = &mut *state {
+            active.batch_checkpoint_hasher = Some(active.md5_hasher.clone());
         }
     }
 
@@ -238,6 +310,10 @@ impl LogWriter {
             return Err(e);
         }
 
+        active.md5_hasher.consume(header_bytes);
+        if !cipher_payload.is_empty() {
+            active.md5_hasher.consume(&cipher_payload);
+        }
         active.current_offset += total_bytes as u64;
 
         Ok((tx, generation, record_log_offset))
@@ -256,6 +332,9 @@ impl LogWriter {
         {
             let _ = active.writer.truncate(offset);
             active.current_offset = offset;
+            if let Some(ref checkpoint) = active.batch_checkpoint_hasher {
+                active.md5_hasher = checkpoint.clone();
+            }
         }
         Ok(())
     }
@@ -302,6 +381,18 @@ impl LogWriter {
         match &*state {
             ActiveLogState::Unopened { generation, .. } => *generation,
             ActiveLogState::Open(active) => active.generation,
+        }
+    }
+
+    /// Returns the creation timestamp of the active log file if known.
+    pub fn created_at(&self) -> Option<std::time::SystemTime> {
+        let state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        match &*state {
+            ActiveLogState::Unopened { created_at, .. } => *created_at,
+            ActiveLogState::Open(active) => Some(active.created_at),
         }
     }
 
@@ -438,11 +529,38 @@ mod tests {
         assert!(!storage.exists("000001.log"));
 
         let opened_gen = writer.roll_if_needed(100, &clock).unwrap();
-        assert_eq!(opened_gen, Some(1));
+        assert_eq!(opened_gen, Some((1, None)));
         assert!(writer.is_open());
         assert!(storage.exists("000001.log"));
 
         let no_roll = writer.roll_if_needed(100, &clock).unwrap();
         assert_eq!(no_roll, None);
+    }
+
+    #[test]
+    fn test_on_the_fly_md5_computation_matches_disk_bytes() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 100, 1, VolumeKey::plaintext_arc()).unwrap();
+
+        writer.append_record(OpCode::Data, 1, b"first record payload").unwrap();
+        writer
+            .append_record(OpCode::InodeDelta, 1, b"second record payload")
+            .unwrap();
+        writer.emit_flush_commit(2, &clock).unwrap();
+
+        // Roll to generation 2 -> returns (next_gen, Some(sealed_md5))
+        let roll_res = writer.roll_if_needed(1000, &clock).unwrap();
+        let (next_gen, sealed_md5_opt) = roll_res.unwrap();
+        assert_eq!(next_gen, 2);
+        let sealed_md5 = sealed_md5_opt.unwrap();
+
+        // Check against MD5 computed by reading back 000001.log from disk
+        let disk_bytes = storage.get_file_bytes("000001.log").unwrap();
+        let expected_md5 = *md5::compute(&disk_bytes);
+        assert_eq!(
+            sealed_md5, expected_md5,
+            "On-the-fly computed MD5 must match raw disk bytes bit-for-bit!"
+        );
     }
 }
