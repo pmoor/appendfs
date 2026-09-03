@@ -1,0 +1,60 @@
+name: Nightly soak
+
+# The stress sweeps documented in AGENTS.md, run once a day against main rather than on
+# every pull request: they take minutes rather than seconds, and their value is in
+# accumulating seeds over time, which a per-PR run does not provide.
+#
+# A scheduled workflow always runs the copy of this file on the default branch, so this is
+# main-only by construction. workflow_dispatch is here so a sweep can be started by hand
+# after a risky change, without waiting for the next night.
+on:
+  schedule:
+    # 03:00 UTC daily. GitHub delays scheduled runs during peak load, so treat the time as
+    # approximate; nothing here depends on when it lands.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: soak
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Both sweeps share one runner. Unlike the per-PR workflow there is nothing to gain from
+  # running them in parallel - nobody is waiting on the result - so paying for the FUSE
+  # install, toolchain and cargo cache once is the better trade.
+  soak:
+    name: stress sweeps
+    runs-on: ubuntu-latest
+    # Generous, but bounded: a hung soak should not sit burning a six hour default. Covers
+    # both sweeps, which run back to back.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FUSE build and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Release, unlike the per-PR job: these sweeps are far too slow unoptimised. The
+      # sweep sizes are the ones AGENTS.md documents.
+      - name: Concurrent stress sweep
+        env:
+          FUZZ_SEEDS: 300
+          FUZZ_STEPS: 8000
+        run: cargo test --release --test concurrency_test -- --nocapture
+
+      # `always()` so a failure in the sweep above still leaves us with the result of this
+      # one. Running them as separate jobs used to give that for free; sharing a runner
+      # would otherwise mean the first failure hides whatever the second would have found,
+      # which is exactly the information a nightly exists to collect.
+      - name: Differential fuzzing and crash recovery sweep
+        if: always()
+        env:
+          FUZZ_SEEDS: 500
+          FUZZ_STEPS: 10000
+        run: cargo test --release --test fuzz_test -- --nocapture
