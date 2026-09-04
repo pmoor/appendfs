@@ -65,6 +65,11 @@ impl LogFileCache {
         guard.remove(&generation);
     }
 
+    /// Returns the number of currently open log reader storage handles cached in memory.
+    pub fn open_readers_count(&self) -> usize {
+        self.cache.lock().unwrap().len()
+    }
+
     /// Retrieves an open log reader handle, verifying the `FileHeader` on first open.
     /// If the log file was pruned locally, falls back to `TieredStorageReader` over S3 range requests.
     pub fn get_or_open(&self, generation: u64) -> io::Result<Arc<dyn StorageReader>> {

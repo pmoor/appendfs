@@ -367,7 +367,8 @@ fn verify_tree_invariants(fs: &InMemoryFS, storage: &dyn Storage, seed: u64) {
         let attr = getattr_core(fs, ino).unwrap_or_else(|e| panic!("getattr({}) failed: {}", ino, e));
         match attr.file_type {
             FileType::Directory => {
-                let entries = list_dir_core(fs, ino).unwrap_or_else(|e| panic!("list_dir({}) failed: {}", ino, e));
+                let mut entries = list_dir_core(fs, ino).unwrap_or_else(|e| panic!("list_dir({}) failed: {}", ino, e));
+                entries.retain(|(_, child_ino)| !fs.is_virtual_ino(*child_ino));
                 let mut child_subdirs = 0;
                 for (name, child_ino) in entries {
                     let child_attr = match getattr_core(fs, child_ino) {

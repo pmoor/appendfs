@@ -147,27 +147,30 @@ mod tests {
         assert!(fh1 > 0);
 
         let snap1 = fs.get_dir_handle(fh1).expect("Handle snapshot must exist");
-        assert_eq!(snap1.len(), 2);
-        assert_eq!(snap1[0].0, "alpha.txt");
-        assert_eq!(snap1[1].0, "bravo.txt");
+        assert_eq!(snap1.len(), 3);
+        assert_eq!(snap1[0].0, ".status");
+        assert_eq!(snap1[1].0, "alpha.txt");
+        assert_eq!(snap1[2].0, "bravo.txt");
 
         // 3. Mutate directory: add charlie.txt, delete alpha.txt
         crate::operations::read_write::create_core(&fs, 1, "charlie.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.remove_dir_entry(1, "alpha.txt", now);
 
-        // 4. fh1 MUST retain its original snapshot (alpha, bravo)
+        // 4. fh1 MUST retain its original snapshot (.status, alpha, bravo)
         let snap1_recheck = fs.get_dir_handle(fh1).expect("Handle snapshot must still exist");
-        assert_eq!(snap1_recheck.len(), 2);
-        assert_eq!(snap1_recheck[0].0, "alpha.txt");
-        assert_eq!(snap1_recheck[1].0, "bravo.txt");
+        assert_eq!(snap1_recheck.len(), 3);
+        assert_eq!(snap1_recheck[0].0, ".status");
+        assert_eq!(snap1_recheck[1].0, "alpha.txt");
+        assert_eq!(snap1_recheck[2].0, "bravo.txt");
 
-        // 5. A new directory handle on root gets the new snapshot (bravo, charlie)
+        // 5. A new directory handle on root gets the new snapshot (.status, bravo, charlie)
         let fh2 = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir_core must succeed on directory");
         assert_ne!(fh1, fh2);
         let snap2 = fs.get_dir_handle(fh2).expect("Second handle snapshot must exist");
-        assert_eq!(snap2.len(), 2);
-        assert_eq!(snap2[0].0, "bravo.txt");
-        assert_eq!(snap2[1].0, "charlie.txt");
+        assert_eq!(snap2.len(), 3);
+        assert_eq!(snap2[0].0, ".status");
+        assert_eq!(snap2[1].0, "bravo.txt");
+        assert_eq!(snap2[2].0, "charlie.txt");
 
         // 6. Release fh1
         assert_eq!(fs.release_dir_handle(fh1), Ok(()));

@@ -371,6 +371,18 @@ pub enum NodeDelta {
 }
 
 impl NodeDelta {
+    pub fn file_type(&self) -> FileType {
+        match self {
+            NodeDelta::Directory(_) => FileType::Directory,
+            NodeDelta::File(_) => FileType::RegularFile,
+            NodeDelta::Symlink(_) => FileType::Symlink,
+            NodeDelta::Fifo(_) => FileType::NamedPipe,
+            NodeDelta::CharDevice(_) => FileType::CharDevice,
+            NodeDelta::BlockDevice(_) => FileType::BlockDevice,
+            NodeDelta::Socket(_) => FileType::Socket,
+        }
+    }
+
     pub fn attr_delta(&self) -> &AttrDelta {
         match self {
             NodeDelta::Directory(d) => &d.attr_delta,

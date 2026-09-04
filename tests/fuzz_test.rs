@@ -435,11 +435,8 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let snap3 = fs_remount.fs.get_dir_handle(fh3).expect("remount dir handle");
                         let snap4 = fs_crash.fs.get_dir_handle(fh4).expect("crash dir handle");
                         let snap5 = fs_remote.fs.get_dir_handle(fh5).expect("remote dir handle");
-                        let snap5_filtered: Vec<(String, u64)> = snap5
-                            .iter()
-                            .filter(|(_, child_ino)| *child_ino < 0xFFFF_FFFF_0000_0000)
-                            .cloned()
-                            .collect();
+                        let snap5_filtered: Vec<(String, u64)> =
+                            snap5.iter().filter(|(name, _)| name != ".remotes").cloned().collect();
 
                         assert_eq!(&*snap1, &*snap2, "opendir snapshot mismatch (baseline vs micro)");
                         assert_eq!(&*snap1, &*snap3, "opendir snapshot mismatch (baseline vs remount)");
@@ -472,11 +469,8 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         let snap3 = fs_remount.fs.get_dir_handle(h.fh3).expect("remount handle");
                         let snap4 = fs_crash.fs.get_dir_handle(h.fh4).expect("crash handle");
                         let snap5 = fs_remote.fs.get_dir_handle(h.fh5).expect("remote handle");
-                        let snap5_filtered: Vec<(String, u64)> = snap5
-                            .iter()
-                            .filter(|(_, child_ino)| *child_ino < 0xFFFF_FFFF_0000_0000)
-                            .cloned()
-                            .collect();
+                        let snap5_filtered: Vec<(String, u64)> =
+                            snap5.iter().filter(|(name, _)| name != ".remotes").cloned().collect();
 
                         assert_eq!(&*snap1, &h.expected_snapshot, "Snapshot isolation violated in baseline");
                         assert_eq!(&*snap2, &h.expected_snapshot, "Snapshot isolation violated in micro");
@@ -1880,4 +1874,15 @@ fn test_read_all_streaming_regular_large_and_virtual() {
     let remotes_bytes = fs.read_all(remotes_ino).unwrap();
     let remotes_str = String::from_utf8(remotes_bytes).unwrap();
     assert!(remotes_str.contains("No remotes configured"));
+
+    // 5. Virtual file (.status)
+    let status_ino = fs.lookup(1, ".status").unwrap();
+    let status_bytes = fs.read_all(status_ino).unwrap();
+    let status_str = String::from_utf8(status_bytes).unwrap();
+    assert!(status_str.contains("=== appendfs Runtime Status ==="));
+    assert!(status_str.contains("[Volume]"));
+    assert!(status_str.contains("[Inodes]"));
+    assert!(status_str.contains("[Flush Layer]"));
+    assert!(status_str.contains("[Cache]"));
+    assert!(status_str.contains("[Handles & Locks]"));
 }

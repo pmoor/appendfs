@@ -18,12 +18,16 @@ fn test_fuse_filesystem() {
     let mut mount = TestMount::mount_custom(log_dir, mount_dir, appendfs::InMemoryFS::new(), false);
     let mount_path = mount.path().to_path_buf();
 
-    // Perform directory listing verification (should be empty initially)
+    // Perform directory listing verification (initially contains only virtual control files like .status)
     let entries: Vec<String> = fs::read_dir(&mount_path)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
         .collect();
-    assert!(entries.is_empty(), "Expected directory to be empty, got: {:?}", entries);
+    assert_eq!(entries, vec![".status".to_string()]);
+
+    // Verify .status virtual file is directly readable through FUSE
+    let status_str = fs::read_to_string(mount_path.join(".status")).unwrap();
+    assert!(status_str.contains("=== appendfs Runtime Status ==="));
 
     // Verify statfs / statvfs reports root inode count (1)
     let path_c = std::ffi::CString::new(mount.path_str()).unwrap();
@@ -221,16 +225,12 @@ fn test_fuse_filesystem() {
     // Cleanup hello_hard.txt
     fs::remove_file(&file_hard).unwrap();
     assert!(!file_hard.exists());
-    // Verify directory is empty again
+    // Verify directory contains only virtual control files after deletion
     let entries_after: Vec<String> = fs::read_dir(&mount_path)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
         .collect();
-    assert!(
-        entries_after.is_empty(),
-        "Expected directory to be empty after deletion, got: {:?}",
-        entries_after
-    );
+    assert_eq!(entries_after, vec![".status".to_string()]);
 
     // Verify non-UTF8 filename lookup returns ENOENT without panicking
     {

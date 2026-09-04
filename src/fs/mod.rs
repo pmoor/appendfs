@@ -184,7 +184,7 @@ impl InMemoryFS {
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
 
-        Self {
+        let fs = Self {
             base: RwLock::new(map),
             flushing: RwLock::new(VecDeque::new()),
             live: RwLock::new(HashMap::new()),
@@ -227,7 +227,9 @@ impl InMemoryFS {
             generations_since_last_summary: AtomicU64::new(0),
             last_summary_generation: AtomicU64::new(0),
             replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
-        }
+        };
+        fs.register_runtime_status();
+        fs
     }
 
     /// Attaches an active `LogWriter` to the filesystem instance, registering its active generation in the manifest.
@@ -264,6 +266,11 @@ impl InMemoryFS {
     pub fn register_remote_status(&self) {
         self.virtual_files
             .register(".remotes", crate::remote::worker::format_remotes_status);
+    }
+
+    pub fn register_runtime_status(&self) {
+        self.virtual_files
+            .register(".status", crate::stats::format_runtime_status);
     }
 
     /// Returns true if `ino` is a synthesized virtual file.

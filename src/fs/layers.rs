@@ -58,15 +58,7 @@ impl<'a> InodeLayerStack<'a> {
         if let Some(delta) = self.deltas.last() {
             return match delta {
                 EntryDelta::Tombstone => None,
-                EntryDelta::Node(d) => Some(match d {
-                    NodeDelta::Directory(_) => FileType::Directory,
-                    NodeDelta::File(_) => FileType::RegularFile,
-                    NodeDelta::Symlink(_) => FileType::Symlink,
-                    NodeDelta::Fifo(_) => FileType::NamedPipe,
-                    NodeDelta::CharDevice(_) => FileType::CharDevice,
-                    NodeDelta::BlockDevice(_) => FileType::BlockDevice,
-                    NodeDelta::Socket(_) => FileType::Socket,
-                }),
+                EntryDelta::Node(d) => Some(d.file_type()),
             };
         }
         self.base.map(|arc| arc.file_type())

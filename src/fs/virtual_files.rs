@@ -204,19 +204,20 @@ mod tests {
 
         // Snapshot directory listing via list_dir_core
         let entries = list_dir_core(&fs, 1).unwrap();
-        // Entries must contain: file1.txt, file2.txt, .remotes, .virtual1, .virtual2
-        assert_eq!(entries.len(), 5);
+        // Entries must contain: file1.txt, file2.txt, .remotes, .status, .virtual1, .virtual2
+        assert_eq!(entries.len(), 6);
         assert!(entries.iter().any(|(name, ino)| name == "file1.txt" && *ino == f1.ino));
         assert!(entries.iter().any(|(name, ino)| name == "file2.txt" && *ino == f2.ino));
         assert!(entries.iter().any(|(name, _)| name == ".remotes"));
+        assert!(entries.iter().any(|(name, _)| name == ".status"));
         assert!(entries.iter().any(|(name, ino)| name == ".virtual1" && *ino == ino_v1));
         assert!(entries.iter().any(|(name, ino)| name == ".virtual2" && *ino == ino_v2));
 
         // Test pagination through iter_dir_entries
         // Page 1: offset 0
         let items_all: Vec<_> = iter_dir_entries(&fs, 1, &entries, 0).collect();
-        // Dot (1) + DotDot (1) + 5 entries = 7 items
-        assert_eq!(items_all.len(), 7);
+        // Dot (1) + DotDot (1) + 6 entries = 8 items
+        assert_eq!(items_all.len(), 8);
         assert_eq!(items_all[0].name, ".");
         assert_eq!(items_all[0].next_offset, 1);
         assert_eq!(items_all[1].name, "..");
@@ -225,22 +226,23 @@ mod tests {
         // Verify get_attrs_batch resolves all items including virtual files!
         let inos: Vec<u64> = items_all.iter().map(|item| item.ino).collect();
         let attrs = fs.get_attrs_batch(&inos);
-        assert_eq!(attrs.len(), 6); // 1 (root) + 2 regular + 3 virtual
+        assert_eq!(attrs.len(), 7); // 1 (root) + 2 regular + 4 virtual
 
         // Page 2: simulate reading with offset = 2 (skip . and ..)
         let items_p2: Vec<_> = iter_dir_entries(&fs, 1, &entries, 2).collect();
-        assert_eq!(items_p2.len(), 5);
+        assert_eq!(items_p2.len(), 6);
         assert_eq!(items_p2[0].next_offset, 3);
-        assert_eq!(items_p2[4].next_offset, 7);
+        assert_eq!(items_p2[5].next_offset, 8);
 
         // Page 3: simulate reading with offset = 5 (middle of entries)
         let items_p3: Vec<_> = iter_dir_entries(&fs, 1, &entries, 5).collect();
-        assert_eq!(items_p3.len(), 2);
+        assert_eq!(items_p3.len(), 3);
         assert_eq!(items_p3[0].name, items_all[5].name);
         assert_eq!(items_p3[1].name, items_all[6].name);
+        assert_eq!(items_p3[2].name, items_all[7].name);
 
-        // Page 4: simulate end of directory offset = 7
-        let items_end: Vec<_> = iter_dir_entries(&fs, 1, &entries, 7).collect();
+        // Page 4: simulate end of directory offset = 8
+        let items_end: Vec<_> = iter_dir_entries(&fs, 1, &entries, 8).collect();
         assert_eq!(items_end.len(), 0);
     }
 
@@ -303,6 +305,12 @@ mod tests {
             crate::operations::xattr::listxattr_core(&fs, v_ino, 0),
             Ok(crate::operations::xattr::ListxattrResult::Size(0))
         );
+
+        // 9. Status virtual file has identical mutation protections
+        let status_ino = fs.virtual_files.get_ino_by_name(".status").unwrap();
+        assert_eq!(write_core(&fs, status_ino, b"mutate", 0), Err(libc::EPERM));
+        assert_eq!(unlink_core(&fs, 1, ".status"), Err(libc::EPERM));
+        assert_eq!(rename_core(&fs, 1, ".status", 1, "renamed.txt"), Err(libc::EPERM));
     }
 
     #[test]

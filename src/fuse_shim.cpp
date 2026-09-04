@@ -658,6 +658,9 @@ int shim_reply_buf(shim_req_t req, const char *buf, size_t size) {
 int shim_reply_open(shim_req_t req, uint64_t fh) {
   struct fuse_file_info fi = {};
   fi.fh = fh;
+  if ((fh & (1ULL << 63)) != 0) {
+    fi.direct_io = 1;
+  }
   return fuse_reply_open(static_cast<fuse_req_t>(req), &fi);
 }
 

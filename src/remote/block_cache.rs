@@ -264,6 +264,10 @@ pub trait BlockCache: Send + Sync + std::fmt::Debug {
     fn prune_if_needed(&self) -> io::Result<()>;
     /// Reference to the single-flight request coalescer associated with this block cache.
     fn coalescer(&self) -> &Arc<super::RemoteReadCoalescer>;
+    /// Returns a short human-readable summary of this block cache implementation and its limits.
+    fn summary(&self) -> String {
+        format!("{:?}", self)
+    }
 }
 
 impl BlockCache for OnDiskBlockCache {
@@ -281,6 +285,14 @@ impl BlockCache for OnDiskBlockCache {
 
     fn coalescer(&self) -> &Arc<super::RemoteReadCoalescer> {
         self.coalescer()
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "On-Disk (limit: {}, dir: {})",
+            crate::stats::format_bytes(self.max_bytes),
+            self.cache_dir.display()
+        )
     }
 }
 
@@ -365,6 +377,13 @@ impl BlockCache for MemoryBlockCache {
 
     fn coalescer(&self) -> &Arc<super::RemoteReadCoalescer> {
         &self.coalescer
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "In-Memory (limit: {})",
+            crate::stats::format_bytes(self.max_bytes as u64)
+        )
     }
 }
 
