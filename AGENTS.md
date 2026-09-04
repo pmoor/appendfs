@@ -29,10 +29,38 @@ All code contributions follow a standard fork-and-pull-request workflow:
    - Open the PR targeting `main` and assign to `pmoor` (e.g. `gh pr create --repo pmoor/appendfs --base main --assignee pmoor ...`).
    - Include a concise summary of changes, rationale, and verification commands executed.
 4. **Wait for review & address feedback**:
-   - Inspect review feedback and inline comments (`gh api repos/pmoor/appendfs/pulls/<pr>/comments`).
+   - Query active review threads and resolution status via GraphQL:
+     ```bash
+     gh api graphql -f query='
+       query {
+         repository(owner: "pmoor", name: "appendfs") {
+           pullRequest(number: <pr>) {
+             reviewThreads(first: 50) {
+               nodes {
+                 id
+                 isResolved
+                 viewerCanResolve
+                 comments(first: 10) { nodes { id body } }
+               }
+             }
+           }
+         }
+       }
+     '
+     ```
    - Devise a concrete action plan, implement the requested adjustments on the feature branch, and verify (`cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`).
    - Push updated commits to `origin` (or amend and force-push with `git push origin <branch> --force-with-lease`).
-   - Respond to comment threads explaining the resolution. Feel free to resolve comment threads once they are fully addressed.
+   - Respond to comment threads explaining the resolution (`gh api repos/pmoor/appendfs/pulls/<pr>/comments -X POST -F in_reply_to=<comment-id> -f body="..."`).
+   - Resolve comment threads via GraphQL once fully addressed and verified:
+     ```bash
+     gh api graphql -f query='
+       mutation {
+         resolveReviewThread(input: {threadId: "<thread-id>"}) {
+           thread { isResolved }
+         }
+       }
+     '
+     ```
 5. **Repeat until all unresolved comments are resolved**.
 6. **Wait for PR to be approved and merged** into `upstream/main`.
 7. **Clean up local and remote feature branches**:
