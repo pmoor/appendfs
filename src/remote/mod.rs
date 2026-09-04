@@ -11,6 +11,7 @@ pub mod fs;
 pub mod latency;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
+pub mod recovery;
 pub mod s3;
 pub mod sigv4;
 pub mod tiered_reader;
@@ -33,6 +34,7 @@ pub use fs::LocalDirRemoteStore;
 pub use latency::LatencyRemoteStore;
 #[cfg(any(test, feature = "testing"))]
 pub use mock::MockRemoteStore;
+pub use recovery::prepare_remote_recovery_for_target;
 pub use s3::S3RemoteStore;
 pub use sigv4::SigV4Signer;
 pub use tiered_reader::TieredStorageReader;

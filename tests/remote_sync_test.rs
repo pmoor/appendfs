@@ -1,6 +1,6 @@
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
-use appendfs::log::{LogFileCache, LogWriter, init_volume};
+use appendfs::log::{LogFileCache, LogWriter, init_volume, init_volume_with_clock};
 use appendfs::operations::read_write::{create_core, read_core, write_core};
 use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, upload_storage_file};
@@ -1343,4 +1343,234 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     );
     // Verify it exists in the remote store
     assert!(nfs_dir.path().join("000001.log").exists());
+}
+
+#[test]
+fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(OsStorage::new(dir.path()));
+    let start_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let clock = Arc::new(appendfs::clock::AdvancingClock::new(start_time));
+    let volume_key = VolumeKey::plaintext_arc();
+
+    // 1. Initialize volume with deterministic clock
+    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
+
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_log_dir(dir.path());
+
+    // Write file A in generation 1
+    let file_a = create_core(&fs, 1, "file_a.txt", 0o644, 0, 1000, 1000).unwrap();
+    let payload_a = b"Generation 1: Data for file A that will be pruned locally";
+    write_core(&fs, file_a.ino, payload_a, 0).unwrap();
+    fs.sync_log().unwrap();
+
+    // Roll to generation 2 (sealing gen 1)
+    clock.advance(std::time::Duration::from_secs(60));
+    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(next_gen, 2);
+    {
+        let mut manifest = fs.manifest.write().unwrap();
+        manifest.set_generation_md5(next_gen - 1, sealed_md5);
+        manifest.record_roll(next_gen, clock.now(), 24);
+    }
+    let summary1 = fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(summary1, "000002.summary");
+
+    // Timestamp after generation 1 roll and summary1 export, but before file B write
+    let post_gen1_time = clock.now() + std::time::Duration::from_secs(10);
+
+    // Write file B in generation 2
+    clock.advance(std::time::Duration::from_secs(60));
+    let file_b = create_core(&fs, 1, "file_b.txt", 0o644, 0, 1000, 1000).unwrap();
+    let payload_b = b"Generation 2: Data for file B";
+    write_core(&fs, file_b.ino, payload_b, 0).unwrap();
+    fs.sync_log().unwrap();
+
+    // Roll to generation 3 (sealing gen 2) and export summary 2
+    clock.advance(std::time::Duration::from_secs(60));
+    let (next_gen3, sealed_md5_2) = writer.force_roll(&*clock).unwrap().unwrap();
+    assert_eq!(next_gen3, 3);
+    {
+        let mut manifest = fs.manifest.write().unwrap();
+        manifest.set_generation_md5(next_gen3 - 1, sealed_md5_2);
+        manifest.record_roll(next_gen3, clock.now(), 24);
+    }
+    let summary2 = fs.export_summary(storage.as_ref()).unwrap();
+    assert_eq!(summary2, "000003.summary");
+
+    // 2. Setup mock remote store and upload all files from local storage to remote
+    let mock_remote = Arc::new(MockRemoteStore::new());
+    for file in storage.list_files().unwrap() {
+        upload_storage_file(storage.as_ref(), mock_remote.as_ref(), &file, None).unwrap();
+    }
+
+    // Configure remote registry in local directory
+    let mut registry = RemoteRegistry::new();
+    let remote_cfg = RemoteTargetConfig::new("mock-s3");
+    registry.add_remote("s3", remote_cfg);
+    registry.set_store_override("s3", mock_remote.clone());
+    registry.save_to_dir(dir.path()).unwrap();
+    let remote_stores = registry.build_read_stores();
+
+    // 3. SIMULATE LOCAL PURGING: delete all but 000003.summary
+    fs::remove_file(dir.path().join("000000.summary")).unwrap();
+    fs::remove_file(dir.path().join("000002.summary")).unwrap();
+    fs::remove_file(dir.path().join("000001.log")).unwrap();
+    fs::remove_file(dir.path().join("000002.log")).unwrap();
+
+    assert!(!dir.path().join("000000.summary").exists());
+    assert!(!dir.path().join("000002.summary").exists());
+    assert!(!dir.path().join("000001.log").exists());
+    assert!(!dir.path().join("000002.log").exists());
+    assert!(dir.path().join("000003.summary").exists());
+
+    // =========================================================================
+    // Scenario 1: Mount R/O with Latest state
+    // =========================================================================
+    // prepare_remote_recovery_for_target sees 000003.summary exists and is eligible for Latest
+    let chosen = appendfs::prepare_remote_recovery_for_target(
+        storage.as_ref(),
+        appendfs::RecoveryTarget::Latest,
+        volume_key.clone(),
+        &remote_stores,
+    )
+    .unwrap();
+    assert_eq!(chosen, Some("000003.summary".to_string()));
+
+    // Fast-recover from 000003.summary
+    let mut fs_latest = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    fs_latest.set_log_dir(dir.path());
+    fs_latest.set_read_only(true);
+
+    // Attach remote tiered storage support
+    let cache_dir = dir.path().join(".cache");
+    let block_cache = Arc::new(OnDiskBlockCache::new(&cache_dir, 50 * 1024 * 1024).unwrap());
+    let log_cache = Arc::new(LogFileCache::with_remote_support(
+        storage.clone(),
+        Some(block_cache.clone()),
+        remote_stores.clone(),
+        Some(Arc::clone(&fs_latest.manifest)),
+    ));
+    fs_latest.log_cache = Some(log_cache);
+
+    // Verify both files exist in metadata
+    assert!(fs_latest.lookup_child(1, "file_a.txt").is_some());
+    assert!(fs_latest.lookup_child(1, "file_b.txt").is_some());
+
+    // Read file_a (written in gen 1, which was purged locally!):
+    // Should fetch from mock_remote via TieredStorageReader and return exact payload
+    let read_a = read_core(&fs_latest, file_a.ino, payload_a.len(), 0).unwrap();
+    assert_eq!(read_a, payload_a);
+
+    // Read file_b (written in gen 2, also purged locally!):
+    let read_b = read_core(&fs_latest, file_b.ino, payload_b.len(), 0).unwrap();
+    assert_eq!(read_b, payload_b);
+
+    // =========================================================================
+    // Scenario 2: Mount R/O with past timestamp target (generation 1)
+    // =========================================================================
+    // 000002.summary is STILL missing locally
+    assert!(!dir.path().join("000002.summary").exists());
+
+    // prepare_remote_recovery_for_target uses 000003.summary's manifest to discover
+    // that generation 2 (which sealed gen 1) is the appropriate snapshot for post_gen1_time,
+    // and downloads 000002.summary from the remote store!
+    let chosen_past = appendfs::prepare_remote_recovery_for_target(
+        storage.as_ref(),
+        appendfs::RecoveryTarget::Timestamp(post_gen1_time),
+        volume_key.clone(),
+        &remote_stores,
+    )
+    .unwrap();
+    assert_eq!(chosen_past, Some("000002.summary".to_string()));
+
+    // Verify 000002.summary was indeed downloaded from remote to local disk!
+    assert!(dir.path().join("000002.summary").exists());
+
+    // Fast-recover with Timestamp(post_gen1_time)
+    let mut fs_past = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Timestamp(post_gen1_time),
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    fs_past.set_log_dir(dir.path());
+    fs_past.set_read_only(true);
+
+    let log_cache_past = Arc::new(LogFileCache::with_remote_support(
+        storage.clone(),
+        Some(block_cache.clone()),
+        remote_stores.clone(),
+        Some(Arc::clone(&fs_past.manifest)),
+    ));
+    fs_past.log_cache = Some(log_cache_past);
+
+    // In generation 1, file_a exists, but file_b does NOT exist yet!
+    assert!(
+        fs_past.lookup_child(1, "file_a.txt").is_some(),
+        "file_a must exist at gen 1 timestamp"
+    );
+    assert!(
+        fs_past.lookup_child(1, "file_b.txt").is_none(),
+        "file_b must NOT exist at gen 1 timestamp"
+    );
+
+    // Reading file_a from the historical past mount fetches from remote and succeeds!
+    let read_past_a = read_core(&fs_past, file_a.ino, payload_a.len(), 0).unwrap();
+    assert_eq!(read_past_a, payload_a);
+
+    // =========================================================================
+    // Scenario 3: Mount R/O with target generation 2
+    // =========================================================================
+    // Delete 000002.summary again
+    fs::remove_file(dir.path().join("000002.summary")).unwrap();
+    assert!(!dir.path().join("000002.summary").exists());
+
+    let chosen_gen2 = appendfs::prepare_remote_recovery_for_target(
+        storage.as_ref(),
+        appendfs::RecoveryTarget::Generation(2),
+        volume_key.clone(),
+        &remote_stores,
+    )
+    .unwrap();
+    assert_eq!(chosen_gen2, Some("000002.summary".to_string()));
+    assert!(dir.path().join("000002.summary").exists());
+
+    let mut fs_gen2 = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Generation(2),
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+    fs_gen2.set_log_dir(dir.path());
+    fs_gen2.set_read_only(true);
+    let log_cache_gen2 = Arc::new(LogFileCache::with_remote_support(
+        storage.clone(),
+        Some(block_cache),
+        remote_stores,
+        Some(Arc::clone(&fs_gen2.manifest)),
+    ));
+    fs_gen2.log_cache = Some(log_cache_gen2);
+
+    assert!(fs_gen2.lookup_child(1, "file_a.txt").is_some());
+    assert!(fs_gen2.lookup_child(1, "file_b.txt").is_none());
+    let read_gen2_a = read_core(&fs_gen2, file_a.ino, payload_a.len(), 0).unwrap();
+    assert_eq!(read_gen2_a, payload_a);
 }

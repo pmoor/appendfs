@@ -352,6 +352,8 @@ fn main() {
             fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
 
             let registry = load_remote_registry(storage.as_ref());
+            let remote_stores = registry.build_read_stores();
+
             let cache_dir = log_dir.join(".cache");
             let block_cache = Arc::new(
                 appendfs::remote::OnDiskBlockCache::new(
@@ -360,7 +362,6 @@ fn main() {
                 )
                 .unwrap(),
             );
-            let remote_stores = registry.build_read_stores();
 
             let log_cache = Arc::new(appendfs::log::LogFileCache::with_remote_support(
                 storage.clone(),
@@ -446,6 +447,18 @@ fn main() {
                 log_dir.display()
             );
             let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
+            let registry = load_remote_registry(storage.as_ref());
+            let remote_stores = registry.build_read_stores();
+
+            if let Err(e) = appendfs::prepare_remote_recovery_for_target(
+                storage.as_ref(),
+                target,
+                volume_key.clone(),
+                &remote_stores,
+            ) {
+                log::warn!("Remote recovery preparation warning: {}", e);
+            }
+
             let mut fs_instance = match recover_fs(storage.clone(), target, Arc::new(SystemClock), volume_key) {
                 Ok(fs) => fs,
                 Err(e) => {
@@ -455,12 +468,26 @@ fn main() {
             };
             fs_instance.set_log_dir(log_dir);
             fs_instance.set_read_only(true);
-            if fs_instance.log_cache.is_none() {
-                fs_instance.set_storage(storage.clone());
-            }
-            if let Some(ref lc) = fs_instance.log_cache {
-                lc.set_decrypted_cache_size(args.decrypted_cache_size);
-            }
+
+            let cache_dir = log_dir.join(".cache");
+            let block_cache = Arc::new(
+                appendfs::remote::OnDiskBlockCache::new(
+                    &cache_dir,
+                    registry.policy.local_cache_max_gb * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
+            let log_cache = Arc::new(appendfs::log::LogFileCache::with_remote_support(
+                storage.clone(),
+                Some(block_cache),
+                remote_stores,
+                Some(Arc::clone(&fs_instance.manifest)),
+            ));
+            log_cache.set_decrypted_cache_size(args.decrypted_cache_size);
+            fs_instance.log_cache = Some(log_cache);
+
+            let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+            fs_instance.set_remote_registry(Arc::clone(&registry_arc));
 
             let effective_tx_id = fs_instance.last_tx_id.load(Ordering::SeqCst);
             let effective_gen = {
