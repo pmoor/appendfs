@@ -5,8 +5,8 @@ use appendfs::operations::read_write::{create_core, read_core, write_core};
 use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, upload_storage_file};
 use appendfs::remote::{
-    CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, LocalDirRemoteStore, MockRemoteStore,
-    OnDiskBlockCache, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
+    BlockCache, CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, LocalDirRemoteStore, MemoryBlockCache,
+    MockRemoteStore, OnDiskBlockCache, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
 };
 use appendfs::storage::OsStorage;
 use appendfs::{Clock, Storage};
@@ -14,30 +14,6 @@ use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tempfile::TempDir;
-
-#[test]
-fn test_mock_remote_store_streaming_and_bad_digest() {
-    let remote = MockRemoteStore::new();
-    let data = b"AppendFS high performance streaming log replication";
-    let real_md5: [u8; 16] = *md5::compute(data);
-
-    // Upload with valid MD5
-    remote
-        .put_object("000001.log", &mut &data[..], data.len() as u64, Some(&real_md5))
-        .unwrap();
-
-    let obj = remote.head_object("000001.log").unwrap().unwrap();
-    assert_eq!(obj.size, data.len() as u64);
-    assert_eq!(obj.etag_md5(), Some(real_md5));
-
-    // Upload with corrupted MD5 fails with BadDigest
-    let fake_md5 = [0xFF; 16];
-    let err = remote
-        .put_object("000002.log", &mut &data[..], data.len() as u64, Some(&fake_md5))
-        .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("BadDigest"));
-}
 
 #[test]
 fn test_remote_replication_and_authenticated_md5_ledger() {
@@ -232,8 +208,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
 
 #[test]
 fn test_disaster_recovery_bootstrap_from_remote() {
-    let src_dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(src_dir.path()));
+    let storage = Arc::new(appendfs::storage::MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -247,7 +222,6 @@ fn test_disaster_recovery_bootstrap_from_remote() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(src_dir.path());
 
     let file_attr = create_core(&fs, 1, "important.txt", 0o644, 0, 1000, 1000).unwrap();
     let ino = file_attr.ino;
@@ -261,28 +235,21 @@ fn test_disaster_recovery_bootstrap_from_remote() {
     upload_storage_file(storage.as_ref(), remote.as_ref(), &summary_file, None).unwrap();
     upload_storage_file(storage.as_ref(), remote.as_ref(), "000001.log", None).unwrap();
 
-    // Now, create a completely fresh, empty destination directory (simulating a fresh machine)
-    let fresh_dir = TempDir::new().unwrap();
-    let fresh_storage = Arc::new(OsStorage::new(fresh_dir.path()));
+    // Now, create a completely fresh, empty in-memory destination storage (simulating a fresh machine)
+    let fresh_storage = Arc::new(appendfs::storage::MemoryStorage::new());
 
     let mut remote_cfg = RemoteTargetConfig::new("backup-bucket");
     remote_cfg.region = "us-east-1".to_string();
 
     // Bootstrap from remote!
-    let recovered_summary = bootstrap_from_remote(
-        remote.as_ref(),
-        fresh_storage.as_ref(),
-        fresh_dir.path(),
-        "origin",
-        remote_cfg,
-    )
-    .unwrap();
+    let recovered_summary =
+        bootstrap_from_remote(remote.as_ref(), fresh_storage.as_ref(), "origin", remote_cfg).unwrap();
 
     assert_eq!(recovered_summary, summary_file);
-    assert!(fresh_dir.path().join(&summary_file).exists());
-    assert!(fresh_dir.path().join("remotes.toml").exists());
+    assert!(fresh_storage.exists(&summary_file));
+    assert!(fresh_storage.exists("remotes.toml"));
 
-    // Recover volume in the fresh directory
+    // Recover volume in the fresh storage
     let fresh_fs = appendfs::recover_fs(fresh_storage, appendfs::RecoveryTarget::Latest, clock, volume_key).unwrap();
     let base = fresh_fs.base.read().unwrap();
     assert!(base.len() >= 2); // root + important.txt
@@ -584,8 +551,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
 
     // 5. Setup tiered reader attached to LogFileCache
     let mut fs = Arc::try_unwrap(fs_arc).ok().unwrap();
-    let cache_dir = dir.path().join(".cache");
-    let block_cache = Arc::new(OnDiskBlockCache::new(&cache_dir, 50 * 1024 * 1024).unwrap());
+    let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
     let remotes = vec![("nas".to_string(), nas_store.clone() as Arc<dyn RemoteStore>)];
     let log_cache = Arc::new(LogFileCache::with_remote_support(
         storage.clone(),
@@ -597,17 +563,17 @@ fn test_nfs_local_volume_replication_and_pruning() {
 
     // Read back nfs_file.txt from the filesystem:
     // Local 000001.log is GONE, so TieredStorageReader should fetch 1MB aligned block from NFS remote,
-    // cache it in .cache/, and return exact bytes!
+    // cache it in block cache, and return exact bytes!
     let read_back = read_core(&fs, file_ino, payload.len(), 0).unwrap();
     assert_eq!(
         read_back, payload,
         "Sparse NFS remote extent read matched original payload bit-for-bit!"
     );
 
-    // Verify on-disk block cache populated
+    // Verify block cache populated
     assert!(
         block_cache.read_block(1, 0).unwrap().is_some(),
-        "Block 0 must now be cached on disk"
+        "Block 0 must now be cached"
     );
 }
 

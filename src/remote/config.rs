@@ -1,6 +1,7 @@
 use crate::remote::RemoteStore;
 use crate::remote::s3::S3RemoteStore;
 use crate::remote::sigv4::SigV4Signer;
+use crate::storage::{Storage, WriteMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -253,21 +254,36 @@ impl RemoteRegistry {
         Self::default()
     }
 
-    /// Loads configuration from `<log_dir>/remotes.toml`, or returns default if absent.
-    pub fn load_from_dir(log_dir: &Path) -> io::Result<Self> {
-        let config_path = log_dir.join(DEFAULT_REMOTES_FILENAME);
-        if !config_path.exists() {
+    /// Loads configuration from `remotes.toml` in the given `Storage`, or returns default if absent.
+    pub fn load_from_storage(storage: &dyn Storage) -> io::Result<Self> {
+        if !storage.exists(DEFAULT_REMOTES_FILENAME) {
             return Ok(Self::default());
         }
-        let content = fs::read_to_string(&config_path)?;
+        let reader = storage.open_reader(DEFAULT_REMOTES_FILENAME)?;
+        let len = reader.len()?;
+        let bytes = reader.read_vec(0, len as usize)?;
+        let content = String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         toml::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Persists configuration to `remotes.toml` in the given `Storage`.
+    pub fn save_to_storage(&self, storage: &dyn Storage) -> io::Result<()> {
+        let content = toml::to_string_pretty(self).map_err(io::Error::other)?;
+        let mut writer = storage.open_writer(DEFAULT_REMOTES_FILENAME, WriteMode::Overwrite)?;
+        writer.append(content.as_bytes())?;
+        writer.sync()
+    }
+
+    /// Loads configuration from `<log_dir>/remotes.toml`, or returns default if absent.
+    pub fn load_from_dir(log_dir: &Path) -> io::Result<Self> {
+        let storage = crate::storage::OsStorage::new(log_dir);
+        Self::load_from_storage(&storage)
     }
 
     /// Persists configuration to `<log_dir>/remotes.toml`.
     pub fn save_to_dir(&self, log_dir: &Path) -> io::Result<()> {
-        let config_path = log_dir.join(DEFAULT_REMOTES_FILENAME);
-        let content = toml::to_string_pretty(self).map_err(io::Error::other)?;
-        fs::write(config_path, content)
+        let storage = crate::storage::OsStorage::new(log_dir);
+        self.save_to_storage(&storage)
     }
 
     pub fn add_remote(&mut self, name: impl Into<String>, config: RemoteTargetConfig) {

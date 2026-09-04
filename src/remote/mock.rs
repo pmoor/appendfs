@@ -17,8 +17,6 @@ pub struct MockRemoteStore {
     objects: RwLock<BTreeMap<String, StoredObject>>,
 }
 
-pub type MemoryRemoteStore = MockRemoteStore;
-
 impl MockRemoteStore {
     pub fn new() -> Self {
         Self::default()
@@ -188,5 +186,29 @@ mod tests {
         // Delete
         store.delete_object("logs/000001.log").unwrap();
         assert_eq!(store.head_object("logs/000001.log").unwrap(), None);
+    }
+
+    #[test]
+    fn test_mock_remote_store_streaming_and_bad_digest() {
+        let remote = MockRemoteStore::new();
+        let data = b"AppendFS high performance streaming log replication";
+        let real_md5: [u8; 16] = *md5::compute(data);
+
+        // Upload with valid MD5
+        remote
+            .put_object("000001.log", &mut &data[..], data.len() as u64, Some(&real_md5))
+            .unwrap();
+
+        let obj = remote.head_object("000001.log").unwrap().unwrap();
+        assert_eq!(obj.size, data.len() as u64);
+        assert_eq!(obj.etag_md5(), Some(real_md5));
+
+        // Upload with corrupted MD5 fails with BadDigest
+        let fake_md5 = [0xFF; 16];
+        let err = remote
+            .put_object("000002.log", &mut &data[..], data.len() as u64, Some(&fake_md5))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("BadDigest"));
     }
 }

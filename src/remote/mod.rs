@@ -32,7 +32,7 @@ pub use fs::LocalDirRemoteStore;
 #[cfg(any(test, feature = "testing"))]
 pub use latency::LatencyRemoteStore;
 #[cfg(any(test, feature = "testing"))]
-pub use mock::{MemoryRemoteStore, MockRemoteStore};
+pub use mock::MockRemoteStore;
 pub use s3::S3RemoteStore;
 pub use sigv4::SigV4Signer;
 pub use tiered_reader::TieredStorageReader;

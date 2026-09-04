@@ -3,7 +3,6 @@ use crate::remote::RemoteStore;
 use crate::remote::config::{RemoteRegistry, RemoteTargetConfig};
 use crate::storage::{Storage, WriteMode};
 use std::io::{self, Write};
-use std::path::Path;
 
 /// Bootstraps a local volume directory from an existing remote object store (`appendfs init --from-remote`).
 ///
@@ -13,7 +12,6 @@ use std::path::Path;
 pub fn bootstrap_from_remote(
     remote: &dyn RemoteStore,
     storage: &dyn Storage,
-    log_dir: &Path,
     remote_name: &str,
     remote_cfg: RemoteTargetConfig,
 ) -> io::Result<String> {
@@ -115,10 +113,10 @@ pub fn bootstrap_from_remote(
         log_writer.sync()?;
     }
 
-    // 5. Save remote configuration to remotes.toml in log_dir
-    let mut registry = RemoteRegistry::load_from_dir(log_dir)?;
+    // 5. Save remote configuration to remotes.toml in storage
+    let mut registry = RemoteRegistry::load_from_storage(storage)?;
     registry.add_remote(remote_name, remote_cfg);
-    registry.save_to_dir(log_dir)?;
+    registry.save_to_storage(storage)?;
 
     Ok(local_summary_name)
 }

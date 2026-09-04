@@ -1,7 +1,7 @@
 use crate::fs::{InMemoryFS, find_parent_inode};
 use crate::node::{AttrDelta, DirectoryDelta, NodeDelta};
 use crate::shim::{self, FileAttr, FileType, Request};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub fn lookup(fs: &InMemoryFS, req: Request, parent: u64, name: &str) {
     log::trace!("lookup(parent={}, name={})", parent, name);
@@ -59,12 +59,11 @@ pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i3
     }
     let mut entries = fs.list_directory(ino).ok_or(libc::ENOENT)?;
     if ino == 1 {
+        let mut map: BTreeMap<String, u64> = entries.into_iter().collect();
         for (name, v_ino) in fs.virtual_files.list_entries() {
-            if !entries.iter().any(|(n, _)| n == &name) {
-                entries.push((name, v_ino));
-            }
+            map.entry(name).or_insert(v_ino);
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries = map.into_iter().collect();
     }
     Ok(entries)
 }

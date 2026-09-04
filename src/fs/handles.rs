@@ -98,15 +98,7 @@ impl InMemoryFS {
     }
 
     pub fn open_dir_handle(&self, ino: u64) -> Option<u64> {
-        let mut entries = self.list_directory(ino)?;
-        if ino == 1 {
-            for (name, v_ino) in self.virtual_files.list_entries() {
-                if !entries.iter().any(|(n, _)| n == &name) {
-                    entries.push((name, v_ino));
-                }
-            }
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-        }
+        let entries = crate::operations::dir::list_dir_core(self, ino).ok()?;
         let fh = self.allocate_fh();
         self.dir_handles.write().unwrap().insert(fh, Arc::new(entries));
         Some(fh)

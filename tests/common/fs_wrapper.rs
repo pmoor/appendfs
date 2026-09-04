@@ -75,7 +75,7 @@ pub struct TestFS {
     pub _temp_dir: Option<Arc<tempfile::TempDir>>,
     pub remotes: Vec<Arc<appendfs::FailingRemoteStore>>,
     pub latency_remotes: Vec<Arc<appendfs::LatencyRemoteStore>>,
-    pub memory_remotes: Vec<Arc<appendfs::MemoryRemoteStore>>,
+    pub memory_remotes: Vec<Arc<appendfs::MockRemoteStore>>,
     pub remote_registry: Option<Arc<RwLock<appendfs::RemoteRegistry>>>,
     pub block_cache: Option<Arc<dyn appendfs::BlockCache>>,
 }
@@ -194,7 +194,7 @@ impl TestFS {
 
         for i in 0..num_remotes {
             let name = format!("remote{}", i);
-            let mem = Arc::new(appendfs::MemoryRemoteStore::new());
+            let mem = Arc::new(appendfs::MockRemoteStore::new());
             let lat = Arc::new(appendfs::LatencyRemoteStore::new(mem.clone()));
             let failing = Arc::new(appendfs::FailingRemoteStore::new(lat.clone()));
 

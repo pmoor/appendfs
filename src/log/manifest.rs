@@ -18,6 +18,10 @@ pub struct LogFileInfo {
     /// Total uncompressed extent payload data bytes written.
     pub total_data_bytes: u64,
     /// Authenticated MD5 digest of the completed, sealed generation log file.
+    ///
+    /// This is `None` while the log file is actively receiving appends (the active generation),
+    /// because checksums and physical size continuously evolve with each write. Once the generation
+    /// is sealed (via log roll or size threshold), its final MD5 digest is computed and populated here.
     #[serde(default)]
     pub md5: Option<[u8; 16]>,
 }

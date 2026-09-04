@@ -30,6 +30,8 @@ pub fn read_core(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Result<
     if offset < 0 {
         return Err(libc::EINVAL);
     }
+    // TODO: Move virtual file test reading into test wrapper harness (e.g. open FD, read FD, close FD).
+    // Production code always has a file handle (fh) and should not need dynamic generation in read_core.
     if fs.virtual_files.is_virtual_ino(ino) {
         if let Some(content) = fs.virtual_files.generate_content(ino, fs) {
             let bytes = content.into_bytes();

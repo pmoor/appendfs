@@ -30,15 +30,13 @@ fn latest_summary_file(storage: &OsStorage) -> std::io::Result<Option<String>> {
     Ok(latest.map(|(_, f)| f))
 }
 
-fn load_remote_registry(log_dir: &Path) -> appendfs::remote::RemoteRegistry {
-    match appendfs::remote::RemoteRegistry::load_from_dir(log_dir) {
+fn load_remote_registry(storage: &dyn Storage) -> appendfs::remote::RemoteRegistry {
+    match appendfs::remote::RemoteRegistry::load_from_storage(storage) {
         Ok(reg) => reg,
         Err(e) => {
             eprintln!(
                 "Error loading '{}': {}",
-                log_dir
-                    .join(appendfs::remote::config::DEFAULT_REMOTES_FILENAME)
-                    .display(),
+                appendfs::remote::config::DEFAULT_REMOTES_FILENAME,
                 e
             );
             std::process::exit(1);
@@ -175,7 +173,7 @@ fn main() {
                 );
                 std::fs::create_dir_all(&args.log_dir).unwrap_or_default();
                 let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
-                let registry = load_remote_registry(&args.log_dir);
+                let registry = load_remote_registry(storage.as_ref());
 
                 let remote_cfg = if let Some(cfg) = registry.get_remote(remote_name) {
                     cfg.clone()
@@ -189,6 +187,8 @@ fn main() {
                     cfg.region = args.remote_region.clone();
                     cfg.prefix = args.remote_prefix.clone();
                     cfg.read_only = args.remote_read_only;
+                    cfg.access_key_id = args.remote_access_key_id.clone();
+                    cfg.secret_access_key = args.remote_secret_access_key.clone();
                     cfg
                 } else {
                     eprintln!(
@@ -199,13 +199,8 @@ fn main() {
                 };
 
                 let store = remote_cfg.build_store();
-                match appendfs::remote::bootstrap_from_remote(
-                    store.as_ref(),
-                    storage.as_ref(),
-                    &args.log_dir,
-                    remote_name,
-                    remote_cfg,
-                ) {
+                match appendfs::remote::bootstrap_from_remote(store.as_ref(), storage.as_ref(), remote_name, remote_cfg)
+                {
                     Ok(summary_file) => {
                         println!("Successfully bootstrapped volume from remote '{}'!", remote_name);
                         println!("  Log Directory:   {}", args.log_dir.display());
@@ -360,8 +355,9 @@ fn main() {
             fs_instance.max_staged_ops = args.flush_threshold_ops;
             fs_instance.max_extent_size = args.max_extent_size;
             fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
+            fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
 
-            let registry = load_remote_registry(log_dir);
+            let registry = load_remote_registry(storage.as_ref());
             let cache_dir = log_dir.join(".cache");
             let block_cache = Arc::new(
                 appendfs::remote::OnDiskBlockCache::new(
@@ -380,7 +376,6 @@ fn main() {
             ));
             log_cache.set_decrypted_cache_size(args.decrypted_cache_size);
             fs_instance.log_cache = Some(log_cache);
-            fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
 
             let fs_instance = Arc::new(fs_instance);
 
@@ -578,7 +573,8 @@ fn main() {
             }
 
             if let Some(ref remote_name) = args.remote {
-                let registry = load_remote_registry(log_dir);
+                let storage = OsStorage::new(log_dir);
+                let registry = load_remote_registry(&storage);
                 let remote_cfg = match registry.get_remote(remote_name) {
                     Some(c) => c,
                     None => {
@@ -587,7 +583,6 @@ fn main() {
                     }
                 };
                 let store = remote_cfg.build_store();
-                let storage = OsStorage::new(log_dir);
                 let summary_file = match latest_summary_file(&storage) {
                     Ok(Some(f)) => f,
                     _ => {
@@ -650,7 +645,8 @@ fn main() {
         }
         Commands::Remote(subargs) => match subargs.command {
             appendfs::cli::RemoteCommands::Add(add_args) => {
-                let mut registry = load_remote_registry(&add_args.log_dir);
+                let storage = OsStorage::new(&add_args.log_dir);
+                let mut registry = load_remote_registry(&storage);
                 let mut cfg = if let Some(ref p) = add_args.path {
                     appendfs::remote::RemoteTargetConfig::new_path(p)
                 } else if let Some(ref b) = add_args.bucket {
@@ -675,7 +671,7 @@ fn main() {
                 cfg.force_path_style = add_args.path_style;
 
                 registry.add_remote(&add_args.name, cfg);
-                if let Err(e) = registry.save_to_dir(&add_args.log_dir) {
+                if let Err(e) = registry.save_to_storage(&storage) {
                     eprintln!("Failed to save remotes.toml in '{}': {}", add_args.log_dir.display(), e);
                     std::process::exit(1);
                 }
@@ -686,9 +682,10 @@ fn main() {
                 );
             }
             appendfs::cli::RemoteCommands::Rm(rm_args) => {
-                let mut registry = load_remote_registry(&rm_args.log_dir);
+                let storage = OsStorage::new(&rm_args.log_dir);
+                let mut registry = load_remote_registry(&storage);
                 if registry.remove_remote(&rm_args.name) {
-                    if let Err(e) = registry.save_to_dir(&rm_args.log_dir) {
+                    if let Err(e) = registry.save_to_storage(&storage) {
                         eprintln!("Failed to save remotes.toml in '{}': {}", rm_args.log_dir.display(), e);
                         std::process::exit(1);
                     }
@@ -699,7 +696,8 @@ fn main() {
                 }
             }
             appendfs::cli::RemoteCommands::List(list_args) => {
-                let registry = load_remote_registry(&list_args.log_dir);
+                let storage = OsStorage::new(&list_args.log_dir);
+                let registry = load_remote_registry(&storage);
                 if registry.remotes.is_empty() {
                     println!("No remotes configured in '{}'.", list_args.log_dir.display());
                 } else {

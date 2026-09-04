@@ -42,9 +42,7 @@ pub use remote::{
     ReplicationPolicy, S3RemoteStore, TieredCache, TieredStorageReader,
 };
 #[cfg(any(test, feature = "testing"))]
-pub use remote::{
-    CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MemoryRemoteStore, MockRemoteStore, RemoteStoreMetrics,
-};
+pub use remote::{CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, MockRemoteStore, RemoteStoreMetrics};
 pub use stats::VolumeStats;
 pub use storage::{FaultStorage, MemoryStorage, OsStorage, Storage, StorageReader, StorageWriter, WriteMode};
 

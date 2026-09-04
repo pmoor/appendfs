@@ -259,6 +259,14 @@ pub struct InitArgs {
     /// Mark bootstrap remote as read-only (for zero-cost CoW cloud forking)
     #[arg(long = "remote-read-only", default_value_t = false)]
     pub remote_read_only: bool,
+
+    /// Access key ID for bootstrap remote credentials
+    #[arg(long = "remote-access-key-id")]
+    pub remote_access_key_id: Option<String>,
+
+    /// Secret access key for bootstrap remote credentials
+    #[arg(long = "remote-secret-access-key")]
+    pub remote_secret_access_key: Option<String>,
 }
 
 impl InitArgs {
@@ -288,8 +296,9 @@ impl InitArgs {
     }
 }
 
-#[derive(Args, Debug)]
-pub struct MountArgs {
+/// Common arguments shared between read-write and read-only mounts.
+#[derive(Args, Debug, Clone)]
+pub struct MountCommonArgs {
     /// Directory path where appendfs volume log and summary files are stored
     pub log_dir: PathBuf,
 
@@ -299,6 +308,39 @@ pub struct MountArgs {
     /// Run FUSE in foreground mode (do not daemonize)
     #[arg(short = 'f', long = "foreground", default_value_t = false)]
     pub foreground: bool,
+
+    /// Additional raw FUSE options passed to libfuse (e.g. -o allow_other)
+    #[arg(short = 'o', value_delimiter = ',')]
+    pub fuse_options: Vec<String>,
+
+    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
+    #[arg(long = "key-file")]
+    pub key_file: Option<PathBuf>,
+
+    /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
+    #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
+    pub decrypted_cache_size: usize,
+}
+
+impl MountCommonArgs {
+    /// Formats CLI arguments into libfuse-compatible C-style argv.
+    pub fn to_fuse_args(&self) -> Vec<String> {
+        let mut fuse_args = vec!["appendfs".to_string(), self.mount_point.to_str().unwrap().to_string()];
+        if self.foreground {
+            fuse_args.push("-f".to_string());
+        }
+        for opt in &self.fuse_options {
+            fuse_args.push("-o".to_string());
+            fuse_args.push(opt.clone());
+        }
+        fuse_args
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct MountArgs {
+    #[command(flatten)]
+    pub common: MountCommonArgs,
 
     /// Interval in seconds for periodic background log flushing (default: 60, 0 to disable)
     #[arg(short = 'i', long = "flush-interval", default_value_t = 60)]
@@ -320,14 +362,6 @@ pub struct MountArgs {
     #[arg(long = "max-extent-size", default_value_t = DEFAULT_MAX_EXTENT_SIZE)]
     pub max_extent_size: usize,
 
-    /// Additional raw FUSE options passed to libfuse (e.g. -o allow_other)
-    #[arg(short = 'o', value_delimiter = ',')]
-    pub fuse_options: Vec<String>,
-
-    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
-    #[arg(long = "key-file")]
-    pub key_file: Option<PathBuf>,
-
     /// Disable autonomous background remote synchronization (default: sync is ON if remotes configured)
     #[arg(long = "no-sync", default_value_t = false)]
     pub no_sync: bool,
@@ -335,10 +369,6 @@ pub struct MountArgs {
     /// Maximum age of active log file before rolling for cloud durability (e.g. "2h", "30m", default: "2h")
     #[arg(long = "max-log-age", default_value = "2h")]
     pub max_log_age: String,
-
-    /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
-    #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
-    pub decrypted_cache_size: usize,
 
     /// Interval in bytes of committed log data before generating a new .summary snapshot file during log rolls (default: 10 GiB, 0 to disable byte-based trigger)
     #[arg(long = "summary-interval-bytes", default_value_t = DEFAULT_SUMMARY_INTERVAL_BYTES)]
@@ -349,28 +379,25 @@ pub struct MountArgs {
     pub summary_interval_generations: u64,
 }
 
+impl std::ops::Deref for MountArgs {
+    type Target = MountCommonArgs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+
 impl MountArgs {
     /// Formats CLI arguments into libfuse-compatible C-style argv.
     pub fn to_fuse_args(&self) -> Vec<String> {
-        let mut fuse_args = vec!["appendfs".to_string(), self.mount_point.to_str().unwrap().to_string()];
-        if self.foreground {
-            fuse_args.push("-f".to_string());
-        }
-        for opt in &self.fuse_options {
-            fuse_args.push("-o".to_string());
-            fuse_args.push(opt.clone());
-        }
-        fuse_args
+        self.common.to_fuse_args()
     }
 }
 
 #[derive(Args, Debug)]
 pub struct MountRoArgs {
-    /// Directory path where the appendfs volume log and summary files are stored
-    pub log_dir: PathBuf,
-
-    /// Directory where the read-only filesystem will be mounted
-    pub mount_point: PathBuf,
+    #[command(flatten)]
+    pub common: MountCommonArgs,
 
     /// Target transaction ID for point-in-time historical recovery
     #[arg(long = "tx-id")]
@@ -383,36 +410,20 @@ pub struct MountRoArgs {
     /// Target log generation for historical recovery
     #[arg(long = "generation")]
     pub generation: Option<u64>,
+}
 
-    /// Run filesystem in foreground (default: false / daemonize)
-    #[arg(short = 'f', long = "foreground")]
-    pub foreground: bool,
+impl std::ops::Deref for MountRoArgs {
+    type Target = MountCommonArgs;
 
-    /// Additional raw FUSE options passed to libfuse (e.g. -o allow_other)
-    #[arg(short = 'o', value_delimiter = ',')]
-    pub fuse_options: Vec<String>,
-
-    /// Path to key file (64 hex characters; prompts for a passphrase if omitted)
-    #[arg(long = "key-file")]
-    pub key_file: Option<PathBuf>,
-
-    /// Maximum size in bytes of in-memory decrypted record cache (default: 128 MiB)
-    #[arg(long = "decrypted-cache-size", default_value_t = DEFAULT_DECRYPTED_CACHE_SIZE)]
-    pub decrypted_cache_size: usize,
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 
 impl MountRoArgs {
     /// Formats CLI arguments into libfuse-compatible C-style argv.
     pub fn to_fuse_args(&self) -> Vec<String> {
-        let mut fuse_args = vec!["appendfs".to_string(), self.mount_point.to_str().unwrap().to_string()];
-        if self.foreground {
-            fuse_args.push("-f".to_string());
-        }
-        for opt in &self.fuse_options {
-            fuse_args.push("-o".to_string());
-            fuse_args.push(opt.clone());
-        }
-        fuse_args
+        self.common.to_fuse_args()
     }
 }
 

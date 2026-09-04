@@ -124,7 +124,7 @@ impl ReplicationTelemetry {
         Self::default()
     }
 
-    pub fn record_synced_gen(&mut self, remote_name: &str, generation_num: u64) {
+    pub fn record_synced_gen(&mut self, remote_name: &str, generation_num: u64, now: SystemTime) {
         let entry = self
             .remotes
             .entry(remote_name.to_string())
@@ -134,12 +134,12 @@ impl ReplicationTelemetry {
             });
         if generation_num >= entry.synced_generation {
             entry.synced_generation = generation_num;
-            entry.last_sync_time = Some(SystemTime::now());
+            entry.last_sync_time = Some(now);
             entry.last_error = None;
         }
     }
 
-    pub fn record_active_part(&mut self, remote_name: &str, generation_num: u64, part_idx: u32) {
+    pub fn record_active_part(&mut self, remote_name: &str, generation_num: u64, part_idx: u32, now: SystemTime) {
         let entry = self
             .remotes
             .entry(remote_name.to_string())
@@ -148,7 +148,7 @@ impl ReplicationTelemetry {
                 ..Default::default()
             });
         entry.active_part = Some((generation_num, part_idx));
-        entry.last_sync_time = Some(SystemTime::now());
+        entry.last_sync_time = Some(now);
         entry.last_error = None;
     }
 
@@ -196,6 +196,7 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
     }
 
     let telemetry_guard = fs.replication_telemetry.read().unwrap();
+    let now = fs.clock.now();
 
     out.push_str(&format!(
         "=== Remote Status (Volume Head Generation: {}) ===\n\n",
@@ -237,7 +238,7 @@ pub fn format_remotes_status(fs: &InMemoryFS) -> String {
                 out.push_str(&format!("  Active Part:        {:06}.part{:04}.log\n", part_gen, part));
             }
             if let Some(t_time) = t.last_sync_time {
-                let elapsed = SystemTime::now().duration_since(t_time).unwrap_or_default().as_secs();
+                let elapsed = now.duration_since(t_time).unwrap_or_default().as_secs();
                 out.push_str(&format!("  Last Sync:          {}s ago\n", elapsed));
             }
             if let Some(ref err) = t.last_error {
@@ -296,7 +297,7 @@ impl RemoteReplicationWorker {
         let log_dir_clone = log_dir.clone();
 
         let thread_handle = thread::spawn(move || {
-            let mut last_part_sync = SystemTime::now();
+            let mut last_part_sync = fs_clone.clock.now();
             let mut uploaded_part_offsets: std::collections::HashMap<u64, (u64, u32)> =
                 std::collections::HashMap::new();
             let mut last_audit = SystemTime::UNIX_EPOCH; // Run initial audit on startup
@@ -384,7 +385,7 @@ impl RemoteReplicationWorker {
         let mut last_audit = if force_audit {
             SystemTime::UNIX_EPOCH
         } else {
-            SystemTime::now()
+            self.fs.clock.now()
         };
         let mut confirmed_generations = std::collections::HashMap::new();
         let mut confirmed_summaries = std::collections::HashMap::new();
@@ -455,7 +456,7 @@ impl RemoteReplicationWorker {
             None => return Ok(()),
         };
 
-        let now = SystemTime::now();
+        let now = fs.clock.now();
         let audit_elapsed = now.duration_since(*last_audit).unwrap_or_default().as_secs();
         let is_audit = force_audit || audit_elapsed >= policy.audit_interval_secs;
 
@@ -467,7 +468,7 @@ impl RemoteReplicationWorker {
 
         // 1. Time-based rolling check
         if let Some(created) = active_created {
-            let age = SystemTime::now().duration_since(created).unwrap_or_default();
+            let age = now.duration_since(created).unwrap_or_default();
             if age.as_secs() >= policy.max_log_age_secs && active_offset > crate::log::record::FILE_HEADER_SIZE as u64 {
                 log::info!(
                     "Active generation {} reached age threshold ({}s >= {}s); rolling for durability...",
@@ -612,7 +613,7 @@ impl RemoteReplicationWorker {
                     fs.replication_telemetry
                         .write()
                         .unwrap()
-                        .record_synced_gen(remote_name, gen_num);
+                        .record_synced_gen(remote_name, gen_num, now);
                 }
             }
         }
@@ -745,7 +746,6 @@ impl RemoteReplicationWorker {
         }
 
         // 4. Active generation part-chunk upload (every active_sync_interval_secs)
-        let now = SystemTime::now();
         let time_since_last_part = now.duration_since(*last_part_sync).unwrap_or_default();
 
         if time_since_last_part.as_secs() >= policy.active_sync_interval_secs {
@@ -780,6 +780,7 @@ impl RemoteReplicationWorker {
                                         remote_name,
                                         active_gen,
                                         *part_idx,
+                                        now,
                                     );
                                 }
                                 Err(e) => {
@@ -820,7 +821,7 @@ impl RemoteReplicationWorker {
         policy: &crate::remote::config::ReplicationPolicy,
         stores: &[(String, Arc<dyn RemoteStore>, bool, bool)],
     ) {
-        let now = SystemTime::now();
+        let now = fs.clock.now();
         let retention_dur = policy
             .local_retention_secs
             .map(Duration::from_secs)

@@ -305,9 +305,10 @@ mod tests {
 
         // Record telemetry
         {
+            let now = fs.clock.now();
             let mut telem = fs.replication_telemetry.write().unwrap();
-            telem.record_synced_gen("nas", 1);
-            telem.record_active_part("nas", 2, 3);
+            telem.record_synced_gen("nas", 1, now);
+            telem.record_active_part("nas", 2, 3, now);
         }
 
         let updated_status = fs
