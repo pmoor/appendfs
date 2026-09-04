@@ -1,7 +1,7 @@
 use appendfs::clock::SystemClock;
 use appendfs::crypto::{VolumeHeader, VolumeKey};
 use appendfs::log::{LogFileCache, LogWriter, init_volume, init_volume_with_clock};
-use appendfs::operations::read_write::{create_core, read_core, write_core};
+use appendfs::operations::read_write::{create_core, open_core, read_core, release_core, write_core};
 use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, upload_storage_file};
 use appendfs::remote::{
@@ -9,12 +9,19 @@ use appendfs::remote::{
     MockRemoteStore, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
 };
 use appendfs::storage::MemoryStorage;
-use appendfs::{Clock, Storage};
+use appendfs::{Clock, InMemoryFS, Storage};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tempfile::TempDir;
+
+fn read_test(fs: &InMemoryFS, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+    let fh = open_core(fs, ino, libc::O_RDONLY as u32)?;
+    let res = read_core(fs, ino, fh, offset as i64, size);
+    let _ = release_core(fs, ino, fh);
+    res
+}
 
 #[test]
 fn test_remote_replication_and_authenticated_md5_ledger() {
@@ -185,7 +192,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     // Read back archival.dat from the filesystem:
     // Local file is GONE, so TieredStorageReader should fetch 1MB aligned block from remote,
     // cache it in memory block cache, and return exact bytes!
-    let read_back = read_core(&fs, ino, original_bytes.len(), 0).unwrap();
+    let read_back = read_test(&fs, ino, 0, original_bytes.len()).unwrap();
     assert_eq!(
         read_back, original_bytes,
         "Sparse remote extent read matched original bytes bit-for-bit!"
@@ -199,7 +206,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
 
     // Second read hits in-memory decrypted cache and block cache directly (even if remote goes down!)
     failing_remote.fail_next_n_requests(10);
-    let read_back2 = read_core(&fs, ino, 100, 500).unwrap();
+    let read_back2 = read_test(&fs, ino, 500, 100).unwrap();
     assert_eq!(read_back2, &original_bytes[500..600]);
 }
 
@@ -558,7 +565,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     // Read back nfs_file.txt from the filesystem:
     // Local 000001.log is GONE, so TieredStorageReader should fetch 1MB aligned block from NFS remote,
     // cache it in block cache, and return exact bytes!
-    let read_back = read_core(&fs, file_ino, payload.len(), 0).unwrap();
+    let read_back = read_test(&fs, file_ino, 0, payload.len()).unwrap();
     assert_eq!(
         read_back, payload,
         "Sparse NFS remote extent read matched original payload bit-for-bit!"
@@ -630,7 +637,7 @@ fn test_local_read_populates_block_cache_before_purge() {
 
     // 5. Read sealed generation 1 file while 000001.log is STILL in storage:
     // Should read from storage AND pre-warm into block cache!
-    let read_sealed = read_core(&fs, file1_ino, payload1.len(), 0).unwrap();
+    let read_sealed = read_test(&fs, file1_ino, 0, payload1.len()).unwrap();
     assert_eq!(read_sealed, payload1);
 
     // Block 0 of generation 1 MUST now be cached!
@@ -638,7 +645,7 @@ fn test_local_read_populates_block_cache_before_purge() {
 
     // 6. Read active generation 2 file:
     // Must NOT write to block cache because active generation avoids partial block caching!
-    let read_active = read_core(&fs, file2_ino, payload2.len(), 0).unwrap();
+    let read_active = read_test(&fs, file2_ino, 0, payload2.len()).unwrap();
     assert_eq!(read_active, payload2);
     assert!(block_cache.read_block(2, 0).unwrap().is_none());
 
@@ -651,7 +658,7 @@ fn test_local_read_populates_block_cache_before_purge() {
 
     // 9. Read sealed file again:
     // 000001.log is GONE, NO remotes exist, but read MUST succeed directly from block cache!
-    let read_cached_after_purge = read_core(&fs, file1_ino, payload1.len(), 0).unwrap();
+    let read_cached_after_purge = read_test(&fs, file1_ino, 0, payload1.len()).unwrap();
     assert_eq!(
         read_cached_after_purge, payload1,
         "Read succeeded directly from pre-warmed block cache after local log was purged!"
@@ -744,7 +751,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     fs.log_cache = Some(log_cache.clone());
 
     // 7. Perform read: should query NAS first, succeed, and NOT touch S3!
-    let read1 = read_core(&fs, file_ino, payload.len(), 0).unwrap();
+    let read1 = read_test(&fs, file_ino, 0, payload.len()).unwrap();
     assert_eq!(read1, payload);
 
     assert_eq!(
@@ -761,7 +768,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     nas_failing.fail_next_n_requests(1);
 
     // 9. Perform read: NAS fails, so it fails over to S3!
-    let read2 = read_core(&fs, file_ino, payload.len(), 0).unwrap();
+    let read2 = read_test(&fs, file_ino, 0, payload.len()).unwrap();
     assert_eq!(read2, payload);
 
     assert_eq!(counting_nas_front.range_reads(), 2, "NAS was tried first and failed");
@@ -803,7 +810,6 @@ fn test_latency_remote_store_in_tiered_reading() {
     fs.export_summary(storage.as_ref()).unwrap();
 
     let raw_log_bytes = storage.get_file_bytes("000001.log").unwrap();
-
     let mock_store = Arc::new(MockRemoteStore::new());
     mock_store
         .put_object("000001.log", &mut &raw_log_bytes[..], raw_log_bytes.len() as u64, None)
@@ -832,7 +838,7 @@ fn test_latency_remote_store_in_tiered_reading() {
 
     // 1st read: misses cache, queries latency_store, takes >= 19ms
     let start1 = Instant::now();
-    let read1 = read_core(&fs, file_attr.ino, payload.len(), 0).unwrap();
+    let read1 = read_test(&fs, file_attr.ino, 0, payload.len()).unwrap();
     let elapsed1 = start1.elapsed();
     assert_eq!(read1, payload);
     assert!(
@@ -844,7 +850,7 @@ fn test_latency_remote_store_in_tiered_reading() {
 
     // 2nd read: served directly from cache, near instantaneous (< 10ms)
     let start2 = Instant::now();
-    let read2 = read_core(&fs, file_attr.ino, payload.len(), 0).unwrap();
+    let read2 = read_test(&fs, file_attr.ino, 0, payload.len()).unwrap();
     let elapsed2 = start2.elapsed();
     assert_eq!(read2, payload);
     assert!(
@@ -943,7 +949,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     assert_ne!(fh & VIRTUAL_FH_FLAG, 0, "Virtual handle must have high-bit flag set");
 
     // 5. Read .remotes content
-    let content_bytes = read_core(&fs_arc, remotes_ino, 4096, 0).unwrap();
+    let content_bytes = read_core(&fs_arc, remotes_ino, fh, 0, 4096).unwrap();
     let content_str = String::from_utf8(content_bytes).unwrap();
 
     assert!(content_str.contains("=== Remote Status (Volume Head Generation: 2) ==="));
@@ -1448,11 +1454,11 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
     // Read file_a (written in gen 1, which was purged locally!):
     // Should fetch from mock_remote via TieredStorageReader and return exact payload
-    let read_a = read_core(&fs_latest, file_a.ino, payload_a.len(), 0).unwrap();
+    let read_a = read_test(&fs_latest, file_a.ino, 0, payload_a.len()).unwrap();
     assert_eq!(read_a, payload_a);
 
     // Read file_b (written in gen 2, also purged locally!):
-    let read_b = read_core(&fs_latest, file_b.ino, payload_b.len(), 0).unwrap();
+    let read_b = read_test(&fs_latest, file_b.ino, 0, payload_b.len()).unwrap();
     assert_eq!(read_b, payload_b);
 
     // =========================================================================
@@ -1505,7 +1511,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     );
 
     // Reading file_a from the historical past mount fetches from remote and succeeds!
-    let read_past_a = read_core(&fs_past, file_a.ino, payload_a.len(), 0).unwrap();
+    let read_past_a = read_test(&fs_past, file_a.ino, 0, payload_a.len()).unwrap();
     assert_eq!(read_past_a, payload_a);
 
     // =========================================================================
@@ -1543,7 +1549,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
     assert!(fs_gen2.lookup_child(1, "file_a.txt").is_some());
     assert!(fs_gen2.lookup_child(1, "file_b.txt").is_none());
-    let read_gen2_a = read_core(&fs_gen2, file_a.ino, payload_a.len(), 0).unwrap();
+    let read_gen2_a = read_test(&fs_gen2, file_a.ino, 0, payload_a.len()).unwrap();
     assert_eq!(read_gen2_a, payload_a);
 }
 

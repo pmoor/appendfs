@@ -164,16 +164,20 @@ mod tests {
         assert_ne!(fh2 & VIRTUAL_FH_FLAG, 0, "fh2 must have high bit flag set");
         assert_ne!(fh1, fh2, "Handles must be distinct");
 
-        // 3. Reading fh1 repeatedly yields "counter: 0\n"
-        {
-            let handles = fs.virtual_handles.read().unwrap();
-            assert_eq!(handles.get(&fh1).unwrap(), b"counter: 0\n");
-            assert_eq!(handles.get(&fh2).unwrap(), b"counter: 1\n");
-        }
+        // 3. Reading fh1 and fh2 via read_core yields their frozen snapshots
+        let data1 = read_core(&fs, v_ino, fh1, 0, 100).unwrap();
+        assert_eq!(data1, b"counter: 0\n");
+        let data2 = read_core(&fs, v_ino, fh2, 0, 100).unwrap();
+        assert_eq!(data2, b"counter: 1\n");
 
-        // 4. Test read_core directly (dynamic content)
-        let data = read_core(&fs, v_ino, 100, 0).unwrap();
-        assert_eq!(data, b"counter: 2\n");
+        // 4. Invalid handle returns EBADF
+        assert_eq!(read_core(&fs, v_ino, 9999, 0, 100), Err(libc::EBADF));
+
+        // 5. Open a third handle: freezes counter = 2
+        let fh3 = fs.open_file_handle(v_ino, 0);
+        let data3 = read_core(&fs, v_ino, fh3, 0, 100).unwrap();
+        assert_eq!(data3, b"counter: 2\n");
+        fs.release_file_handle(fh3, v_ino).unwrap();
 
         // 5. Release fh1: buffer is freed
         fs.release_file_handle(fh1, v_ino).unwrap();

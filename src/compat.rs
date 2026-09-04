@@ -5,7 +5,7 @@ use crate::operations::dir::mkdir_core;
 use crate::operations::links::{link_core, readlink_core, symlink_core};
 use crate::operations::read_write::{
     FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_UID, create_core,
-    read_core, setattr_core, write_core,
+    open_core, read_core, release_core, setattr_core, write_core,
 };
 use crate::operations::special::mknod_core;
 use crate::operations::xattr::setxattr_core;
@@ -499,6 +499,13 @@ pub fn lookup_path(fs: &InMemoryFS, path: &str) -> Option<u64> {
     Some(current)
 }
 
+fn read_compat_file(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<u8> {
+    let fh = open_core(fs, ino, libc::O_RDONLY as u32).expect("open compat file");
+    let data = read_core(fs, ino, fh, offset, size).expect("read compat file");
+    release_core(fs, ino, fh).expect("release compat file");
+    data
+}
+
 /// Asserts that `fs` exactly matches the canonical compatibility specification.
 /// Validates directory hierarchy, file contents, sparse holes, symlinks, special files,
 /// permissions (`mode`), ownership (`uid`/`gid`), timestamps (`mtime`/`atime`), and xattrs.
@@ -569,7 +576,7 @@ pub fn verify_compat_tree(fs: &InMemoryFS) {
     assert_eq!(attr.atime, compat_time(110));
     assert_eq!(attr.mtime, compat_time(120));
     assert_eq!(attr.nlink, 2, "must be linked twice (hello.txt and hello_hardlink.txt)");
-    let hello_bytes = read_core(fs, ino_hello, 40, 0).expect("read /hello.txt");
+    let hello_bytes = read_compat_file(fs, ino_hello, 40, 0);
     assert_eq!(hello_bytes, b"Hello, AppendFS v1 compatibility world!\n");
     assert_eq!(fs.get_xattr(ino_hello, "user.test_attr"), Some(b"compat_v1".to_vec()));
     assert_eq!(fs.get_xattr(ino_hello, "user.second_attr"), Some(b"verified".to_vec()));
@@ -599,7 +606,7 @@ pub fn verify_compat_tree(fs: &InMemoryFS) {
     assert_eq!(attr.gid, 1002);
     assert_eq!(attr.atime, compat_time(150));
     assert_eq!(attr.mtime, compat_time(160));
-    let bin_read = read_core(fs, ino_data_bin, 1024, 0).expect("read data.bin");
+    let bin_read = read_compat_file(fs, ino_data_bin, 1024, 0);
     assert_eq!(bin_read, compat_data_bin());
 
     // 11. /dir_b/multi_extent.dat
@@ -612,7 +619,7 @@ pub fn verify_compat_tree(fs: &InMemoryFS) {
     assert_eq!(attr.gid, 1003);
     assert_eq!(attr.atime, compat_time(170));
     assert_eq!(attr.mtime, compat_time(180));
-    let multi_read = read_core(fs, ino_multi, 32768, 0).expect("read multi_extent.dat");
+    let multi_read = read_compat_file(fs, ino_multi, 32768, 0);
     assert_eq!(multi_read, compat_multi_extent_full());
 
     // 12. /sparse_file.bin (hole 0..4096, data 4096..4196)
@@ -626,10 +633,10 @@ pub fn verify_compat_tree(fs: &InMemoryFS) {
     assert_eq!(attr.atime, compat_time(190));
     assert_eq!(attr.mtime, compat_time(200));
     // Verify hole returns zeroed bytes
-    let hole_read = read_core(fs, ino_sparse, 4096, 0).expect("read sparse hole");
+    let hole_read = read_compat_file(fs, ino_sparse, 4096, 0);
     assert_eq!(hole_read, vec![0u8; 4096]);
     // Verify data portion
-    let data_read = read_core(fs, ino_sparse, 100, 4096).expect("read sparse data");
+    let data_read = read_compat_file(fs, ino_sparse, 100, 4096);
     assert_eq!(data_read, vec![0xAAu8; 100]);
 
     // 13. Symlinks

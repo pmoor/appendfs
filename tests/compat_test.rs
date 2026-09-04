@@ -15,9 +15,16 @@
 //! and tested by `test_all_fixture_versions`.
 
 use appendfs::compat::{create_canonical_compat_volume, verify_compat_tree};
-use appendfs::operations::read_write::{create_core, read_core, write_core};
+use appendfs::operations::read_write::{create_core, open_core, read_core, release_core, write_core};
 use appendfs::storage::OsStorage;
-use appendfs::{LogWriter, RecoveryTarget, Storage, VolumeKey, recover_fs};
+use appendfs::{InMemoryFS, LogWriter, RecoveryTarget, Storage, VolumeKey, recover_fs};
+
+fn read_test(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Vec<u8> {
+    let fh = open_core(fs, ino, libc::O_RDONLY as u32).expect("open file");
+    let data = read_core(fs, ino, fh, offset, size).expect("read file");
+    release_core(fs, ino, fh).expect("release file");
+    data
+}
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,7 +82,7 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
     write_core(&fs, new_file.ino, b"reconstruction test forward write works!", 0).expect("write after reconstruction");
     fs.flush_log().expect("flush after reconstruction");
 
-    let read_back = read_core(&fs, new_file.ino, 40, 0).expect("read after reconstruction");
+    let read_back = read_test(&fs, new_file.ino, 40, 0);
     assert_eq!(read_back, b"reconstruction test forward write works!");
 }
 
@@ -127,7 +134,7 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
     write_core(&fs, new_file.ino, b"summary test forward write works!", 0).expect("write after summary");
     fs.flush_log().expect("flush after summary");
 
-    let read_back = read_core(&fs, new_file.ino, 33, 0).expect("read after summary");
+    let read_back = read_test(&fs, new_file.ino, 33, 0);
     assert_eq!(read_back, b"summary test forward write works!");
 }
 

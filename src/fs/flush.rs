@@ -1261,7 +1261,7 @@ mod tests {
             .expect("shared.txt must survive recovery");
         assert_eq!(rec_file_attr.nlink, 1);
 
-        let data = crate::operations::read_write::read_core(&recovered, file_attr.ino, 25, 0).unwrap();
+        let data = recovered.read_file_data(file_attr.ino, 0, 25).unwrap();
         assert_eq!(&data, b"persistent shared content");
 
         let rec_stats = recovered.calculate_generation_live_stats();
@@ -1412,7 +1412,7 @@ mod tests {
         .unwrap();
 
         // Read all 100 bytes: [0..20] must be 0xAA, [20..100] must be zeroes (0x00), NOT stale data!
-        let read_data = crate::operations::read_write::read_core(&fs, ino, 100, 0).unwrap();
+        let read_data = fs.read_file_data(ino, 0, 100).unwrap();
         assert_eq!(read_data.len(), 100);
         assert_eq!(&read_data[0..20], &[0xAA; 20]);
         assert_eq!(
@@ -1423,7 +1423,7 @@ mod tests {
 
         // Flush and verify reading again from base
         fs.sync_log().unwrap();
-        let read_data_after_flush = crate::operations::read_write::read_core(&fs, ino, 100, 0).unwrap();
+        let read_data_after_flush = fs.read_file_data(ino, 0, 100).unwrap();
         assert_eq!(&read_data_after_flush[0..20], &[0xAA; 20]);
         assert_eq!(&read_data_after_flush[20..100], &[0x00; 80]);
     }
@@ -1555,11 +1555,11 @@ mod tests {
         );
 
         // Verify all three files are intact in memory and base
-        let d1 = crate::operations::read_write::read_core(&fs, f1.ino, 15, 0).unwrap();
+        let d1 = fs.read_file_data(f1.ino, 0, 15).unwrap();
         assert_eq!(&d1, b"initial payload");
-        let d2 = crate::operations::read_write::read_core(&fs, f2.ino, 14, 0).unwrap();
+        let d2 = fs.read_file_data(f2.ino, 0, 14).unwrap();
         assert_eq!(&d2, b"second payload");
-        let d3 = crate::operations::read_write::read_core(&fs, f3.ino, 13, 0).unwrap();
+        let d3 = fs.read_file_data(f3.ino, 0, 13).unwrap();
         assert_eq!(&d3, b"third payload");
 
         // 7. Crash-recovery: Recover filesystem and verify all files recovered cleanly
@@ -1573,11 +1573,11 @@ mod tests {
         assert!(recovered.get_attr(f1.ino).is_some());
         assert!(recovered.get_attr(f2.ino).is_some());
         assert!(recovered.get_attr(f3.ino).is_some());
-        let rec_d1 = crate::operations::read_write::read_core(&recovered, f1.ino, 15, 0).unwrap();
+        let rec_d1 = recovered.read_file_data(f1.ino, 0, 15).unwrap();
         assert_eq!(&rec_d1, b"initial payload");
-        let rec_d2 = crate::operations::read_write::read_core(&recovered, f2.ino, 14, 0).unwrap();
+        let rec_d2 = recovered.read_file_data(f2.ino, 0, 14).unwrap();
         assert_eq!(&rec_d2, b"second payload");
-        let rec_d3 = crate::operations::read_write::read_core(&recovered, f3.ino, 13, 0).unwrap();
+        let rec_d3 = recovered.read_file_data(f3.ino, 0, 13).unwrap();
         assert_eq!(&rec_d3, b"third payload");
     }
 
@@ -1657,12 +1657,12 @@ mod tests {
         .expect("Recovery must succeed cleanly");
         for ino in initial_inos {
             assert!(recovered.get_attr(ino).is_some());
-            let d = crate::operations::read_write::read_core(&recovered, ino, 15, 0).unwrap();
+            let d = recovered.read_file_data(ino, 0, 15).unwrap();
             assert_eq!(&d, b"initial payload");
         }
         for (ino, payload) in batch2_inos {
             assert!(recovered.get_attr(ino).is_some());
-            let d = crate::operations::read_write::read_core(&recovered, ino, payload.len(), 0).unwrap();
+            let d = recovered.read_file_data(ino, 0, payload.len()).unwrap();
             assert_eq!(d, payload);
         }
 

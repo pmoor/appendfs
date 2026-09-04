@@ -97,11 +97,10 @@ impl InMemoryFS {
         self.next_fh.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub fn open_dir_handle(&self, ino: u64) -> Option<u64> {
-        let entries = crate::operations::dir::list_dir_core(self, ino).ok()?;
+    pub fn open_dir_handle(&self, entries: Vec<(String, u64)>) -> u64 {
         let fh = self.allocate_fh();
         self.dir_handles.write().unwrap().insert(fh, Arc::new(entries));
-        Some(fh)
+        fh
     }
 
     pub fn get_dir_handle(&self, fh: u64) -> Option<Arc<Vec<(String, u64)>>> {
@@ -128,9 +127,7 @@ mod tests {
         crate::operations::read_write::create_core(&fs, 1, "bravo.txt", 0o644, 0, 1000, 1000).unwrap();
 
         // 2. Open a directory handle on root
-        let fh1 = fs
-            .open_dir_handle(1)
-            .expect("open_dir_handle must succeed on directory");
+        let fh1 = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir_core must succeed on directory");
         assert!(fh1 > 0);
 
         let snap1 = fs.get_dir_handle(fh1).expect("Handle snapshot must exist");
@@ -149,9 +146,7 @@ mod tests {
         assert_eq!(snap1_recheck[1].0, "bravo.txt");
 
         // 5. A new directory handle on root gets the new snapshot (bravo, charlie)
-        let fh2 = fs
-            .open_dir_handle(1)
-            .expect("open_dir_handle must succeed on directory");
+        let fh2 = crate::operations::dir::opendir_core(&fs, 1, 0).expect("opendir_core must succeed on directory");
         assert_ne!(fh1, fh2);
         let snap2 = fs.get_dir_handle(fh2).expect("Second handle snapshot must exist");
         assert_eq!(snap2.len(), 2);
@@ -168,9 +163,12 @@ mod tests {
         assert_eq!(fs.release_dir_handle(fh2), Ok(()));
         assert!(fs.get_dir_handle(fh2).is_none());
 
-        // 8. open_dir_handle on a non-directory returns None
+        // 8. opendir_core on a non-directory returns ENOTDIR
         let alpha_ino = snap1[0].1;
-        assert!(fs.open_dir_handle(alpha_ino).is_none());
+        assert_eq!(
+            crate::operations::dir::opendir_core(&fs, alpha_ino, 0),
+            Err(libc::ENOTDIR)
+        );
     }
 
     #[test]

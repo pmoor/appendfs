@@ -25,56 +25,32 @@ pub fn getattr(fs: &InMemoryFS, req: Request, ino: u64) {
     }
 }
 
-pub fn read_core(fs: &InMemoryFS, ino: u64, size: usize, offset: i64) -> Result<Vec<u8>, i32> {
-    log::trace!("read(ino={}, size={}, offset={})", ino, size, offset);
+pub fn read_core(fs: &InMemoryFS, ino: u64, fh: u64, offset: i64, size: usize) -> Result<Vec<u8>, i32> {
+    log::trace!("read(ino={}, fh={}, size={}, offset={})", ino, fh, size, offset);
     if offset < 0 {
         return Err(libc::EINVAL);
     }
-    // TODO: Move virtual file test reading into test wrapper harness (e.g. open FD, read FD, close FD).
-    // Production code always has a file handle (fh) and should not need dynamic generation in read_core.
-    if fs.virtual_files.is_virtual_ino(ino) {
-        if let Some(content) = fs.virtual_files.generate_content(ino, fs) {
-            let bytes = content.into_bytes();
-            let start = (offset as usize).min(bytes.len());
-            let end = (start + size).min(bytes.len());
-            return Ok(bytes[start..end].to_vec());
+    if (fh & crate::fs::VIRTUAL_FH_FLAG) != 0 {
+        let handles = fs.virtual_handles.read().unwrap();
+        if let Some(buf) = handles.get(&fh) {
+            let start = (offset as usize).min(buf.len());
+            let end = (start + size).min(buf.len());
+            return Ok(buf[start..end].to_vec());
+        } else {
+            return Err(libc::EBADF);
         }
-        return Err(libc::ENOENT);
+    }
+
+    let handle = fs.get_file_handle(fh).ok_or(libc::EBADF)?;
+    if handle.ino != ino {
+        return Err(libc::EBADF);
     }
     fs.read_file_data(ino, offset as u64, size)
 }
 
 pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
     log::trace!("read(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    if (fh & crate::fs::VIRTUAL_FH_FLAG) != 0 {
-        let handles = fs.virtual_handles.read().unwrap();
-        if let Some(buf) = handles.get(&fh) {
-            if offset < 0 {
-                req.reply_err(libc::EINVAL);
-                return;
-            }
-            let start = (offset as usize).min(buf.len());
-            let end = (start + size).min(buf.len());
-            req.reply_buf(&buf[start..end]);
-            return;
-        } else {
-            req.reply_err(libc::EBADF);
-            return;
-        }
-    }
-
-    let handle = match fs.get_file_handle(fh) {
-        Some(h) => h,
-        None => {
-            req.reply_err(libc::EBADF);
-            return;
-        }
-    };
-    if handle.ino != ino {
-        req.reply_err(libc::EBADF);
-        return;
-    }
-    match read_core(fs, ino, size, offset) {
+    match read_core(fs, ino, fh, offset, size) {
         Ok(buf) => req.reply_buf(&buf),
         Err(e) => req.reply_err(e),
     }
@@ -86,8 +62,13 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
         return Err(libc::EISDIR);
     }
 
-    if fs.is_read_only() && (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0 {
-        return Err(libc::EROFS);
+    if (flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND)) != 0 {
+        if fs.is_read_only() {
+            return Err(libc::EROFS);
+        }
+        if fs.virtual_files.is_virtual_ino(ino) {
+            return Err(libc::EACCES);
+        }
     }
 
     let fh = fs.open_file_handle(ino, flags);

@@ -101,8 +101,11 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                 }
             }
             3 => {
-                if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng) {
-                    let _ = read_core(&fs, ino, 64, 0);
+                if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
+                    && let Ok(fh) = open_core(&fs, ino, 0)
+                {
+                    let _ = read_core(&fs, ino, fh, 0, 64);
+                    let _ = release_core(&fs, ino, fh);
                 }
             }
             4 => {
@@ -147,7 +150,7 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
                     && let Ok(fh) = open_core(&fs, ino, 0)
                 {
-                    let _ = read_core(&fs, ino, 64, 0);
+                    let _ = read_core(&fs, ino, fh, 0, 64);
                     let _ = release_core(&fs, ino, fh);
                 }
             }

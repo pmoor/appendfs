@@ -307,7 +307,34 @@ impl TestFS {
     }
 
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, i32> {
-        appendfs::operations::read_write::read_core(&self.fs, ino, len, offset as i64)
+        let fh = self.open(ino, libc::O_RDONLY as u32)?;
+        let res = appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len);
+        let _ = self.release(ino, fh);
+        res
+    }
+
+    pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, i32> {
+        appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset as i64, len)
+    }
+
+    pub fn read_all(&self, ino: u64) -> Result<Vec<u8>, i32> {
+        let fh = self.open(ino, libc::O_RDONLY as u32)?;
+        let len = if (fh & appendfs::fs::VIRTUAL_FH_FLAG) != 0 {
+            self.fs
+                .virtual_handles
+                .read()
+                .unwrap()
+                .get(&fh)
+                .map(|b| b.len())
+                .unwrap_or(0)
+        } else {
+            appendfs::operations::read_write::getattr_core(&self.fs, ino)
+                .map(|a| a.size as usize)
+                .unwrap_or(0)
+        };
+        let res = appendfs::operations::read_write::read_core(&self.fs, ino, fh, 0, len);
+        let _ = self.release(ino, fh);
+        res
     }
 
     pub fn punch(&self, ino: u64, offset: u64, len: u64) -> Result<(), i32> {
