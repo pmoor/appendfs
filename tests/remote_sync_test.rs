@@ -6,19 +6,19 @@ use appendfs::remote::bootstrap_from_remote;
 use appendfs::remote::worker::{cross_copy_file, upload_storage_file};
 use appendfs::remote::{
     BlockCache, CountingRemoteStore, FailingRemoteStore, LatencyRemoteStore, LocalDirRemoteStore, MemoryBlockCache,
-    MockRemoteStore, OnDiskBlockCache, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
+    MockRemoteStore, RemoteRegistry, RemoteStore, RemoteTargetConfig, check_remote_integrity,
 };
-use appendfs::storage::OsStorage;
+use appendfs::storage::MemoryStorage;
 use appendfs::{Clock, Storage};
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 #[test]
 fn test_remote_replication_and_authenticated_md5_ledger() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -36,7 +36,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.set_storage(storage.clone());
 
     // Write file 1 (gen 1)
     let root = 1;
@@ -121,8 +121,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
 
 #[test]
 fn test_tiered_eviction_and_sparse_remote_extent_reads() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -137,7 +136,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.set_storage(storage.clone());
 
     // Write a large extent across multiple KB in generation 1
     let file_attr = create_core(&fs, 1, "archival.dat", 0o644, 0, 1000, 1000).unwrap();
@@ -166,15 +165,13 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     // Wrap mock in FailingRemoteStore to test network failover
     let failing_remote = Arc::new(FailingRemoteStore::new(mock.clone()));
 
-    // SIMULATE TIERED LOCAL EVICTION: Delete 000001.log from local disk!
-    let local_gen1_path = dir.path().join("000001.log");
-    assert!(local_gen1_path.exists());
-    fs::remove_file(&local_gen1_path).unwrap();
-    assert!(!local_gen1_path.exists(), "000001.log was pruned from local disk");
+    // SIMULATE TIERED LOCAL EVICTION: Delete 000001.log from storage!
+    assert!(storage.exists("000001.log"));
+    storage.remove_file("000001.log").unwrap();
+    assert!(!storage.exists("000001.log"), "000001.log was pruned from storage");
 
-    // Setup TieredCache with OnDiskBlockCache in .cache/
-    let cache_dir = dir.path().join(".cache");
-    let block_cache = Arc::new(OnDiskBlockCache::new(&cache_dir, 50 * 1024 * 1024).unwrap());
+    // Setup TieredCache with MemoryBlockCache
+    let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
     let remotes = vec![("mock_s3".to_string(), failing_remote.clone() as Arc<dyn RemoteStore>)];
 
     let log_cache = Arc::new(LogFileCache::with_remote_support(
@@ -187,20 +184,20 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
 
     // Read back archival.dat from the filesystem:
     // Local file is GONE, so TieredStorageReader should fetch 1MB aligned block from remote,
-    // cache it in .cache/, and return exact bytes!
+    // cache it in memory block cache, and return exact bytes!
     let read_back = read_core(&fs, ino, original_bytes.len(), 0).unwrap();
     assert_eq!(
         read_back, original_bytes,
         "Sparse remote extent read matched original bytes bit-for-bit!"
     );
 
-    // Verify that the on-disk block cache now holds block 0
+    // Verify that the memory block cache now holds block 0
     assert!(
         block_cache.read_block(1, 0).unwrap().is_some(),
-        "Block 0 must now be cached on disk"
+        "Block 0 must now be cached in block cache"
     );
 
-    // Second read hits in-memory and on-disk cache directly (even if remote goes down!)
+    // Second read hits in-memory decrypted cache and block cache directly (even if remote goes down!)
     failing_remote.fail_next_n_requests(10);
     let read_back2 = read_core(&fs, ino, 100, 500).unwrap();
     assert_eq!(read_back2, &original_bytes[500..600]);
@@ -257,8 +254,7 @@ fn test_disaster_recovery_bootstrap_from_remote() {
 
 #[test]
 fn test_read_only_remote_and_cloud_forking() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -272,7 +268,7 @@ fn test_read_only_remote_and_cloud_forking() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.set_storage(storage.clone());
 
     // Write file in generation 1
     let file_attr = create_core(&fs, 1, "base.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -318,8 +314,7 @@ fn test_read_only_remote_and_cloud_forking() {
 
 #[test]
 fn test_active_log_part_sync_and_consolidation_on_seal() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -333,7 +328,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.set_storage(storage.clone());
 
     let remote = Arc::new(MockRemoteStore::new());
 
@@ -360,7 +355,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     appendfs::remote::RemoteReplicationWorker::run_cycle(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/memory"),
         &mut last_part_sync,
         &mut uploaded_parts,
     )
@@ -382,7 +377,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     appendfs::remote::RemoteReplicationWorker::run_cycle(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/memory"),
         &mut last_part_sync,
         &mut uploaded_parts,
     )
@@ -407,7 +402,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     appendfs::remote::RemoteReplicationWorker::run_cycle(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/memory"),
         &mut last_part_sync,
         &mut uploaded_parts,
     )
@@ -478,9 +473,8 @@ fn test_local_dir_remote_store_streaming_and_md5_sidecars() {
 
 #[test]
 fn test_nfs_local_volume_replication_and_pruning() {
-    let dir = TempDir::new().unwrap();
     let nfs_dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -495,7 +489,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
 
     // Setup RemoteRegistry pointing to a local directory representing an NFS share
     let mut registry = RemoteRegistry::new();
@@ -528,7 +522,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     appendfs::remote::RemoteReplicationWorker::run_cycle(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
     )
@@ -546,8 +540,8 @@ fn test_nfs_local_volume_replication_and_pruning() {
     assert!(report.is_clean(), "Integrity check against NFS remote must pass");
 
     // 4. Prune local 000001.log to simulate tiered storage eviction
-    fs::remove_file(dir.path().join("000001.log")).unwrap();
-    assert!(!dir.path().join("000001.log").exists());
+    storage.remove_file("000001.log").unwrap();
+    assert!(!storage.exists("000001.log"));
 
     // 5. Setup tiered reader attached to LogFileCache
     let mut fs = Arc::try_unwrap(fs_arc).ok().unwrap();
@@ -579,8 +573,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
 
 #[test]
 fn test_local_read_populates_block_cache_before_purge() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -595,7 +588,6 @@ fn test_local_read_populates_block_cache_before_purge() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
 
     // 1. Write file in generation 1
     let root = 1u64;
@@ -622,9 +614,8 @@ fn test_local_read_populates_block_cache_before_purge() {
     write_core(&fs, file2_ino, payload2, 0).unwrap();
     fs.sync_log().unwrap();
 
-    // 4. Attach LogFileCache with OnDiskBlockCache (NO remotes configured!)
-    let cache_dir = dir.path().join(".cache");
-    let block_cache = Arc::new(OnDiskBlockCache::new(&cache_dir, 50 * 1024 * 1024).unwrap());
+    // 4. Attach LogFileCache with MemoryBlockCache (NO remotes configured!)
+    let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
     let log_cache = Arc::new(LogFileCache::with_remote_support(
         storage.clone(),
         Some(block_cache.clone()),
@@ -634,33 +625,32 @@ fn test_local_read_populates_block_cache_before_purge() {
     fs.log_cache = Some(log_cache.clone());
 
     // Verify cache is empty before any reads
-    assert!(!cache_dir.join("000001_000000.bin").exists());
-    assert!(!cache_dir.join("000002_000000.bin").exists());
+    assert!(block_cache.read_block(1, 0).unwrap().is_none());
+    assert!(block_cache.read_block(2, 0).unwrap().is_none());
 
-    // 5. Read sealed generation 1 file while 000001.log is STILL on local disk:
-    // Should read from local disk AND pre-warm into .cache/!
+    // 5. Read sealed generation 1 file while 000001.log is STILL in storage:
+    // Should read from storage AND pre-warm into block cache!
     let read_sealed = read_core(&fs, file1_ino, payload1.len(), 0).unwrap();
     assert_eq!(read_sealed, payload1);
 
-    // Block 0 of generation 1 MUST now be cached on disk in .cache/!
-    assert!(cache_dir.join("000001_000000.bin").exists());
+    // Block 0 of generation 1 MUST now be cached!
     assert!(block_cache.read_block(1, 0).unwrap().is_some());
 
     // 6. Read active generation 2 file:
-    // Must NOT write to .cache/ because active generation avoids partial block caching!
+    // Must NOT write to block cache because active generation avoids partial block caching!
     let read_active = read_core(&fs, file2_ino, payload2.len(), 0).unwrap();
     assert_eq!(read_active, payload2);
-    assert!(!cache_dir.join("000002_000000.bin").exists());
+    assert!(block_cache.read_block(2, 0).unwrap().is_none());
 
-    // 7. Clear in-memory decrypted cache so the next read MUST hit disk
+    // 7. Clear in-memory decrypted cache so the next read MUST hit storage / block cache
     log_cache.decrypted_cache.clear();
 
-    // 8. Physically DELETE 000001.log from local disk (simulate 30-day purge)
-    fs::remove_file(dir.path().join("000001.log")).unwrap();
-    assert!(!dir.path().join("000001.log").exists());
+    // 8. Physically DELETE 000001.log from storage (simulate 30-day purge)
+    storage.remove_file("000001.log").unwrap();
+    assert!(!storage.exists("000001.log"));
 
     // 9. Read sealed file again:
-    // 000001.log is GONE, NO remotes exist, but read MUST succeed directly from .cache/!
+    // 000001.log is GONE, NO remotes exist, but read MUST succeed directly from block cache!
     let read_cached_after_purge = read_core(&fs, file1_ino, payload1.len(), 0).unwrap();
     assert_eq!(
         read_cached_after_purge, payload1,
@@ -670,8 +660,7 @@ fn test_local_read_populates_block_cache_before_purge() {
 
 #[test]
 fn test_remote_read_priority_prefers_lower_priority_remotes() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -686,7 +675,6 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
 
     // 1. Write file into generation 1
     let root = 1u64;
@@ -706,8 +694,8 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     }
     fs.export_summary(storage.as_ref()).unwrap();
 
-    // 3. Read raw 000001.log bytes from local disk
-    let raw_log_bytes = std::fs::read(dir.path().join("000001.log")).unwrap();
+    // 3. Read raw 000001.log bytes from storage
+    let raw_log_bytes = storage.get_file_bytes("000001.log").unwrap();
 
     // 4. Create two mock stores: NAS (priority 10) and S3 (priority 100)
     let nas_store = Arc::new(MockRemoteStore::new());
@@ -743,11 +731,10 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     assert_eq!(remote_stores[1].name, "s3");
 
     // 5. Delete local 000001.log to force remote tiered reading
-    std::fs::remove_file(dir.path().join("000001.log")).unwrap();
+    storage.remove_file("000001.log").unwrap();
 
     // 6. Setup LogFileCache with block_cache and ordered remote_stores
-    let cache_dir = dir.path().join(".cache");
-    let block_cache = Arc::new(OnDiskBlockCache::new(&cache_dir, 50 * 1024 * 1024).unwrap());
+    let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
     let log_cache = Arc::new(LogFileCache::with_remote_support(
         storage.clone(),
         Some(block_cache.clone()),
@@ -769,7 +756,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     assert_eq!(counting_s3.total_requests(), 0, "S3 must NOT be called");
 
     // 8. Test failover: clear block cache and decrypted cache, make NAS fail next request
-    std::fs::remove_file(cache_dir.join("000001_000000.bin")).unwrap();
+    block_cache.clear();
     log_cache.decrypted_cache.clear();
     nas_failing.fail_next_n_requests(1);
 
@@ -786,8 +773,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
 fn test_latency_remote_store_in_tiered_reading() {
     use std::time::{Duration, Instant};
 
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -801,7 +787,6 @@ fn test_latency_remote_store_in_tiered_reading() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
 
     let file_attr = create_core(&fs, 1, "latency_test.dat", 0o644, 0, 1000, 1000).unwrap();
     let payload = b"Testing latency injection on tiered remote store reads";
@@ -817,7 +802,7 @@ fn test_latency_remote_store_in_tiered_reading() {
     }
     fs.export_summary(storage.as_ref()).unwrap();
 
-    let raw_log_bytes = std::fs::read(dir.path().join("000001.log")).unwrap();
+    let raw_log_bytes = storage.get_file_bytes("000001.log").unwrap();
 
     let mock_store = Arc::new(MockRemoteStore::new());
     mock_store
@@ -829,10 +814,9 @@ fn test_latency_remote_store_in_tiered_reading() {
     latency_store.set_method_delay("get_object_range", Duration::from_millis(20));
 
     // Delete local 000001.log to force remote tiered read
-    std::fs::remove_file(dir.path().join("000001.log")).unwrap();
+    storage.remove_file("000001.log").unwrap();
 
-    let cache_dir = dir.path().join(".cache");
-    let block_cache = Arc::new(OnDiskBlockCache::new(&cache_dir, 50 * 1024 * 1024).unwrap());
+    let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
     let counting_store = Arc::new(CountingRemoteStore::new(latency_store.clone()));
     let remotes = vec![(
         "delayed_remote".to_string(),
@@ -876,8 +860,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     use appendfs::fs::VIRTUAL_FH_FLAG;
     use appendfs::operations::dir::list_dir_core;
 
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -894,7 +877,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     let writer =
         Arc::new(LogWriter::create_lazy(storage.clone(), 1, 100 * 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
 
     // Configure 2 remotes (NAS and S3)
     let nas_store = Arc::new(MockRemoteStore::new());
@@ -949,7 +932,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     appendfs::remote::RemoteReplicationWorker::run_cycle(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part,
         &mut uploaded_parts,
     )
@@ -990,8 +973,7 @@ fn test_tiered_storage_reader_coalesces_concurrent_remote_reads() {
     use std::thread;
     use std::time::Duration;
 
-    let dir = TempDir::new().unwrap();
-    let cache = Arc::new(OnDiskBlockCache::new(dir.path(), 50 * 1024 * 1024).unwrap());
+    let cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
 
     // 2 MiB payload with deterministic bytes
     let payload = vec![0x77u8; 2 * 1024 * 1024];
@@ -1057,14 +1039,13 @@ fn test_tiered_storage_reader_coalesces_concurrent_remote_reads() {
     assert_eq!(reader.coalescer.coalesced_requests(), (num_threads - 1) as u64);
     assert_eq!(reader.coalescer.total_requests(), num_threads as u64);
 
-    // 3. Block 0 is now cached on disk
+    // 3. Block 0 is now cached
     assert!(cache.read_block(1, 0).unwrap().is_some());
 }
 
 #[test]
 fn test_event_driven_immediate_replication_on_log_roll() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = Arc::new(VolumeKey::plaintext());
 
@@ -1079,7 +1060,7 @@ fn test_event_driven_immediate_replication_on_log_roll() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
     let fs_arc = Arc::new(fs);
 
     let mut registry = RemoteRegistry::new();
@@ -1093,7 +1074,7 @@ fn test_event_driven_immediate_replication_on_log_roll() {
     let mut worker = appendfs::remote::RemoteReplicationWorker::start_with_interval(
         fs_arc.clone(),
         registry_arc.clone(),
-        dir.path().to_path_buf(),
+        std::path::PathBuf::from("/unused"),
         std::time::Duration::from_secs(3600),
     );
 
@@ -1132,8 +1113,7 @@ fn test_event_driven_immediate_replication_on_log_roll() {
 
 #[test]
 fn test_audit_interval_skips_confirmed_files_until_audit() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = Arc::new(VolumeKey::plaintext());
 
@@ -1148,7 +1128,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
     let fs_arc = Arc::new(fs);
 
     let raw_remote = Arc::new(MockRemoteStore::new());
@@ -1183,7 +1163,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
         &mut last_audit,
@@ -1209,7 +1189,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
         &mut last_audit,
@@ -1230,7 +1210,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
         &mut last_audit,
@@ -1248,9 +1228,8 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
 
 #[test]
 fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
-    let dir = TempDir::new().unwrap();
     let nfs_dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
@@ -1265,7 +1244,6 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
 
     // Write file in generation 1
     let root = 1u64;
@@ -1311,7 +1289,7 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
 
     let writer2 = Arc::new(LogWriter::create_lazy(storage.clone(), 2, 1024 * 1024, 1, volume_key.clone()).unwrap());
     recovered_fs.log_writer = Some(writer2);
-    recovered_fs.set_log_dir(dir.path());
+    recovered_fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
 
     // Configure remote registry with 0-second retention to test pruning
     let mut registry = RemoteRegistry::new();
@@ -1326,19 +1304,19 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     let mut uploaded_parts = std::collections::HashMap::new();
 
     // Run cycle: should replicate 000001.log and prune it immediately without waiting for a new summary!
-    assert!(dir.path().join("000001.log").exists());
+    assert!(storage.exists("000001.log"));
     appendfs::remote::RemoteReplicationWorker::run_cycle(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
     )
     .unwrap();
 
-    // Verify 000001.log was pruned from local disk
+    // Verify 000001.log was pruned from storage
     assert!(
-        !dir.path().join("000001.log").exists(),
+        !storage.exists("000001.log"),
         "000001.log must be pruned immediately after restart without waiting for a new summary"
     );
     // Verify it exists in the remote store
@@ -1347,8 +1325,7 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
 
 #[test]
 fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let start_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let clock = Arc::new(appendfs::clock::AdvancingClock::new(start_time));
     let volume_key = VolumeKey::plaintext_arc();
@@ -1365,7 +1342,6 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     .unwrap();
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
 
     // Write file A in generation 1
     let file_a = create_core(&fs, 1, "file_a.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -1413,25 +1389,25 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         upload_storage_file(storage.as_ref(), mock_remote.as_ref(), &file, None).unwrap();
     }
 
-    // Configure remote registry in local directory
+    // Configure remote registry in storage
     let mut registry = RemoteRegistry::new();
     let remote_cfg = RemoteTargetConfig::new("mock-s3");
     registry.add_remote("s3", remote_cfg);
     registry.set_store_override("s3", mock_remote.clone());
-    registry.save_to_dir(dir.path()).unwrap();
+    registry.save_to_storage(storage.as_ref()).unwrap();
     let remote_stores = registry.build_read_stores();
 
     // 3. SIMULATE LOCAL PURGING: delete all but 000003.summary
-    fs::remove_file(dir.path().join("000000.summary")).unwrap();
-    fs::remove_file(dir.path().join("000002.summary")).unwrap();
-    fs::remove_file(dir.path().join("000001.log")).unwrap();
-    fs::remove_file(dir.path().join("000002.log")).unwrap();
+    storage.remove_file("000000.summary").unwrap();
+    storage.remove_file("000002.summary").unwrap();
+    storage.remove_file("000001.log").unwrap();
+    storage.remove_file("000002.log").unwrap();
 
-    assert!(!dir.path().join("000000.summary").exists());
-    assert!(!dir.path().join("000002.summary").exists());
-    assert!(!dir.path().join("000001.log").exists());
-    assert!(!dir.path().join("000002.log").exists());
-    assert!(dir.path().join("000003.summary").exists());
+    assert!(!storage.exists("000000.summary"));
+    assert!(!storage.exists("000002.summary"));
+    assert!(!storage.exists("000001.log"));
+    assert!(!storage.exists("000002.log"));
+    assert!(storage.exists("000003.summary"));
 
     // =========================================================================
     // Scenario 1: Mount R/O with Latest state
@@ -1454,12 +1430,10 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         volume_key.clone(),
     )
     .unwrap();
-    fs_latest.set_log_dir(dir.path());
     fs_latest.set_read_only(true);
 
     // Attach remote tiered storage support
-    let cache_dir = dir.path().join(".cache");
-    let block_cache = Arc::new(OnDiskBlockCache::new(&cache_dir, 50 * 1024 * 1024).unwrap());
+    let block_cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
     let log_cache = Arc::new(LogFileCache::with_remote_support(
         storage.clone(),
         Some(block_cache.clone()),
@@ -1485,7 +1459,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     // Scenario 2: Mount R/O with past timestamp target (generation 1)
     // =========================================================================
     // 000002.summary is STILL missing locally
-    assert!(!dir.path().join("000002.summary").exists());
+    assert!(!storage.exists("000002.summary"));
 
     // prepare_remote_recovery_for_target uses 000003.summary's manifest to discover
     // that generation 2 (which sealed gen 1) is the appropriate snapshot for post_gen1_time,
@@ -1499,8 +1473,8 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     .unwrap();
     assert_eq!(chosen_past, Some("000002.summary".to_string()));
 
-    // Verify 000002.summary was indeed downloaded from remote to local disk!
-    assert!(dir.path().join("000002.summary").exists());
+    // Verify 000002.summary was indeed downloaded from remote to local storage!
+    assert!(storage.exists("000002.summary"));
 
     // Fast-recover with Timestamp(post_gen1_time)
     let mut fs_past = appendfs::recover_fs(
@@ -1510,7 +1484,6 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         volume_key.clone(),
     )
     .unwrap();
-    fs_past.set_log_dir(dir.path());
     fs_past.set_read_only(true);
 
     let log_cache_past = Arc::new(LogFileCache::with_remote_support(
@@ -1539,8 +1512,8 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     // Scenario 3: Mount R/O with target generation 2
     // =========================================================================
     // Delete 000002.summary again
-    fs::remove_file(dir.path().join("000002.summary")).unwrap();
-    assert!(!dir.path().join("000002.summary").exists());
+    storage.remove_file("000002.summary").unwrap();
+    assert!(!storage.exists("000002.summary"));
 
     let chosen_gen2 = appendfs::prepare_remote_recovery_for_target(
         storage.as_ref(),
@@ -1550,7 +1523,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     )
     .unwrap();
     assert_eq!(chosen_gen2, Some("000002.summary".to_string()));
-    assert!(dir.path().join("000002.summary").exists());
+    assert!(storage.exists("000002.summary"));
 
     let mut fs_gen2 = appendfs::recover_fs(
         storage.clone(),
@@ -1559,7 +1532,6 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
         volume_key.clone(),
     )
     .unwrap();
-    fs_gen2.set_log_dir(dir.path());
     fs_gen2.set_read_only(true);
     let log_cache_gen2 = Arc::new(LogFileCache::with_remote_support(
         storage.clone(),
@@ -1577,8 +1549,7 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
 
 #[test]
 fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
-    let dir = TempDir::new().unwrap();
-    let storage = Arc::new(OsStorage::new(dir.path()));
+    let storage = Arc::new(MemoryStorage::new());
     let start_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let clock = Arc::new(appendfs::clock::AdvancingClock::new(start_time));
     let volume_key = VolumeKey::plaintext_arc();
@@ -1596,7 +1567,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
 
     let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
     fs.log_writer = Some(writer.clone());
-    fs.set_log_dir(dir.path());
+    fs.log_cache = Some(Arc::new(LogFileCache::with_storage(storage.clone())));
     let fs_arc = Arc::new(fs);
 
     // Create 3 sealed log generations
@@ -1642,7 +1613,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
         &mut last_audit,
@@ -1706,9 +1677,9 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     }
 
     // Ensure all 3 local log files exist before pruning
-    assert!(dir.path().join("000001.log").exists());
-    assert!(dir.path().join("000002.log").exists());
-    assert!(dir.path().join("000003.log").exists());
+    assert!(storage.exists("000001.log"));
+    assert!(storage.exists("000002.log"));
+    assert!(storage.exists("000003.log"));
 
     counting_store.metrics().reset();
 
@@ -1716,7 +1687,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
         &mut last_audit,
@@ -1727,9 +1698,9 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     .unwrap();
 
     // All 3 local logs must be pruned
-    assert!(!dir.path().join("000001.log").exists(), "000001.log must be pruned");
-    assert!(!dir.path().join("000002.log").exists(), "000002.log must be pruned");
-    assert!(!dir.path().join("000003.log").exists(), "000003.log must be pruned");
+    assert!(!storage.exists("000001.log"), "000001.log must be pruned");
+    assert!(!storage.exists("000002.log"), "000002.log must be pruned");
+    assert!(!storage.exists("000003.log"), "000003.log must be pruned");
 
     // Quorum MD5 verification must have used 1 list_objects and 0 head_object calls!
     assert_eq!(
@@ -1764,7 +1735,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         reg.set_store_override("counting", failing_counting.clone());
     }
 
-    assert!(dir.path().join("000004.log").exists());
+    assert!(storage.exists("000004.log"));
     failing_counting.metrics().reset();
 
     // First cycle with list_objects failing:
@@ -1773,7 +1744,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
         &mut last_audit,
@@ -1785,7 +1756,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
 
     // 000004.log must NOT be pruned because listing failed on the remote
     assert!(
-        dir.path().join("000004.log").exists(),
+        storage.exists("000004.log"),
         "000004.log must NOT be pruned when remote listing fails"
     );
 
@@ -1796,7 +1767,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
         &mut last_audit,
@@ -1807,7 +1778,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     .unwrap();
 
     assert!(
-        dir.path().join("000004.log").exists(),
+        storage.exists("000004.log"),
         "000004.log must still NOT be pruned when listing continues to fail"
     );
     assert_eq!(failing_counting.lists(), 1, "Attempted 1 list_objects call");
@@ -1824,7 +1795,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
-        dir.path(),
+        Path::new("/unused"),
         &mut last_part_sync,
         &mut uploaded_parts,
         &mut last_audit,
@@ -1836,7 +1807,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
 
     // 000004.log should now be cleanly pruned via batch listing
     assert!(
-        !dir.path().join("000004.log").exists(),
+        !storage.exists("000004.log"),
         "000004.log must be pruned once remote listing succeeds"
     );
     assert_eq!(

@@ -413,8 +413,7 @@ mod tests {
 
     #[test]
     fn test_exists_below_live_sees_a_tombstone_frozen_out_of_live() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(
@@ -452,8 +451,7 @@ mod tests {
 
     #[test]
     fn test_attr_update_does_not_resurrect_a_tombstoned_inode() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(

@@ -279,7 +279,81 @@ fn lock_worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
 //   - no inode exists in `fs.inodes` that isn't reachable from root (no leaks, and no
 //     cycles disconnected from root - a cycle's members would all show up here as
 //     simultaneously present-but-unreachable)
-fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64) {
+fn preserve_storage_for_repro(storage: &dyn Storage, seed: u64) {
+    let preserved = std::path::PathBuf::from(format!("/tmp/appendfs_repro_seed_{}", seed));
+    let _ = std::fs::remove_dir_all(&preserved);
+    let _ = std::fs::create_dir_all(&preserved);
+    for filename in storage.list_files().unwrap_or_default() {
+        if let Ok(bytes) = storage
+            .open_reader(&filename)
+            .and_then(|r| r.read_vec(0, r.len().unwrap_or(0) as usize))
+        {
+            let _ = std::fs::write(preserved.join(&filename), bytes);
+        }
+    }
+    eprintln!("  preserved log dir at {:?}", preserved);
+}
+
+// Passive diagnostic used only from a failure branch: scans every `.log` file in
+// `storage` in generation order and prints every record touching `ino`, either as the
+// record header's primary inode or (for Rename/Link) as a parent/dest reference, so a
+// divergence at `ino` can be traced back to exactly which ops the log ever saw for it.
+fn dump_log_records_for_inode(storage: &dyn Storage, ino: u64) {
+    let mut log_files: Vec<String> = storage
+        .list_files()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.ends_with(".log"))
+        .collect();
+    log_files.sort();
+    for filename in log_files {
+        let reader = match LogReader::open(storage, &filename, appendfs::VolumeKey::plaintext_arc()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("    (failed to open {:?}: {})", filename, e);
+                continue;
+            }
+        };
+        for rec in reader {
+            let rec = match rec {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("    (read error in {:?}: {})", filename, e);
+                    continue;
+                }
+            };
+            let decoded = rec.decode().ok();
+            let mentions = rec.header.inode == ino
+                || match &decoded {
+                    Some(DecodedPayload::InodeDelta(appendfs::log::LogEntryDelta::Node(
+                        appendfs::log::LogNodeDelta::Directory(d),
+                    ))) => d.added.iter().any(|(_, target_ino)| *target_ino == ino),
+                    _ => false,
+                };
+            if mentions {
+                eprintln!(
+                    "    {:?} tx={} inode={} offset={} payload={:?}",
+                    rec.header.op_code, rec.header.tx_id, rec.header.inode, rec.record_log_offset, decoded
+                );
+            }
+        }
+    }
+}
+
+// Traverses the live tree from root using only the public `*_core` query functions real VFS
+// uses (never touching `fs.inodes` directly beyond a final orphan-count check), and
+// asserts filesystem-wide invariants that must hold once all threads have quiesced:
+//   - every reachable entry resolves (no dangling directory entries)
+//   - every directory has nlink == 2 (this FS doesn't do POSIX subdir-nlink accounting,
+//     so this is the invariant that actually holds - see mkdir_core/rmdir_core)
+//   - every directory is reachable from exactly one parent (directories can't be
+//     hardlinked - link_core rejects them with EPERM)
+//   - every file/symlink's reported nlink matches the number of directory entries in
+//     the final tree that actually point at it
+//   - no inode exists in `fs.inodes` that isn't reachable from root (no leaks, and no
+//     cycles disconnected from root - a cycle's members would all show up here as
+//     simultaneously present-but-unreachable)
+fn verify_tree_invariants(fs: &InMemoryFS, storage: &dyn Storage, seed: u64) {
     let mut visited: HashSet<u64> = HashSet::new();
     let mut queue: VecDeque<u64> = VecDeque::new();
     visited.insert(1);
@@ -300,18 +374,9 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
                                 "dangling entry {:?} -> inode {} in dir {}: getattr failed: {}",
                                 name, child_ino, ino, e
                             );
-                            dump_log_records_for_inode(log_dir, child_ino);
-                            dump_log_records_for_inode(log_dir, ino);
-                            let preserved = std::path::PathBuf::from(format!("/tmp/appendfs_repro_seed_{}", seed));
-                            let _ = std::fs::remove_dir_all(&preserved);
-                            std::fs::create_dir_all(&preserved).unwrap();
-                            for entry in std::fs::read_dir(log_dir).unwrap() {
-                                let entry = entry.unwrap();
-                                if entry.path().is_file() {
-                                    std::fs::copy(entry.path(), preserved.join(entry.file_name())).unwrap();
-                                }
-                            }
-                            eprintln!("  preserved log dir at {:?}", preserved);
+                            dump_log_records_for_inode(storage, child_ino);
+                            dump_log_records_for_inode(storage, ino);
+                            preserve_storage_for_repro(storage, seed);
                             panic!(
                                 "dangling entry {:?} -> inode {} in dir {}: getattr failed: {}",
                                 name, child_ino, ino, e
@@ -359,17 +424,8 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
                 "nlink mismatch (seed {}) at inode {}: attr={:?} counted_entries={}",
                 seed, ino, attr, count
             );
-            dump_log_records_for_inode(log_dir, *ino);
-            let preserved = std::path::PathBuf::from(format!("/tmp/appendfs_repro_seed_{}", seed));
-            let _ = std::fs::remove_dir_all(&preserved);
-            std::fs::create_dir_all(&preserved).unwrap();
-            for entry in std::fs::read_dir(log_dir).unwrap() {
-                let entry = entry.unwrap();
-                if entry.path().is_file() {
-                    std::fs::copy(entry.path(), preserved.join(entry.file_name())).unwrap();
-                }
-            }
-            eprintln!("  preserved log dir at {:?}", preserved);
+            dump_log_records_for_inode(storage, *ino);
+            preserve_storage_for_repro(storage, seed);
         }
         assert_eq!(
             attr.nlink, *count,
@@ -402,18 +458,9 @@ fn verify_tree_invariants(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64)
                 }
             }
             eprintln!("  referenced by: {:?}", referrers);
-            dump_log_records_for_inode(log_dir, *ino);
+            dump_log_records_for_inode(storage, *ino);
         }
-        let preserved = std::path::PathBuf::from(format!("/tmp/appendfs_repro_seed_{}", seed));
-        let _ = std::fs::remove_dir_all(&preserved);
-        std::fs::create_dir_all(&preserved).unwrap();
-        for entry in std::fs::read_dir(log_dir).unwrap() {
-            let entry = entry.unwrap();
-            if entry.path().is_file() {
-                std::fs::copy(entry.path(), preserved.join(entry.file_name())).unwrap();
-            }
-        }
-        eprintln!("  preserved log dir at {:?}", preserved);
+        preserve_storage_for_repro(storage, seed);
     }
     assert_eq!(
         visited.len(),
@@ -445,7 +492,7 @@ fn normalize_for_compare(ino: u64, mut node: Node) -> Node {
     node
 }
 
-use appendfs::storage::{OsStorage, Storage};
+use appendfs::storage::{MemoryStorage, OsStorage, Storage};
 
 // After the concurrent stress run, replaying the log from scratch must reproduce
 // byte-for-byte the same filesystem state that's live in memory. This is the property
@@ -455,25 +502,28 @@ use appendfs::storage::{OsStorage, Storage};
 // interleaving between threads can produce a live state the log can't reconstruct.
 // Mirrors tests/fuzz_test.rs's test_summary_export_is_deterministic, but against this
 // test's genuinely concurrent log instead of a single-threaded one.
-fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, seed: u64) {
+fn verify_log_replay_matches_live(fs: &InMemoryFS, storage: Arc<dyn Storage>, seed: u64) {
     let _generation = fs.log_writer.as_ref().unwrap().generation();
-    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_dir));
     let written_file = fs
         .export_summary(storage.as_ref())
         .unwrap_or_else(|e| panic!("export_summary failed on the live instance (seed {}): {}", seed, e));
 
-    // Reprocess: copy only the raw .log files into a fresh directory (excluding the
+    // Reprocess: copy only the raw .log files into a fresh in-memory storage (excluding the
     // .summary file just written), so recover_fs has no fast-path available and is
     // forced to fully replay from generation 1.
-    let replay_dir = tempfile::tempdir().unwrap();
-    for entry in std::fs::read_dir(log_dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("log") {
-            std::fs::copy(&path, replay_dir.path().join(entry.file_name())).unwrap();
+    let replay_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    for filename in storage.list_files().unwrap() {
+        if filename.ends_with(".log") {
+            let reader = storage.open_reader(&filename).unwrap();
+            let len = reader.len().unwrap() as usize;
+            let buf = reader.read_vec(0, len).unwrap();
+            let mut writer = replay_storage
+                .open_writer(&filename, appendfs::storage::WriteMode::CreateNew)
+                .unwrap();
+            writer.append(&buf).unwrap();
+            writer.sync().unwrap();
         }
     }
-    let replay_storage: Arc<dyn Storage> = Arc::new(OsStorage::new(replay_dir.path()));
     let mut replayed = recover_fs(
         replay_storage.clone(),
         appendfs::RecoveryTarget::Latest,
@@ -530,16 +580,9 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
             } else {
                 eprintln!("  replayed node {}: <absent>", ino);
             }
-            dump_log_records_for_inode(log_dir, *ino);
+            dump_log_records_for_inode(storage.as_ref(), *ino);
         }
-        let preserved = std::path::PathBuf::from(format!("/tmp/appendfs_repro_seed_{}", seed));
-        let _ = std::fs::remove_dir_all(&preserved);
-        std::fs::create_dir_all(&preserved).unwrap();
-        for entry in std::fs::read_dir(log_dir).unwrap() {
-            let entry = entry.unwrap();
-            std::fs::copy(entry.path(), preserved.join(entry.file_name())).unwrap();
-        }
-        eprintln!("  preserved log dir at {:?}", preserved);
+        preserve_storage_for_repro(storage.as_ref(), seed);
     }
     assert_eq!(
         written_keys, regenerated_keys,
@@ -556,15 +599,8 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
             eprintln!("content divergence (seed {}) at inode {}:", seed, ino);
             eprintln!("  live:     {:?}", live_node);
             eprintln!("  replayed: {:?}", replayed_node);
-            dump_log_records_for_inode(log_dir, ino);
-            let preserved = std::path::PathBuf::from(format!("/tmp/appendfs_repro_seed_{}", seed));
-            let _ = std::fs::remove_dir_all(&preserved);
-            std::fs::create_dir_all(&preserved).unwrap();
-            for entry in std::fs::read_dir(log_dir).unwrap() {
-                let entry = entry.unwrap();
-                std::fs::copy(entry.path(), preserved.join(entry.file_name())).unwrap();
-            }
-            eprintln!("  preserved log dir at {:?}", preserved);
+            dump_log_records_for_inode(storage.as_ref(), ino);
+            preserve_storage_for_repro(storage.as_ref(), seed);
         }
         assert_eq!(
             live_bytes, replayed_bytes,
@@ -573,55 +609,6 @@ fn verify_log_replay_matches_live(fs: &InMemoryFS, log_dir: &std::path::Path, se
              actually landed in memory",
             ino, seed
         );
-    }
-}
-
-// Passive diagnostic used only from a failure branch: scans every `.log` file in
-// `log_dir` in generation order and prints every record touching `ino`, either as the
-// record header's primary inode or (for Rename/Link) as a parent/dest reference, so a
-// divergence at `ino` can be traced back to exactly which ops the log ever saw for it.
-fn dump_log_records_for_inode(log_dir: &std::path::Path, ino: u64) {
-    let mut log_files: Vec<std::path::PathBuf> = std::fs::read_dir(log_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("log"))
-        .collect();
-    log_files.sort();
-    for path in log_files {
-        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let storage = OsStorage::new(parent);
-        let reader = match LogReader::open(&storage, filename, appendfs::VolumeKey::plaintext_arc()) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("    (failed to open {:?}: {})", path, e);
-                continue;
-            }
-        };
-        for rec in reader {
-            let rec = match rec {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("    (read error in {:?}: {})", path, e);
-                    continue;
-                }
-            };
-            let decoded = rec.decode().ok();
-            let mentions = rec.header.inode == ino
-                || match &decoded {
-                    Some(DecodedPayload::InodeDelta(appendfs::log::LogEntryDelta::Node(
-                        appendfs::log::LogNodeDelta::Directory(d),
-                    ))) => d.added.iter().any(|(_, target_ino)| *target_ino == ino),
-                    _ => false,
-                };
-            if mentions {
-                eprintln!(
-                    "    {:?} tx={} inode={} offset={} payload={:?}",
-                    rec.header.op_code, rec.header.tx_id, rec.header.inode, rec.record_log_offset, decoded
-                );
-            }
-        }
     }
 }
 
@@ -656,13 +643,11 @@ fn dump_preserved_repro() {
 }
 
 fn run_concurrent_stress(seed: u64) {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let log_dir = temp_dir.path().to_path_buf();
-    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_dir));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let writer = Arc::new(
         LogWriter::create(
-            storage,
+            storage.clone(),
             1,
             &*clock,
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
@@ -672,6 +657,7 @@ fn run_concurrent_stress(seed: u64) {
         .unwrap(),
     );
     let mut fs = InMemoryFS::with_clock_and_log(Arc::clone(&clock), Some(Arc::clone(&writer)));
+    fs.set_storage(storage.clone());
     // Reads bump atime in memory but are never logged (logging every read would defeat
     // the point of an append-only log), so with atime tracking on, a live instance and
     // its log replay would legitimately differ on atime alone - disabling it here keeps
@@ -756,8 +742,8 @@ fn run_concurrent_stress(seed: u64) {
         seed
     );
 
-    verify_tree_invariants(&fs, &log_dir, seed);
-    verify_log_replay_matches_live(&fs, &log_dir, seed);
+    verify_tree_invariants(&fs, storage.as_ref(), seed);
+    verify_log_replay_matches_live(&fs, storage.clone(), seed);
 
     assert!(
         fs.dir_handles.read().unwrap().is_empty(),

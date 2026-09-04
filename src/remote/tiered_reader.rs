@@ -220,14 +220,13 @@ impl StorageReader for TieredStorageReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::block_cache::OnDiskBlockCache;
+    use crate::remote::block_cache::MemoryBlockCache;
     use crate::remote::mock::MockRemoteStore;
     use crate::remote::{CountingRemoteStore, RemoteStore};
 
     #[test]
     fn test_tiered_reader_with_block_cache_and_failover() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(OnDiskBlockCache::new(dir.path(), 50 * 1024 * 1024).unwrap());
+        let cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
 
         let remote1 = Arc::new(MockRemoteStore::new());
         let remote2 = Arc::new(MockRemoteStore::new());
@@ -249,7 +248,7 @@ mod tests {
         reader.read_exact_at(500, &mut slice).unwrap();
         assert_eq!(slice, [0x42u8; 100]);
 
-        // Block 0 is now cached on disk
+        // Block 0 is now cached
         assert!(cache.read_block(1, 0).unwrap().is_some());
         assert!(cache.read_block(1, 1).unwrap().is_none());
 
@@ -267,8 +266,7 @@ mod tests {
     fn test_tiered_reader_with_local_storage_tier0() {
         use crate::storage::{MemoryStorage, WriteMode};
 
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(OnDiskBlockCache::new(dir.path(), 50 * 1024 * 1024).unwrap());
+        let cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
 
         let memory_storage = Arc::new(MemoryStorage::new());
         let payload = vec![0x99u8; 1024 * 1024]; // 1 MiB block
@@ -296,7 +294,7 @@ mod tests {
         reader.read_exact_at(128, &mut slice).unwrap();
         assert_eq!(slice, [0x99u8; 64]);
 
-        // Block 0 MUST now be pre-warmed in on-disk block cache!
+        // Block 0 MUST now be pre-warmed in block cache!
         assert!(cache.read_block(1, 0).unwrap().is_some());
 
         // Now drop/truncate the local file to simulate local log purging!
@@ -311,8 +309,7 @@ mod tests {
 
     #[test]
     fn test_tiered_reader_equal_priority_deterministic_distribution() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(OnDiskBlockCache::new(dir.path(), 50 * 1024 * 1024).unwrap());
+        let cache = Arc::new(MemoryBlockCache::new(50 * 1024 * 1024));
 
         let store_a = Arc::new(MockRemoteStore::new());
         let store_b = Arc::new(MockRemoteStore::new());

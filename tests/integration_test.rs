@@ -1,6 +1,6 @@
 mod common;
 use appendfs::Clock;
-use appendfs::storage::{OsStorage, Storage};
+use appendfs::storage::{MemoryStorage, OsStorage, Storage};
 use common::TestMount;
 use std::fs;
 use std::io::Write;
@@ -2189,8 +2189,7 @@ fn test_fallocate_punch_hole_zero_range_and_recovery() {
 /// like from here, since older bytes remain a valid encoding of different values.
 #[test]
 fn test_recovery_refuses_a_volume_with_no_readable_summary() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+    let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
     appendfs::init_volume(
         storage.clone(),
         &appendfs::VolumeKey::plaintext(),
@@ -2202,8 +2201,8 @@ fn test_recovery_refuses_a_volume_with_no_readable_summary() {
     // than a corrupted field because it fails the same way regardless of which fields a
     // given build validates - the guard under test is about there being no readable summary,
     // not about why any particular one failed.
-    let path = dir.path().join("000000.summary");
-    std::fs::write(&path, &std::fs::read(&path).unwrap()[..16]).unwrap();
+    let bytes = storage.get_file_bytes("000000.summary").unwrap();
+    storage.insert_file("000000.summary", bytes[..16].to_vec());
 
     let Err(err) = appendfs::recover_fs(
         storage.clone(),
@@ -2221,8 +2220,7 @@ fn test_recovery_refuses_a_volume_with_no_readable_summary() {
 
     // A volume with no summaries at all is a different case and must still work: there is
     // nothing to contradict, so recovery legitimately starts from empty.
-    let fresh = tempfile::tempdir().unwrap();
-    let fresh_storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(fresh.path()));
+    let fresh_storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
     assert!(
         appendfs::recover_fs(
             fresh_storage,
@@ -2237,8 +2235,7 @@ fn test_recovery_refuses_a_volume_with_no_readable_summary() {
 
 #[test]
 fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
-    let dir = tempfile::tempdir().unwrap();
-    let log_path = dir.path();
+    let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
     let master_key = appendfs::crypto::MasterKey::new([0x42u8; 32]);
 
     // 1. Initialize encrypted volume
@@ -2249,14 +2246,8 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
         appendfs::compress::Compression::None,
     )
     .unwrap();
-    appendfs::log::init_volume(
-        std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path)),
-        &volume_key,
-        volume_header,
-    )
-    .unwrap();
+    appendfs::log::init_volume(storage.clone(), &volume_key, volume_header).unwrap();
 
-    let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
     let unlocked_arc = std::sync::Arc::new(volume_key);
 
     // 2. Open writer and append sensitive data
@@ -2280,7 +2271,6 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
             .unwrap(),
         );
         fs.log_writer = Some(writer);
-        fs.set_log_dir(log_path);
 
         let file_attr =
             appendfs::operations::read_write::create_core(&fs, 1, "confidential.txt", 0o600, 0, 1000, 1000).unwrap();
@@ -2292,7 +2282,7 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
     }
 
     // 3. Raw Disk Inspection: Verify zero plaintext leaks on disk!
-    let raw_log = std::fs::read(log_path.join("000001.log")).unwrap();
+    let raw_log = storage.get_file_bytes("000001.log").unwrap();
     let secret = b"TOP_SECRET_CREDENTIALS_AND_PAYLOAD_987654321";
     let filename = b"confidential.txt";
     assert!(
@@ -2304,7 +2294,7 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
         "Plaintext metadata/filename leaked into raw log file!"
     );
 
-    let raw_summary = std::fs::read(log_path.join("000001.summary")).unwrap();
+    let raw_summary = storage.get_file_bytes("000001.summary").unwrap();
     assert!(
         !raw_summary.windows(secret.len()).any(|w| w == secret),
         "Plaintext data leaked into raw summary snapshot!"
@@ -2358,8 +2348,6 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
 /// than guarded.)
 #[test]
 fn test_tampered_record_header_is_rejected_not_served() {
-    let dir = tempfile::tempdir().unwrap();
-    let log_path = dir.path();
     let master_key = appendfs::crypto::MasterKey::new([0x7Eu8; 32]);
     let secret = b"PLAINTEXT_THAT_MUST_NEVER_BE_SERVED";
 
@@ -2370,7 +2358,7 @@ fn test_tampered_record_header_is_rejected_not_served() {
         appendfs::compress::Compression::None,
     )
     .unwrap();
-    let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
+    let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
     appendfs::log::init_volume(storage.clone(), &volume_key, volume_header).unwrap();
 
     let volume_key = std::sync::Arc::new(volume_key);
@@ -2393,7 +2381,6 @@ fn test_tampered_record_header_is_rejected_not_served() {
             .unwrap(),
         );
         fs.log_writer = Some(writer);
-        fs.set_log_dir(log_path);
 
         let attr = appendfs::operations::read_write::create_core(&fs, 1, "secret.txt", 0o600, 0, 1000, 1000).unwrap();
         appendfs::operations::read_write::write_core(&fs, attr.ino, secret, 0).unwrap();
@@ -2416,8 +2403,7 @@ fn test_tampered_record_header_is_rejected_not_served() {
 
     // Flip a bit in every record header's `inode` field, simulating an attacker with write
     // access but no key. Layout is op_code(1) tx_id(8) inode(8) payload_len(4) checksum(4).
-    let log_file = log_path.join("000001.log");
-    let mut bytes = std::fs::read(&log_file).unwrap();
+    let mut bytes = storage.get_file_bytes("000001.log").unwrap();
     let header_size = appendfs::log::record::RECORD_HEADER_SIZE;
     let mut off = appendfs::log::record::FILE_HEADER_SIZE;
     let mut tampered = 0;
@@ -2428,7 +2414,7 @@ fn test_tampered_record_header_is_rejected_not_served() {
         off += header_size + payload_len;
     }
     assert!(tampered > 0, "expected records to tamper with");
-    std::fs::write(&log_file, &bytes).unwrap();
+    storage.insert_file("000001.log", bytes);
 
     // Whether it surfaces during replay or at read time, the one outcome that must never
     // happen is the secret being returned as though nothing were wrong.
@@ -2467,8 +2453,7 @@ fn test_key_source_round_trips_through_the_volume_header() {
         (KeySource::KeyFile, true, false),
         (KeySource::KeyFileAndPassphrase, true, true),
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+        let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
         let master = appendfs::crypto::MasterKey::new([0x5Cu8; 32]);
 
         let (header, key) = appendfs::crypto::VolumeHeader::new_encrypted(
@@ -2492,8 +2477,7 @@ fn test_key_source_round_trips_through_the_volume_header() {
     }
 
     // A plaintext volume reports no credential at all.
-    let dir = tempfile::tempdir().unwrap();
-    let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+    let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
     appendfs::init_volume(
         storage.clone(),
         &appendfs::VolumeKey::plaintext(),
@@ -2533,14 +2517,13 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
 
     /// Rewrites `000000.summary` via `edit`, restoring the whole-file checksum so the edit
     /// gets past the bitrot check and reaches the code under test.
-    fn tamper(dir: &std::path::Path, edit: impl FnOnce(&mut Vec<u8>)) {
-        let path = dir.join("000000.summary");
-        let mut bytes = std::fs::read(&path).unwrap();
+    fn tamper(storage: &appendfs::storage::MemoryStorage, edit: impl FnOnce(&mut Vec<u8>)) {
+        let mut bytes = storage.get_file_bytes("000000.summary").unwrap();
         edit(&mut bytes);
         let n = bytes.len();
         let digest = blake3::hash(&bytes[..n - 60]);
         bytes[n - 32..].copy_from_slice(digest.as_bytes());
-        std::fs::write(&path, &bytes).unwrap();
+        storage.insert_file("000000.summary", bytes);
     }
 
     for (name, edit) in [
@@ -2572,8 +2555,7 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
             }),
         ),
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+        let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
         let master = MasterKey::new([0x33u8; 32]);
         let (header, key) = VolumeHeader::new_encrypted(
             &master,
@@ -2584,7 +2566,7 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
         .unwrap();
         appendfs::log::init_volume(storage.clone(), &key, header).unwrap();
 
-        tamper(dir.path(), edit);
+        tamper(&storage, edit);
 
         let opened = appendfs::log::SummaryReader::open(storage.as_ref(), "000000.summary", std::sync::Arc::new(key));
         assert!(opened.is_err(), "{}: forged summary opened successfully", name);
@@ -2600,9 +2582,8 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
 fn test_export_refuses_a_mismatched_header_and_key() {
     use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
 
-    let dir = tempfile::tempdir().unwrap();
     let storage: std::sync::Arc<dyn appendfs::storage::Storage> =
-        std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
+        std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
     let master = MasterKey::new([0x55u8; 32]);
     let (_header, key) = VolumeHeader::new_encrypted(
         &master,
@@ -2650,9 +2631,7 @@ fn test_compressed_volume_round_trips_and_saves_space() {
 
     let mut sizes = Vec::new();
     for compression in [Compression::None, Compression::Zstd] {
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path();
-        let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
+        let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
         let master = MasterKey::new([0x6Bu8; 32]);
         let (header, key) =
             VolumeHeader::new_encrypted(&master, [0x77u8; 16], KeySource::KeyFile, compression).unwrap();
@@ -2679,7 +2658,6 @@ fn test_compressed_volume_round_trips_and_saves_space() {
                 .with_compression(compression),
             );
             fs.log_writer = Some(writer);
-            fs.set_log_dir(log_path);
 
             let attr = appendfs::operations::read_write::create_core(&fs, 1, "text.log", 0o644, 0, 1000, 1000).unwrap();
             appendfs::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
@@ -2708,7 +2686,7 @@ fn test_compressed_volume_round_trips_and_saves_space() {
             compression
         );
 
-        sizes.push(std::fs::metadata(log_path.join("000001.log")).unwrap().len());
+        sizes.push(storage.get_file_bytes("000001.log").unwrap().len() as u64);
     }
 
     let (uncompressed, compressed) = (sizes[0], sizes[1]);
@@ -2733,9 +2711,7 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
     use appendfs::crypto::{KeySource, MasterKey, VolumeHeader};
 
     for compression in [Compression::None, Compression::Zstd] {
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path();
-        let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
+        let storage = std::sync::Arc::new(appendfs::storage::MemoryStorage::new());
         let master = MasterKey::new([0x31u8; 32]);
         let (header, key) =
             VolumeHeader::new_encrypted(&master, [0x32u8; 16], KeySource::KeyFile, compression).unwrap();
@@ -2765,7 +2741,6 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
                 .with_compression(compression),
             );
             fs.log_writer = Some(writer);
-            fs.set_log_dir(log_path);
             let attr = appendfs::operations::read_write::create_core(&fs, 1, "big.txt", 0o644, 0, 1000, 1000).unwrap();
             appendfs::operations::read_write::write_core(&fs, attr.ino, &payload, 0).unwrap();
             fs.sync_log().unwrap();
@@ -2783,10 +2758,9 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
 
         // The check must still catch a genuinely truncated log rather than having been
         // loosened into uselessness.
-        let log_file = log_path.join("000001.log");
-        let len = std::fs::metadata(&log_file).unwrap().len();
-        let bytes = std::fs::read(&log_file).unwrap();
-        std::fs::write(&log_file, &bytes[..(len / 2) as usize]).unwrap();
+        let bytes = storage.get_file_bytes("000001.log").unwrap();
+        let len = bytes.len();
+        storage.insert_file("000001.log", bytes[..len / 2].to_vec());
 
         let truncated = appendfs::check_volume(storage, true, key).unwrap();
         assert!(
@@ -2799,9 +2773,7 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
 
 #[test]
 fn test_periodic_summary_generation_on_log_rolls() {
-    let dir = tempfile::tempdir().unwrap();
-    let log_path = dir.path();
-    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let key = Arc::new(appendfs::crypto::VolumeKey::plaintext());
 
     // 1. Initialize empty volume (creates 000000.summary)
@@ -2838,7 +2810,6 @@ fn test_periodic_summary_generation_on_log_rolls() {
         );
 
         fs.log_writer = Some(writer);
-        fs.set_log_dir(log_path);
         // Configure to emit summary every 2 rolled generations (and 0 byte trigger)
         fs.set_summary_intervals(0, 2);
 
@@ -2912,9 +2883,7 @@ fn test_periodic_summary_generation_on_log_rolls() {
 
 #[test]
 fn test_periodic_summary_generation_by_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let log_path = dir.path();
-    let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(log_path));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let key = Arc::new(appendfs::crypto::VolumeKey::plaintext());
 
     appendfs::init_volume(
@@ -2937,7 +2906,6 @@ fn test_periodic_summary_generation_by_bytes() {
         let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1500, 0, key.clone()).unwrap());
 
         fs.log_writer = Some(writer);
-        fs.set_log_dir(log_path);
         // Byte threshold = 2500, generations threshold = 0 (disabled)
         fs.set_summary_intervals(2500, 0);
 

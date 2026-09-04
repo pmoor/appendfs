@@ -616,8 +616,7 @@ mod tests {
 
     #[test]
     fn test_flush_coalesces_micro_writes_into_single_base_range_entry() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = SystemClock;
         let writer = Arc::new(
             LogWriter::create(
@@ -706,8 +705,7 @@ mod tests {
         const TOTAL: usize = 8 * CAP + 300;
 
         for encrypted in [false, true] {
-            let temp_dir = tempfile::tempdir().unwrap();
-            let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+            let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
 
             let volume_key = if encrypted {
                 let master = crate::crypto::MasterKey::new([0x42u8; 32]);
@@ -822,8 +820,7 @@ mod tests {
     /// resurrect the punched bytes.
     #[test]
     fn test_punched_hole_masks_flushed_data_and_survives_recovery() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let writer = Arc::new(
             LogWriter::create(
                 Arc::clone(&storage),
@@ -910,8 +907,7 @@ mod tests {
     /// still sitting in `base` between the two cut points.
     #[test]
     fn test_successive_truncates_keep_masking_the_full_discarded_range() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(temp_dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let writer = Arc::new(
             LogWriter::create(
                 Arc::clone(&storage),
@@ -1043,8 +1039,7 @@ mod tests {
 
     #[test]
     fn test_generation_live_stats_and_manifest_lifecycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(
@@ -1121,8 +1116,7 @@ mod tests {
 
     #[test]
     fn test_rm_rf_directory_tree_emits_unlinks_for_all_children_and_recovers_cleanly() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(
@@ -1202,8 +1196,7 @@ mod tests {
 
     #[test]
     fn test_hardlink_survives_rm_rf_of_other_parent_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(
@@ -1278,8 +1271,7 @@ mod tests {
 
     #[test]
     fn test_mutation_threshold_triggers_automatic_flush() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(
@@ -1314,8 +1306,7 @@ mod tests {
 
     #[test]
     fn test_unlinked_open_file_does_not_resurrect_on_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(
@@ -1368,8 +1359,7 @@ mod tests {
 
     #[test]
     fn test_truncate_down_then_extend_across_flush_boundary() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(

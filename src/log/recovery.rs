@@ -318,13 +318,11 @@ mod tests {
     use super::*;
     use crate::clock::{AdvancingClock, SystemClock};
     use crate::log::LogWriter;
-    use crate::storage::OsStorage;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn test_recovery_to_specific_tx_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(OsStorage::new(dir.path()));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
             &VolumeKey::plaintext(),
@@ -412,8 +410,7 @@ mod tests {
 
     #[test]
     fn test_recovery_to_specific_timestamp() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(OsStorage::new(dir.path()));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
             &VolumeKey::plaintext(),

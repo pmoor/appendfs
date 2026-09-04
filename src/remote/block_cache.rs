@@ -312,6 +312,11 @@ impl MemoryBlockCache {
             coalescer,
         }
     }
+
+    /// Clears all cached blocks from memory.
+    pub fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
 }
 
 impl BlockCache for MemoryBlockCache {

@@ -842,8 +842,7 @@ mod tests {
 
     #[test]
     fn test_clean_filesystem_integrity_passes() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
             &VolumeKey::plaintext(),
@@ -893,8 +892,7 @@ mod tests {
 
     #[test]
     fn test_orphan_inode_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
             &VolumeKey::plaintext(),
@@ -920,7 +918,7 @@ mod tests {
         };
         fs.base.write().unwrap().insert(orphan_ino, Arc::new(orphan_node));
 
-        let report = check_fs_integrity(&fs, Some(dir.path()), false);
+        let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
         assert_eq!(report.orphaned_inodes, vec![999]);
         let orphan_issue = report.issues.iter().find(|i| i.code == "ORPHAN_INODE").unwrap();
@@ -929,8 +927,7 @@ mod tests {
 
     #[test]
     fn test_nlink_mismatch_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
             &VolumeKey::plaintext(),
@@ -948,7 +945,7 @@ mod tests {
         let clock = Arc::new(SystemClock);
         let writer = Arc::new(
             LogWriter::create(
-                storage,
+                storage.clone(),
                 1,
                 &*clock,
                 crate::cli::DEFAULT_MAX_LOG_SIZE,
@@ -958,7 +955,7 @@ mod tests {
             .unwrap(),
         );
         fs.log_writer = Some(writer);
-        fs.set_log_dir(dir.path());
+        fs.set_storage(storage);
 
         let f = crate::operations::read_write::create_core(&fs, 1, "test.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.sync_log().unwrap();
@@ -972,7 +969,7 @@ mod tests {
             *node_arc = Arc::new(node);
         }
 
-        let report = check_fs_integrity(&fs, Some(dir.path()), false);
+        let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
         let issue = report.issues.iter().find(|i| i.code == "NLINK_MISMATCH").unwrap();
         assert_eq!(issue.inode, Some(f.ino));
@@ -980,8 +977,7 @@ mod tests {
 
     #[test]
     fn test_extent_past_eof_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
             &VolumeKey::plaintext(),
@@ -1019,7 +1015,7 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, Some(dir.path()), false);
+        let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
         let issue = report.issues.iter().find(|i| i.code == "EXTENT_PAST_EOF").unwrap();
         assert_eq!(issue.inode, Some(2));
@@ -1027,8 +1023,7 @@ mod tests {
 
     #[test]
     fn test_directory_cycle_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
             &VolumeKey::plaintext(),
@@ -1072,7 +1067,7 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, Some(dir.path()), false);
+        let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
         let cycle_issue = report.issues.iter().find(|i| i.code == "DIR_CYCLE");
         assert!(cycle_issue.is_some(), "Must report DIR_CYCLE: {:?}", report.issues);
@@ -1080,8 +1075,7 @@ mod tests {
 
     #[test]
     fn test_dangling_entry_and_invalid_parent_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
         crate::init_volume(
             storage.clone(),
             &VolumeKey::plaintext(),
@@ -1119,7 +1113,7 @@ mod tests {
             *root_arc = Arc::new(root);
         }
 
-        let report = check_fs_integrity(&fs, Some(dir.path()), false);
+        let report = check_fs_integrity(&fs, None, false);
         assert!(!report.is_clean());
         assert!(report.issues.iter().any(|i| i.code == "DANGLING_ENTRY"));
         assert!(report.issues.iter().any(|i| i.code == "INVALID_PARENT"));

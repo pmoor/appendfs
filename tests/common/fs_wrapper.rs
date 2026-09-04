@@ -3,7 +3,7 @@ use appendfs::clock::{Clock, SystemClock};
 use appendfs::crypto::VolumeKey;
 use appendfs::log::recover_fs;
 use appendfs::shim::{FileAttr, FileType};
-use appendfs::storage::{FaultStorage, OsStorage, Storage};
+use appendfs::storage::{FaultStorage, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -37,20 +37,14 @@ pub enum SnapshotNode {
     },
 }
 
-/// Builds the active `LogWriter`, routing it through `fault` when this instance was
-/// created with fault injection so a test can fail its writes on demand.
+/// Builds the active `LogWriter` for the given storage.
 fn make_writer(
-    log_dir: &Path,
-    fault: Option<&Arc<FaultStorage>>,
+    storage: Arc<dyn Storage>,
     generation: u64,
     clock: &dyn Clock,
     max_log_size: u64,
     start_tx: u64,
 ) -> Arc<appendfs::LogWriter> {
-    let storage: Arc<dyn Storage> = match fault {
-        Some(f) => Arc::clone(f) as Arc<dyn Storage>,
-        None => Arc::new(OsStorage::new(log_dir)),
-    };
     Arc::new(
         appendfs::LogWriter::create(
             storage,
@@ -68,6 +62,7 @@ fn make_writer(
 pub struct TestFS {
     pub fs: InMemoryFS,
     pub log_dir: PathBuf,
+    pub storage: Arc<dyn Storage>,
     /// Present only for instances built by `new_temp_with_fault_injection`; the handle
     /// used to inject and clear log write failures. Survives remount/crash so faults can
     /// be injected repeatedly across a run.
@@ -97,12 +92,16 @@ impl TestFS {
     }
 
     fn new_temp_inner(max_log_size: Option<u64>, clock: Arc<dyn Clock>, inject_faults: bool) -> Self {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let log_dir = temp_dir.path().to_path_buf();
-        let fault = inject_faults.then(|| Arc::new(FaultStorage::new(Arc::new(OsStorage::new(&log_dir)))));
+        let mem_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let (storage, fault) = if inject_faults {
+            let f = Arc::new(FaultStorage::new(mem_storage));
+            (f.clone() as Arc<dyn Storage>, Some(f))
+        } else {
+            (mem_storage, None)
+        };
+        let log_dir = PathBuf::from("/memory");
         let writer = make_writer(
-            &log_dir,
-            fault.as_ref(),
+            storage.clone(),
             1,
             &*clock,
             max_log_size.unwrap_or(appendfs::cli::DEFAULT_MAX_LOG_SIZE),
@@ -110,15 +109,11 @@ impl TestFS {
         );
 
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
-        match fault.as_ref() {
-            Some(f) => fs.set_storage(Arc::clone(f) as Arc<dyn Storage>),
-            None => fs.set_log_dir(&log_dir),
-        }
+        fs.set_storage(storage.clone());
 
         // Export initial 000000.summary snapshot to initialize volume at clock.now()
         let snapshot = fs.snapshot_all();
         let manifest = fs.manifest.read().unwrap().clone();
-        let storage = fs.log_writer.as_ref().unwrap().storage();
         let _ = appendfs::log::export_summary(
             &appendfs::log::SummarySnapshot {
                 inodes: &snapshot,
@@ -136,8 +131,9 @@ impl TestFS {
         Self {
             fs,
             log_dir,
+            storage,
             fault,
-            _temp_dir: Some(Arc::new(temp_dir)),
+            _temp_dir: None,
             remotes: Vec::new(),
             latency_remotes: Vec::new(),
             memory_remotes: Vec::new(),
@@ -147,11 +143,10 @@ impl TestFS {
     }
 
     pub fn new_temp_with_remotes(max_log_size: Option<u64>, clock: Arc<dyn Clock>, num_remotes: usize) -> Self {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let log_dir = temp_dir.path().to_path_buf();
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let log_dir = PathBuf::from("/memory");
         let writer = make_writer(
-            &log_dir,
-            None,
+            storage.clone(),
             1,
             &*clock,
             max_log_size.unwrap_or(appendfs::cli::DEFAULT_MAX_LOG_SIZE),
@@ -159,12 +154,11 @@ impl TestFS {
         );
 
         let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
-        fs.set_log_dir(&log_dir);
+        fs.set_storage(storage.clone());
 
         // Export initial 000000.summary snapshot
         let snapshot = fs.snapshot_all();
         let manifest = fs.manifest.read().unwrap().clone();
-        let storage = fs.log_writer.as_ref().unwrap().storage();
         let _ = appendfs::log::export_summary(
             &appendfs::log::SummarySnapshot {
                 inodes: &snapshot,
@@ -228,8 +222,9 @@ impl TestFS {
         Self {
             fs,
             log_dir,
+            storage,
             fault: None,
-            _temp_dir: Some(Arc::new(temp_dir)),
+            _temp_dir: None,
             remotes: failing_remotes,
             latency_remotes,
             memory_remotes,
@@ -276,9 +271,15 @@ impl TestFS {
     }
 
     pub fn from_instance(fs: InMemoryFS, log_dir: &Path, temp_dir: Option<Arc<tempfile::TempDir>>) -> Self {
+        let storage = fs
+            .log_cache
+            .as_ref()
+            .map(|c| Arc::clone(c.storage()))
+            .unwrap_or_else(|| Arc::new(MemoryStorage::new()));
         Self {
             fs,
             log_dir: log_dir.to_path_buf(),
+            storage,
             fault: None,
             _temp_dir: temp_dir,
             remotes: Vec::new(),
@@ -513,6 +514,7 @@ impl TestFS {
     }
 
     pub fn clean_remount(self) -> Self {
+        let storage = self.storage.clone();
         let log_dir = self.log_dir.clone();
         let temp_dir = self._temp_dir.clone();
         let clock = self.fs.clock.clone();
@@ -520,12 +522,13 @@ impl TestFS {
         let max_extent_size = self.fs.max_extent_size;
         let _ = self.fs.sync_and_export_summary();
         drop(self);
-        let mut rec = Self::recover_into(&log_dir, temp_dir, clock, fault);
+        let mut rec = Self::recover_into(&log_dir, temp_dir, clock, fault, storage);
         rec.fs.max_extent_size = max_extent_size;
         rec
     }
 
     pub fn clean_remount_with_remotes(mut self) -> Self {
+        let storage = self.storage.clone();
         let log_dir = self.log_dir.clone();
         let temp_dir = self._temp_dir.clone();
         let clock = self.fs.clock.clone();
@@ -542,7 +545,6 @@ impl TestFS {
         self.fs.log_writer = None;
         drop(self);
 
-        let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_dir));
         let mut recovered = recover_fs(
             storage.clone(),
             appendfs::RecoveryTarget::Latest,
@@ -554,15 +556,14 @@ impl TestFS {
         let next_gen = recovered.manifest.read().unwrap().next_generation;
         let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
         let writer = make_writer(
-            &log_dir,
-            None,
+            storage.clone(),
             next_gen,
             &*clock,
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
             start_tx,
         );
         recovered.attach_log_writer(writer);
-        recovered.set_log_dir(&log_dir);
+        recovered.set_storage(storage.clone());
         recovered.max_extent_size = max_extent_size;
         recovered.next_inode.store(
             recovered.next_inode.load(Ordering::SeqCst).max(next_inode),
@@ -590,6 +591,7 @@ impl TestFS {
         Self {
             fs: recovered,
             log_dir,
+            storage,
             fault: None,
             _temp_dir: temp_dir,
             remotes,
@@ -601,6 +603,7 @@ impl TestFS {
     }
 
     pub fn unclean_crash(mut self) -> Self {
+        let storage = self.storage.clone();
         let log_dir = self.log_dir.clone();
         let temp_dir = self._temp_dir.clone();
         let clock = self.fs.clock.clone();
@@ -610,7 +613,7 @@ impl TestFS {
         let _ = self.fs.sync_log();
         self.fs.log_writer = None;
         drop(self);
-        let mut rec = Self::recover_into(&log_dir, temp_dir, clock, fault);
+        let mut rec = Self::recover_into(&log_dir, temp_dir, clock, fault, storage);
         rec.fs.max_extent_size = max_extent_size;
         rec.fs.next_inode.store(
             rec.fs.next_inode.load(Ordering::SeqCst).max(next_inode),
@@ -619,20 +622,15 @@ impl TestFS {
         rec
     }
 
-    /// Replays `log_dir` into a fresh instance and opens the next generation for writing.
-    /// Recovery itself always reads through the real OS filesystem - the log files on disk
-    /// are real either way - while `fault`, when present, is carried over so the new
-    /// instance can keep having its writes failed on demand.
+    /// Replays `storage` into a fresh instance and opens the next generation for writing.
+    /// `fault`, when present, is carried over so the new instance can keep having its writes failed on demand.
     fn recover_into(
         log_dir: &Path,
         temp_dir: Option<Arc<tempfile::TempDir>>,
         clock: Arc<dyn Clock>,
         fault: Option<Arc<FaultStorage>>,
+        storage: Arc<dyn Storage>,
     ) -> Self {
-        let storage: Arc<dyn Storage> = match fault.as_ref() {
-            Some(f) => Arc::clone(f) as Arc<dyn Storage>,
-            None => Arc::new(OsStorage::new(log_dir)),
-        };
         let mut recovered = recover_fs(
             storage.clone(),
             appendfs::RecoveryTarget::Latest,
@@ -643,21 +641,18 @@ impl TestFS {
         let next_gen = recovered.manifest.read().unwrap().next_generation;
         let start_tx = recovered.last_tx_id.load(Ordering::SeqCst) + 1;
         let writer = make_writer(
-            log_dir,
-            fault.as_ref(),
+            storage.clone(),
             next_gen,
             &*clock,
             appendfs::cli::DEFAULT_MAX_LOG_SIZE,
             start_tx,
         );
         recovered.attach_log_writer(writer);
-        match fault.as_ref() {
-            Some(f) => recovered.set_storage(Arc::clone(f) as Arc<dyn Storage>),
-            None => recovered.set_log_dir(log_dir),
-        }
+        recovered.set_storage(storage.clone());
         Self {
             fs: recovered,
             log_dir: log_dir.to_path_buf(),
+            storage,
             fault,
             _temp_dir: temp_dir,
             remotes: Vec::new(),
