@@ -21,7 +21,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -31,7 +31,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # build.rs probes fuse3 through pkg-config and fails hard without it, so the
       # headers must be present before anything is compiled.
       - name: Install FUSE build dependencies
@@ -50,7 +50,7 @@ jobs:
     name: tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `fuse3` is needed in addition to the -dev package: the integration tests mount a
       # real filesystem and call the fusermount3 binary to tear it down.
       - name: Install FUSE build and runtime dependencies
