@@ -1,7 +1,8 @@
 use crate::fs::InMemoryFS;
-use crate::remote::RemoteStore;
 use crate::remote::config::RemoteRegistry;
+use crate::remote::{RemoteObject, RemoteStore};
 use crate::storage::Storage;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,8 +101,6 @@ pub fn cross_copy_file(
     dst_remote.put_object(filename, &mut tmp_file, expected_len, expected_md5)?;
     Ok(())
 }
-
-use std::collections::HashMap;
 
 /// Live operational telemetry for a single remote target.
 #[derive(Debug, Clone, Default)]
@@ -829,6 +828,8 @@ impl RemoteReplicationWorker {
 
         let last_summary_gen = fs.last_summary_generation.load(Ordering::SeqCst);
 
+        // Pre-filter candidate logs eligible for local pruning before dispatching remote queries
+        let mut candidates = Vec::new();
         for log_entry in &manifest.logs {
             let gen_num = log_entry.generation;
             let filename = &log_entry.filename;
@@ -856,10 +857,46 @@ impl RemoteReplicationWorker {
                 continue;
             }
 
+            candidates.push((log_entry, age));
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Batch-list remote objects across each remote store to compare sizes and ETags (MD5)
+        // in O(1) listing requests rather than issuing individual head_object requests per log.
+        let mut store_listings: Vec<Option<HashMap<String, RemoteObject>>> = Vec::with_capacity(stores.len());
+        for (remote_name, remote, _, _) in stores {
+            match remote.list_objects("") {
+                Ok(objs) => {
+                    let map: HashMap<String, RemoteObject> = objs.into_iter().map(|o| (o.key.clone(), o)).collect();
+                    store_listings.push(Some(map));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "list_objects failed on remote '{}' during pruning: {}, falling back to head_object",
+                        remote_name,
+                        e
+                    );
+                    store_listings.push(None);
+                }
+            }
+        }
+
+        for (log_entry, age) in candidates {
+            let gen_num = log_entry.generation;
+            let filename = &log_entry.filename;
+
             // Verify quorum k of N stores have matching size and ETag
             let mut verified_copies = 0;
-            for (_, remote, _, _) in stores {
-                if let Ok(Some(remote_obj)) = remote.head_object(filename)
+            for (i, (_, remote, _, _)) in stores.iter().enumerate() {
+                let remote_obj_res = match &store_listings[i] {
+                    Some(map) => Ok(map.get(filename).cloned()),
+                    None => remote.head_object(filename),
+                };
+
+                if let Ok(Some(remote_obj)) = remote_obj_res
                     && remote_obj.size == log_entry.total_bytes
                 {
                     if let Some(expected_md5) = log_entry.md5 {

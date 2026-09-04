@@ -1574,3 +1574,214 @@ fn test_ro_mount_with_all_but_latest_summary_purged_locally() {
     let read_gen2_a = read_core(&fs_gen2, file_a.ino, payload_a.len(), 0).unwrap();
     assert_eq!(read_gen2_a, payload_a);
 }
+
+#[test]
+fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
+    let dir = TempDir::new().unwrap();
+    let storage = Arc::new(OsStorage::new(dir.path()));
+    let start_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let clock = Arc::new(appendfs::clock::AdvancingClock::new(start_time));
+    let volume_key = VolumeKey::plaintext_arc();
+
+    // 1. Initialize volume with clock
+    init_volume_with_clock(storage.clone(), &volume_key, VolumeHeader::plaintext(), clock.clone()).unwrap();
+
+    let mut fs = appendfs::recover_fs(
+        storage.clone(),
+        appendfs::RecoveryTarget::Latest,
+        clock.clone(),
+        volume_key.clone(),
+    )
+    .unwrap();
+
+    let writer = Arc::new(LogWriter::create_lazy(storage.clone(), 1, 1024 * 1024, 1, volume_key.clone()).unwrap());
+    fs.log_writer = Some(writer.clone());
+    fs.set_log_dir(dir.path());
+    let fs_arc = Arc::new(fs);
+
+    // Create 3 sealed log generations
+    for gen_idx in 1..=3 {
+        let filename = format!("file_{}.txt", gen_idx);
+        let file = create_core(&fs_arc, 1, &filename, 0o644, 0, 1000, 1000).unwrap();
+        let payload = format!("Payload for generation {}", gen_idx);
+        write_core(&fs_arc, file.ino, payload.as_bytes(), 0).unwrap();
+        fs_arc.sync_log().unwrap();
+
+        // Roll and export summary
+        let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
+        {
+            let mut manifest = fs_arc.manifest.write().unwrap();
+            manifest.set_generation_md5(next_gen - 1, sealed_md5);
+            manifest.record_roll(next_gen, clock.now(), 24);
+        }
+        fs_arc.sync_and_export_summary().unwrap();
+    }
+
+    let manifest = fs_arc.manifest.read().unwrap().clone();
+    assert_eq!(manifest.logs.len(), 4); // Gens 1, 2, 3 sealed, Gen 4 active
+
+    // Set up remote with CountingRemoteStore
+    let raw_remote = Arc::new(MockRemoteStore::new());
+    let counting_store = Arc::new(CountingRemoteStore::new(raw_remote.clone()));
+
+    let mut registry = RemoteRegistry::new();
+    registry.add_remote("counting", RemoteTargetConfig::new("test-bucket"));
+    registry.set_store_override("counting", counting_store.clone());
+    registry.policy.min_synced_remotes = 1;
+    // Set high retention so first cycle only replicates, does not prune
+    registry.policy.local_retention_secs = Some(3600);
+    let registry_arc = Arc::new(std::sync::RwLock::new(registry));
+
+    let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
+    let mut uploaded_parts = std::collections::HashMap::new();
+    let mut last_audit = std::time::SystemTime::UNIX_EPOCH;
+    let mut confirmed_gens = std::collections::HashMap::new();
+    let mut confirmed_sums = std::collections::HashMap::new();
+
+    // 2. Replicate all sealed generations and summaries to remote
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        true,
+    )
+    .unwrap();
+
+    // Verify all 3 sealed generations exist on remote
+    for gen_idx in 1..=3 {
+        let name = format!("{:06}.log", gen_idx);
+        assert!(raw_remote.head_object(&name).unwrap().is_some());
+    }
+
+    // =========================================================================
+    // Part A: Test check_remote_integrity optimization
+    // =========================================================================
+    counting_store.metrics().reset();
+
+    // Batch listing should perform 1 list_objects call and 0 head_object calls
+    let report = check_remote_integrity(counting_store.as_ref(), "counting", &manifest);
+    assert!(report.is_clean(), "Integrity report must be clean");
+    assert_eq!(
+        counting_store.lists(),
+        1,
+        "check_remote_integrity must issue exactly 1 batch list_objects request"
+    );
+    assert_eq!(
+        counting_store.heads(),
+        0,
+        "check_remote_integrity must NOT issue individual head_object requests"
+    );
+
+    // Fallback: If list_objects fails, check_remote_integrity falls back to head_object
+    let failing_raw = Arc::new(FailingRemoteStore::new(raw_remote.clone()));
+    let failing_counting = Arc::new(CountingRemoteStore::new(failing_raw.clone()));
+    failing_raw.fail_method("list_objects");
+
+    let fallback_report = check_remote_integrity(failing_counting.as_ref(), "failing", &manifest);
+    assert!(fallback_report.is_clean(), "Fallback integrity check must still pass");
+    assert_eq!(failing_counting.lists(), 1, "list_objects was attempted once");
+    assert_eq!(
+        failing_counting.heads(),
+        3,
+        "Fell back to individual head_object requests for all 3 sealed generations"
+    );
+
+    // =========================================================================
+    // Part B: Test retention pruning batch listing with ETags (MD5)
+    // =========================================================================
+    // Configure 0 retention so all sealed generations 1, 2, 3 are eligible for local pruning
+    {
+        let mut reg = registry_arc.write().unwrap();
+        reg.policy.local_retention_secs = Some(0);
+    }
+
+    // Ensure all 3 local log files exist before pruning
+    assert!(dir.path().join("000001.log").exists());
+    assert!(dir.path().join("000002.log").exists());
+    assert!(dir.path().join("000003.log").exists());
+
+    counting_store.metrics().reset();
+
+    // Run cycle: should check quorum via 1 list_objects call with ETags and prune all 3 logs!
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false, // incremental, confirmed_gens avoids Step 2 probes
+    )
+    .unwrap();
+
+    // All 3 local logs must be pruned
+    assert!(!dir.path().join("000001.log").exists(), "000001.log must be pruned");
+    assert!(!dir.path().join("000002.log").exists(), "000002.log must be pruned");
+    assert!(!dir.path().join("000003.log").exists(), "000003.log must be pruned");
+
+    // Quorum MD5 verification must have used 1 list_objects and 0 head_object calls!
+    assert_eq!(
+        counting_store.lists(),
+        1,
+        "Pruning quorum verification must issue exactly 1 batch list_objects request"
+    );
+    assert_eq!(
+        counting_store.heads(),
+        0,
+        "Pruning quorum verification must NOT issue individual head_object requests"
+    );
+
+    // =========================================================================
+    // Part C: Test pruning fallback when list_objects fails on remote
+    // =========================================================================
+    let file4 = create_core(&fs_arc, 1, "file_4.txt", 0o644, 0, 1000, 1000).unwrap();
+    write_core(&fs_arc, file4.ino, b"Payload for generation 4", 0).unwrap();
+    fs_arc.sync_log().unwrap();
+
+    let (next_gen, sealed_md5) = writer.force_roll(&*clock).unwrap().unwrap();
+    {
+        let mut manifest = fs_arc.manifest.write().unwrap();
+        manifest.set_generation_md5(next_gen - 1, sealed_md5);
+        manifest.record_roll(next_gen, clock.now(), 24);
+    }
+    fs_arc.sync_and_export_summary().unwrap();
+
+    // Set store to failing_counting which fails list_objects
+    {
+        let mut reg = registry_arc.write().unwrap();
+        reg.set_store_override("counting", failing_counting.clone());
+    }
+
+    assert!(dir.path().join("000004.log").exists());
+    failing_counting.metrics().reset();
+
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+
+    // 000004.log must be replicated and then successfully pruned via head_object fallback
+    assert!(
+        !dir.path().join("000004.log").exists(),
+        "000004.log must be pruned via fallback"
+    );
+    assert!(
+        failing_counting.heads() >= 1,
+        "Fallback head_object was used during pruning"
+    );
+}

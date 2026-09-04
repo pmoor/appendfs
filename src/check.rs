@@ -757,13 +757,33 @@ pub fn check_remote_integrity(
     manifest: &crate::log::LogManifest,
 ) -> IntegrityReport {
     let mut report = IntegrityReport::default();
+
+    // Batch-list all objects from the remote store to compare sizes and ETags (MD5)
+    // in O(1) listing requests rather than dispatching individual head_object requests per log.
+    let listed_objects: Option<HashMap<String, crate::remote::RemoteObject>> = match remote.list_objects("") {
+        Ok(objs) => Some(objs.into_iter().map(|o| (o.key.clone(), o)).collect()),
+        Err(e) => {
+            log::warn!(
+                "list_objects failed on remote '{}': {}, falling back to individual head_object requests",
+                remote_name,
+                e
+            );
+            None
+        }
+    };
+
     for log_entry in &manifest.logs {
         // Only verify sealed generations that have an authenticated MD5 ledger entry
         let Some(expected_md5) = log_entry.md5 else {
             continue;
         };
 
-        match remote.head_object(&log_entry.filename) {
+        let remote_obj_res = match listed_objects {
+            Some(ref map) => Ok(map.get(&log_entry.filename).cloned()),
+            None => remote.head_object(&log_entry.filename),
+        };
+
+        match remote_obj_res {
             Ok(Some(remote_obj)) => {
                 if remote_obj.size != log_entry.total_bytes {
                     report.issues.push(IntegrityIssue::error(
