@@ -1853,3 +1853,31 @@ fn test_summary_export_is_deterministic() {
         );
     }
 }
+
+#[test]
+fn test_read_all_streaming_regular_large_and_virtual() {
+    let fs = TestFS::new_temp(None);
+
+    // 1. Empty file
+    let empty_ino = fs.create(1, "empty.txt", 0o644).unwrap();
+    assert_eq!(fs.read_all(empty_ino).unwrap(), Vec::<u8>::new());
+
+    // 2. Small file (100 bytes)
+    let small_ino = fs.create(1, "small.txt", 0o644).unwrap();
+    let small_payload = vec![0xABu8; 100];
+    fs.write(small_ino, 0, &small_payload).unwrap();
+    assert_eq!(fs.read_all(small_ino).unwrap(), small_payload);
+
+    // 3. Large file spanning multiple 64KB chunks (150 KB)
+    let large_ino = fs.create(1, "large.txt", 0o644).unwrap();
+    let large_payload: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+    fs.write(large_ino, 0, &large_payload).unwrap();
+    assert_eq!(fs.read_all(large_ino).unwrap(), large_payload);
+
+    // 4. Virtual file (.remotes)
+    fs.fs.register_remote_status();
+    let remotes_ino = fs.lookup(1, ".remotes").unwrap();
+    let remotes_bytes = fs.read_all(remotes_ino).unwrap();
+    let remotes_str = String::from_utf8(remotes_bytes).unwrap();
+    assert!(remotes_str.contains("No remotes configured"));
+}

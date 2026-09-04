@@ -294,6 +294,10 @@ impl TestFS {
         self.fs.next_inode.fetch_add(1, Ordering::SeqCst)
     }
 
+    pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
+        self.fs.lookup_child(parent, name)
+    }
+
     pub fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64, i32> {
         appendfs::operations::dir::mkdir_core(&self.fs, parent, name, mode, 1000, 1000).map(|attr| attr.ino)
     }
@@ -319,20 +323,25 @@ impl TestFS {
 
     pub fn read_all(&self, ino: u64) -> Result<Vec<u8>, i32> {
         let fh = self.open(ino, libc::O_RDONLY as u32)?;
-        let len = if (fh & appendfs::fs::VIRTUAL_FH_FLAG) != 0 {
-            self.fs
-                .virtual_handles
-                .read()
-                .unwrap()
-                .get(&fh)
-                .map(|b| b.len())
-                .unwrap_or(0)
-        } else {
-            appendfs::operations::read_write::getattr_core(&self.fs, ino)
-                .map(|a| a.size as usize)
-                .unwrap_or(0)
+        let mut result = Vec::new();
+        let chunk_size = 64 * 1024;
+        let mut offset = 0i64;
+        let res = loop {
+            match appendfs::operations::read_write::read_core(&self.fs, ino, fh, offset, chunk_size) {
+                Ok(chunk) => {
+                    if chunk.is_empty() {
+                        break Ok(result);
+                    }
+                    let read_len = chunk.len();
+                    result.extend_from_slice(&chunk);
+                    if read_len < chunk_size {
+                        break Ok(result);
+                    }
+                    offset += read_len as i64;
+                }
+                Err(err) => break Err(err),
+            }
         };
-        let res = appendfs::operations::read_write::read_core(&self.fs, ino, fh, 0, len);
         let _ = self.release(ino, fh);
         res
     }
