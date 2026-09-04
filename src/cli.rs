@@ -206,10 +206,6 @@ pub struct InitArgs {
     /// Directory path where the appendfs volume log and summary files will be stored
     pub log_dir: PathBuf,
 
-    /// Initial branch name (default: "main")
-    #[arg(long = "branch", default_value = "main")]
-    pub branch: String,
-
     /// Encrypt with ChaCha20-Poly1305, unlocked by a key file: 64 hex characters, e.g. from
     /// `openssl rand -hex 32`
     ///

@@ -73,7 +73,7 @@ impl LogFileCache {
             return Ok(Arc::clone(reader));
         }
 
-        let filename = format!("{:06}.log", generation);
+        let filename = super::log_filename(generation);
 
         let (is_sealed, mut expected_len) = if let Some(ref m) = self.manifest {
             let man = m.read().unwrap();

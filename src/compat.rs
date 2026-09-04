@@ -448,7 +448,6 @@ pub fn create_canonical_compat_volume(out_dir: &Path) -> io::Result<()> {
     // of the canonical tree is built with below.
     init_volume_with_clock_and_uids(
         storage.clone(),
-        Some("main"),
         &VolumeKey::plaintext(),
         VolumeHeader::plaintext(),
         clock.clone(),

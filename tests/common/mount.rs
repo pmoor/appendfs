@@ -41,13 +41,7 @@ impl TestMount {
         let log_dir = tempfile::Builder::new().prefix("appendfs_log_").tempdir().unwrap();
         let log_path = log_dir.path().to_path_buf();
         let storage: Arc<dyn appendfs::storage::Storage> = Arc::new(appendfs::storage::OsStorage::new(&log_path));
-        appendfs::init_volume(
-            storage.clone(),
-            Some("main"),
-            &VolumeKey::plaintext(),
-            VolumeHeader::plaintext(),
-        )
-        .unwrap();
+        appendfs::init_volume(storage.clone(), &VolumeKey::plaintext(), VolumeHeader::plaintext()).unwrap();
 
         let mount_dir = tempfile::Builder::new().prefix("appendfs_mnt_").tempdir().unwrap();
         let mount_path = mount_dir.path().to_path_buf();

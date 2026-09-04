@@ -31,7 +31,7 @@ fn open_generation_file(
     generation: u64,
     created_at: std::time::SystemTime,
 ) -> io::Result<ActiveLogFile> {
-    let filename = format!("{:06}.log", generation);
+    let filename = super::log_filename(generation);
     let mut writer = storage.open_writer(&filename, WriteMode::CreateNew)?;
     let mut md5_hasher = md5::Context::new();
 
@@ -415,7 +415,7 @@ impl LogWriter {
             Err(e) => e.into_inner(),
         };
         match &*state {
-            ActiveLogState::Unopened { generation, .. } => format!("{:06}.log", generation),
+            ActiveLogState::Unopened { generation, .. } => super::log_filename(*generation),
             ActiveLogState::Open(active) => active.filename.clone(),
         }
     }

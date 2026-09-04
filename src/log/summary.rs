@@ -409,30 +409,22 @@ pub fn export_summary(
 /// Creates `000000.summary` containing the root directory (inode 1) and an initial LogManifest.
 pub fn init_volume(
     storage: Arc<dyn Storage>,
-    branch: Option<&str>,
     volume_key: &VolumeKey,
     volume_header: crate::crypto::VolumeHeader,
 ) -> io::Result<String> {
-    init_volume_with_clock(
-        storage,
-        branch,
-        volume_key,
-        volume_header,
-        Arc::new(crate::clock::SystemClock),
-    )
+    init_volume_with_clock(storage, volume_key, volume_header, Arc::new(crate::clock::SystemClock))
 }
 
 /// Initializes a volume whose root directory is owned by the invoking user.
 pub fn init_volume_with_clock(
     storage: Arc<dyn Storage>,
-    branch: Option<&str>,
     volume_key: &VolumeKey,
     volume_header: crate::crypto::VolumeHeader,
     clock: Arc<dyn crate::clock::Clock>,
 ) -> io::Result<String> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    init_volume_with_clock_and_uids(storage, branch, volume_key, volume_header, clock, uid, gid)
+    init_volume_with_clock_and_uids(storage, volume_key, volume_header, clock, uid, gid)
 }
 
 /// Initializes a volume with an explicit root owner.
@@ -444,7 +436,6 @@ pub fn init_volume_with_clock(
 /// `-odefault_permissions`, so the kernel enforces the recorded uid against the caller.
 pub fn init_volume_with_clock_and_uids(
     storage: Arc<dyn Storage>,
-    branch: Option<&str>,
     volume_key: &VolumeKey,
     volume_header: crate::crypto::VolumeHeader,
     clock: Arc<dyn crate::clock::Clock>,
@@ -463,12 +454,9 @@ pub fn init_volume_with_clock_and_uids(
 
     let fs = InMemoryFS::with_clock_and_uids(clock.clone(), uid, gid);
     let snapshot = fs.snapshot_all();
-    let branch_name = branch.unwrap_or("main");
     let manifest = crate::log::LogManifest {
-        branch: branch_name.to_string(),
         logs: Vec::new(),
         next_generation: 1,
-        next_filename: "000001.log".to_string(),
     };
 
     export_summary(
@@ -872,10 +860,8 @@ mod tests {
         );
 
         let manifest = crate::log::LogManifest {
-            branch: "main".to_string(),
             logs: Vec::new(),
             next_generation: 2,
-            next_filename: "000002.log".to_string(),
         };
 
         let filename = export_summary(
@@ -897,7 +883,6 @@ mod tests {
         assert_eq!(reader.header.generation, 1);
         assert_eq!(reader.header.last_tx_id, 42);
         assert_eq!(reader.header.next_inode, 3);
-        assert_eq!(reader.manifest.branch, "main");
         assert_eq!(reader.footer.entry_count, 2);
 
         let node1 = reader.read_inode(1).unwrap().unwrap();
@@ -942,10 +927,8 @@ mod tests {
         }
 
         let manifest = crate::log::LogManifest {
-            branch: "test".to_string(),
             logs: Vec::new(),
             next_generation: 5,
-            next_filename: "000005.log".to_string(),
         };
 
         let filename = export_summary(
@@ -978,7 +961,6 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         init_volume(
             storage.clone(),
-            Some("dev"),
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -990,9 +972,8 @@ mod tests {
         assert_eq!(reader.header.generation, 0);
         assert_eq!(reader.header.last_tx_id, 0);
         assert_eq!(reader.header.next_inode, 2);
-        assert_eq!(reader.manifest.branch, "dev");
         assert_eq!(reader.manifest.next_generation, 1);
-        assert_eq!(reader.manifest.next_filename, "000001.log");
+        assert_eq!(reader.manifest.next_filename(), "000001.log");
 
         let root = reader.read_inode(1).unwrap().unwrap();
         match root.kind {
@@ -1017,7 +998,6 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         init_volume(
             storage.clone(),
-            None,
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -1054,7 +1034,7 @@ mod tests {
         .unwrap();
         let expected_id = header.volume_id;
 
-        init_volume(storage.clone(), Some("main"), &key, header).unwrap();
+        init_volume(storage.clone(), &key, header).unwrap();
 
         // The point of keeping this blob in plaintext: identify the volume and validate a
         // key before any body decryption is attempted.
@@ -1076,7 +1056,6 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         init_volume(
             storage.clone(),
-            None,
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -1109,10 +1088,8 @@ mod tests {
         );
 
         let manifest = crate::log::LogManifest {
-            branch: "main".to_string(),
             logs: Vec::new(),
             next_generation: 2,
-            next_filename: "000002.log".to_string(),
         };
 
         // A first export dies partway, leaving a partial 000001.summary.tmp behind.

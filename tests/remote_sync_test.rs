@@ -23,7 +23,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     let volume_key = VolumeKey::plaintext_arc();
 
     // 1. Initialize volume
-    let summary_file = init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    let summary_file = init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
     assert_eq!(summary_file, "000000.summary");
 
     // 2. Recover InMemoryFS and append records to multiple generations
@@ -52,7 +52,7 @@ fn test_remote_replication_and_authenticated_md5_ledger() {
     {
         let mut manifest = fs.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
 
     // Write file 2 (gen 2)
@@ -126,7 +126,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
@@ -151,7 +151,7 @@ fn test_tiered_eviction_and_sparse_remote_extent_reads() {
     {
         let mut manifest = fs.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
     fs.export_summary(storage.as_ref()).unwrap();
 
@@ -212,7 +212,7 @@ fn test_disaster_recovery_bootstrap_from_remote() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
     let mut fs = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
@@ -262,7 +262,7 @@ fn test_read_only_remote_and_cloud_forking() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
     let mut fs = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
@@ -285,7 +285,7 @@ fn test_read_only_remote_and_cloud_forking() {
     {
         let mut manifest = fs.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
     fs.export_summary(storage.as_ref()).unwrap();
 
@@ -323,7 +323,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
     let mut fs = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
@@ -399,7 +399,7 @@ fn test_active_log_part_sync_and_consolidation_on_seal() {
     {
         let mut manifest = fs_arc.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
     fs_arc.export_summary(storage.as_ref()).unwrap();
 
@@ -484,7 +484,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
@@ -517,7 +517,7 @@ fn test_nfs_local_volume_replication_and_pruning() {
     {
         let mut manifest = fs.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
     fs.export_summary(storage.as_ref()).unwrap();
 
@@ -584,7 +584,7 @@ fn test_local_read_populates_block_cache_before_purge() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
@@ -611,7 +611,7 @@ fn test_local_read_populates_block_cache_before_purge() {
     {
         let mut manifest = fs.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
     fs.export_summary(storage.as_ref()).unwrap();
 
@@ -675,7 +675,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
@@ -702,7 +702,7 @@ fn test_remote_read_priority_prefers_lower_priority_remotes() {
     {
         let mut manifest = fs.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
     fs.export_summary(storage.as_ref()).unwrap();
 
@@ -791,7 +791,7 @@ fn test_latency_remote_store_in_tiered_reading() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
     let mut fs = appendfs::recover_fs(
         storage.clone(),
         appendfs::RecoveryTarget::Latest,
@@ -813,7 +813,7 @@ fn test_latency_remote_store_in_tiered_reading() {
     {
         let mut manifest = fs.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
     fs.export_summary(storage.as_ref()).unwrap();
 
@@ -881,7 +881,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
@@ -939,7 +939,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     {
         let mut manifest = fs_arc.manifest.write().unwrap();
         manifest.set_generation_md5(rolled_gen - 1, sealed_md5);
-        manifest.record_roll(rolled_gen, format!("{:06}.log", rolled_gen), clock.now(), 40);
+        manifest.record_roll(rolled_gen, clock.now(), 40);
     }
     fs_arc.export_summary(storage.as_ref()).unwrap();
 
@@ -1068,7 +1068,7 @@ fn test_event_driven_immediate_replication_on_log_roll() {
     let clock = Arc::new(SystemClock);
     let volume_key = Arc::new(VolumeKey::plaintext());
 
-    let _summary_file = init_volume(storage.clone(), None, volume_key.as_ref(), VolumeHeader::plaintext()).unwrap();
+    let _summary_file = init_volume(storage.clone(), volume_key.as_ref(), VolumeHeader::plaintext()).unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
@@ -1107,7 +1107,7 @@ fn test_event_driven_immediate_replication_on_log_roll() {
     {
         let mut manifest = fs_arc.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
     fs_arc.notify_replication();
 
@@ -1137,7 +1137,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     let clock = Arc::new(SystemClock);
     let volume_key = Arc::new(VolumeKey::plaintext());
 
-    let _summary_file = init_volume(storage.clone(), None, volume_key.as_ref(), VolumeHeader::plaintext()).unwrap();
+    let _summary_file = init_volume(storage.clone(), volume_key.as_ref(), VolumeHeader::plaintext()).unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
@@ -1170,7 +1170,7 @@ fn test_audit_interval_skips_confirmed_files_until_audit() {
     {
         let mut manifest = fs_arc.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
 
     let mut last_part_sync = std::time::SystemTime::UNIX_EPOCH;
@@ -1254,7 +1254,7 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     let clock = Arc::new(SystemClock);
     let volume_key = VolumeKey::plaintext_arc();
 
-    init_volume(storage.clone(), Some("main"), &volume_key, VolumeHeader::plaintext()).unwrap();
+    init_volume(storage.clone(), &volume_key, VolumeHeader::plaintext()).unwrap();
 
     let mut fs = appendfs::recover_fs(
         storage.clone(),
@@ -1281,7 +1281,7 @@ fn test_last_summary_generation_restored_on_recovery_and_allows_pruning() {
     {
         let mut manifest = fs.manifest.write().unwrap();
         manifest.set_generation_md5(next_gen - 1, sealed_md5);
-        manifest.record_roll(next_gen, format!("{:06}.log", next_gen), clock.now(), 24);
+        manifest.record_roll(next_gen, clock.now(), 24);
     }
 
     // Drop filesystem and writer, simulating a restart/remount

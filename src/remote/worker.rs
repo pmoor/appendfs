@@ -757,7 +757,7 @@ impl RemoteReplicationWorker {
                 let part_filename = format!("{:06}.part{:04}.log", active_gen, *part_idx);
 
                 // Read slice from local active log
-                let active_filename = format!("{:06}.log", active_gen);
+                let active_filename = crate::log::log_filename(active_gen);
                 if let Ok(reader) = storage.open_reader(&active_filename) {
                     let mut part_bytes = vec![0u8; part_len as usize];
                     if reader.read_exact_at(*last_offset, &mut part_bytes).is_ok() {

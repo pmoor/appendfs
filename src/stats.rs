@@ -6,9 +6,7 @@ use std::fmt::Write as FmtWrite;
 /// Aggregate statistics and fragmentation status for an appendfs volume.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VolumeStats {
-    pub branch: String,
     pub next_generation: u64,
-    pub next_filename: String,
     pub total_inodes: usize,
     pub directory_count: usize,
     pub file_count: usize,
@@ -22,6 +20,11 @@ pub struct VolumeStats {
 }
 
 impl VolumeStats {
+    /// Returns the physical filename for the next log generation (e.g. "000002.log").
+    pub fn next_filename(&self) -> String {
+        crate::log::log_filename(self.next_generation)
+    }
+
     /// Collects volume statistics from an in-memory filesystem state.
     pub fn collect(fs: &InMemoryFS) -> Self {
         let manifest = fs.manifest.read().unwrap().clone();
@@ -66,9 +69,7 @@ impl VolumeStats {
         };
 
         Self {
-            branch: manifest.branch,
             next_generation: manifest.next_generation,
-            next_filename: manifest.next_filename,
             total_inodes,
             directory_count,
             file_count,
@@ -86,11 +87,11 @@ impl VolumeStats {
     pub fn display_text(&self) -> String {
         let mut out = String::new();
         writeln!(out, "=== appendfs Volume Statistics ===").unwrap();
-        writeln!(out, "Branch:              {}", self.branch).unwrap();
         writeln!(
             out,
             "Next Generation:     {} ({})",
-            self.next_generation, self.next_filename
+            self.next_generation,
+            self.next_filename()
         )
         .unwrap();
         writeln!(
@@ -200,13 +201,11 @@ mod tests {
     fn test_volume_stats_formatting() {
         let fs = InMemoryFS::new();
         let stats = VolumeStats::collect(&fs);
-        assert_eq!(stats.branch, "main");
         assert_eq!(stats.total_inodes, 1);
         assert_eq!(stats.directory_count, 1);
         assert_eq!(stats.file_count, 0);
 
         let text = stats.display_text();
-        assert!(text.contains("Branch:              main"));
         assert!(text.contains("Total Inodes:        1"));
         assert!(text.contains("Overall Live Ratio:  N/A"));
     }

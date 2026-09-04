@@ -84,7 +84,7 @@ pub fn bootstrap_from_remote(
 
     if !part_objects.is_empty() {
         part_objects.sort_by(|a, b| a.key.cmp(&b.key));
-        let active_log_name = format!("{:06}.log", next_gen);
+        let active_log_name = crate::log::log_filename(next_gen);
         log::info!(
             "Found {} active unsealed part(s) for generation {}; reconstructing {}...",
             part_objects.len(),

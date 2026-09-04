@@ -13,13 +13,7 @@ use std::sync::Arc;
 
 fn recovered_root_owner(dir: &std::path::Path) -> (u32, u32) {
     let storage: Arc<dyn appendfs::storage::Storage> = Arc::new(OsStorage::new(dir));
-    appendfs::init_volume(
-        storage.clone(),
-        Some("main"),
-        &VolumeKey::plaintext(),
-        VolumeHeader::plaintext(),
-    )
-    .unwrap();
+    appendfs::init_volume(storage.clone(), &VolumeKey::plaintext(), VolumeHeader::plaintext()).unwrap();
 
     let fs = appendfs::recover_fs(
         storage,
@@ -71,7 +65,6 @@ fn test_root_owner_is_not_a_hardcoded_constant() {
     let pinned_gid = uid.wrapping_add(9);
     appendfs::log::init_volume_with_clock_and_uids(
         storage.clone(),
-        Some("main"),
         &VolumeKey::plaintext(),
         VolumeHeader::plaintext(),
         Arc::new(appendfs::SystemClock),

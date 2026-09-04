@@ -762,7 +762,6 @@ fn test_volume_init_mount_and_stats_flow() {
     // 1. Explicitly initialize empty volume
     let summary_filename = appendfs::init_volume(
         storage.clone(),
-        Some("work"),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
     )
@@ -833,7 +832,6 @@ fn test_volume_init_mount_and_stats_flow() {
         )
         .unwrap();
         let live_stats = appendfs::VolumeStats::collect(&live_recovered_fs);
-        assert_eq!(live_stats.branch, "work");
         assert_eq!(live_stats.total_inodes, 3);
         assert_eq!(live_stats.directory_count, 2);
         assert_eq!(live_stats.file_count, 1);
@@ -854,7 +852,6 @@ fn test_volume_init_mount_and_stats_flow() {
     .unwrap();
     let stats = appendfs::VolumeStats::collect(&recovered_fs);
 
-    assert_eq!(stats.branch, "work");
     assert_eq!(stats.total_inodes, 3); // root (1) + docs (2) + note.txt (3)
     assert_eq!(stats.directory_count, 2);
     assert_eq!(stats.file_count, 1);
@@ -862,7 +859,6 @@ fn test_volume_init_mount_and_stats_flow() {
     assert_eq!(stats.total_logical_bytes, 21);
 
     let display = stats.display_text();
-    assert!(display.contains("Branch:              work"));
     assert!(display.contains("Total Inodes:        3 (2 directories, 1 files, 0 symlinks)"));
     assert!(display.contains("000001.log"));
 
@@ -895,7 +891,6 @@ fn test_volume_init_mount_and_stats_flow() {
     assert!(summary_file.exists());
     let dump_sum_v0 = appendfs::dump_file(rec_storage.as_ref(), "000000.summary", 0, None).unwrap();
     assert!(dump_sum_v0.contains("=== appendfs Summary File Dump ==="));
-    assert!(dump_sum_v0.contains("Branch:              work"));
     assert!(dump_sum_v0.contains("Total Inodes:        1"));
     assert!(dump_sum_v0.contains("Checksum (BLAKE3):"));
     assert!(dump_sum_v0.contains("VERIFIED"));
@@ -914,7 +909,6 @@ fn test_lazy_log_creation_and_clean_read_only_unmount() {
     // 1. Initialize volume
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
     )
@@ -1030,7 +1024,6 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
 
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
     )
@@ -1091,7 +1084,6 @@ fn test_background_flusher_in_mount_session() {
 
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
     )
@@ -1151,7 +1143,6 @@ fn test_check_volume_identifies_clean_and_orphaned_volume() {
 
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
     )
@@ -1302,7 +1293,6 @@ fn test_double_mount_rw_protection_and_concurrent_ro_mount() {
 
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
     )
@@ -2203,7 +2193,6 @@ fn test_recovery_refuses_a_volume_with_no_readable_summary() {
     let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
     )
@@ -2262,7 +2251,6 @@ fn test_encrypted_volume_lifecycle_and_raw_disk_verification() {
     .unwrap();
     appendfs::log::init_volume(
         std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path)),
-        Some("main"),
         &volume_key,
         volume_header,
     )
@@ -2383,7 +2371,7 @@ fn test_tampered_record_header_is_rejected_not_served() {
     )
     .unwrap();
     let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(log_path));
-    appendfs::log::init_volume(storage.clone(), Some("main"), &volume_key, volume_header).unwrap();
+    appendfs::log::init_volume(storage.clone(), &volume_key, volume_header).unwrap();
 
     let volume_key = std::sync::Arc::new(volume_key);
     let ino = {
@@ -2493,7 +2481,7 @@ fn test_key_source_round_trips_through_the_volume_header() {
         assert_eq!(header.key_source.needs_key_file(), needs_file, "{:?}", source);
         assert_eq!(header.key_source.needs_passphrase(), needs_pass, "{:?}", source);
 
-        appendfs::log::init_volume(storage.clone(), Some("main"), &key, header).unwrap();
+        appendfs::log::init_volume(storage.clone(), &key, header).unwrap();
 
         // The mode must survive the round trip through the plaintext header blob, and be
         // readable without any credential at all - that is what lets a mount know what to
@@ -2508,7 +2496,6 @@ fn test_key_source_round_trips_through_the_volume_header() {
     let storage = std::sync::Arc::new(appendfs::storage::OsStorage::new(dir.path()));
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         &appendfs::VolumeKey::plaintext(),
         appendfs::VolumeHeader::plaintext(),
     )
@@ -2595,7 +2582,7 @@ fn test_forged_summary_offsets_error_rather_than_panic() {
             appendfs::compress::Compression::None,
         )
         .unwrap();
-        appendfs::log::init_volume(storage.clone(), Some("main"), &key, header).unwrap();
+        appendfs::log::init_volume(storage.clone(), &key, header).unwrap();
 
         tamper(dir.path(), edit);
 
@@ -2669,7 +2656,7 @@ fn test_compressed_volume_round_trips_and_saves_space() {
         let master = MasterKey::new([0x6Bu8; 32]);
         let (header, key) =
             VolumeHeader::new_encrypted(&master, [0x77u8; 16], KeySource::KeyFile, compression).unwrap();
-        appendfs::log::init_volume(storage.clone(), Some("main"), &key, header.clone()).unwrap();
+        appendfs::log::init_volume(storage.clone(), &key, header.clone()).unwrap();
 
         let key = std::sync::Arc::new(key);
         let ino = {
@@ -2752,7 +2739,7 @@ fn test_check_verifies_compressed_volumes_without_false_positives() {
         let master = MasterKey::new([0x31u8; 32]);
         let (header, key) =
             VolumeHeader::new_encrypted(&master, [0x32u8; 16], KeySource::KeyFile, compression).unwrap();
-        appendfs::log::init_volume(storage.clone(), Some("main"), &key, header).unwrap();
+        appendfs::log::init_volume(storage.clone(), &key, header).unwrap();
         let key = std::sync::Arc::new(key);
 
         // Highly compressible, and large enough that the compressed log is orders of
@@ -2820,7 +2807,6 @@ fn test_periodic_summary_generation_on_log_rolls() {
     // 1. Initialize empty volume (creates 000000.summary)
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         key.as_ref(),
         appendfs::crypto::VolumeHeader::plaintext(),
     )
@@ -2933,7 +2919,6 @@ fn test_periodic_summary_generation_by_bytes() {
 
     appendfs::init_volume(
         storage.clone(),
-        Some("main"),
         key.as_ref(),
         appendfs::crypto::VolumeHeader::plaintext(),
     )

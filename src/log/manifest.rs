@@ -6,7 +6,7 @@ use std::time::SystemTime;
 pub struct LogFileInfo {
     /// Monotonic generation sequence number (e.g. 1 for 000001.log).
     pub generation: u64,
-    /// Physical filename on disk (e.g. "000001.log" or "branch_a_000004.log").
+    /// Physical filename on disk (e.g. "000001.log").
     pub filename: String,
     /// Creation timestamp for this log generation.
     #[serde(with = "crate::clock::serde_system_time")]
@@ -26,11 +26,16 @@ pub struct LogFileInfo {
     pub md5: Option<[u8; 16]>,
 }
 
+/// Returns the physical filename for a given log generation (e.g. "000001.log").
+pub fn log_filename(generation: u64) -> String {
+    format!("{:06}.log", generation)
+}
+
 impl LogFileInfo {
-    pub fn new(generation: u64, filename: impl Into<String>, created_at: SystemTime, initial_header_size: u64) -> Self {
+    pub fn new(generation: u64, created_at: SystemTime, initial_header_size: u64) -> Self {
         Self {
             generation,
-            filename: filename.into(),
+            filename: log_filename(generation),
             created_at,
             record_count: 0,
             total_bytes: initial_header_size,
@@ -43,55 +48,39 @@ impl LogFileInfo {
 /// Authoritative manifest of all active log generations and lineage for the filesystem.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogManifest {
-    /// Active branch identifier (e.g. "main").
-    pub branch: String,
     /// Ordered list of active log files that back the extents in this filesystem state.
     pub logs: Vec<LogFileInfo>,
     /// Next generation sequence number to allocate.
     pub next_generation: u64,
-    /// Next generation log filename to create on roll (e.g. "000002.log").
-    pub next_filename: String,
-}
-
-impl Default for LogManifest {
-    fn default() -> Self {
-        Self::new(1, "main")
-    }
 }
 
 impl LogManifest {
-    pub fn new(start_generation: u64, branch: impl Into<String>) -> Self {
-        Self::new_with_time(start_generation, branch, SystemTime::now())
-    }
-
-    pub fn new_with_time(start_generation: u64, branch: impl Into<String>, created_at: SystemTime) -> Self {
-        let branch = branch.into();
-        let current_filename = format!("{:06}.log", start_generation);
+    pub fn new_with_time(start_generation: u64, created_at: SystemTime) -> Self {
         let next_generation = start_generation + 1;
-        let next_filename = format!("{:06}.log", next_generation);
 
         Self {
-            branch,
             logs: vec![LogFileInfo::new(
                 start_generation,
-                current_filename,
                 created_at,
                 crate::log::record::FILE_HEADER_SIZE as u64,
             )],
             next_generation,
-            next_filename,
         }
     }
 
-    /// Appends a new rolled log generation and advances `next_generation` / `next_filename`.
-    pub fn record_roll(&mut self, next_gen: u64, next_file: String, created_at: SystemTime, initial_header_size: u64) {
+    /// Returns the physical filename for the next log generation (e.g. "000002.log").
+    pub fn next_filename(&self) -> String {
+        log_filename(self.next_generation)
+    }
+
+    /// Appends a new rolled log generation and advances `next_generation`.
+    pub fn record_roll(&mut self, next_gen: u64, created_at: SystemTime, initial_header_size: u64) {
         if self.logs.iter().any(|l| l.generation == next_gen) {
             return;
         }
-        let entry = LogFileInfo::new(next_gen, next_file, created_at, initial_header_size);
+        let entry = LogFileInfo::new(next_gen, created_at, initial_header_size);
         self.logs.push(entry);
         self.next_generation = next_gen + 1;
-        self.next_filename = format!("{:06}.log", self.next_generation);
     }
 
     /// Sets the MD5 digest for a specific sealed generation.
@@ -163,23 +152,18 @@ mod tests {
 
     #[test]
     fn test_log_manifest_creation_and_roll() {
-        let mut manifest = LogManifest::new(1, "main");
+        let mut manifest = LogManifest::new_with_time(1, SystemTime::UNIX_EPOCH);
         assert_eq!(manifest.logs.len(), 1);
         assert_eq!(manifest.logs[0].generation, 1);
         assert_eq!(manifest.logs[0].filename, "000001.log");
         assert_eq!(manifest.next_generation, 2);
-        assert_eq!(manifest.next_filename, "000002.log");
+        assert_eq!(manifest.next_filename(), "000002.log");
 
-        manifest.record_roll(
-            2,
-            "000002.log".to_string(),
-            SystemTime::now(),
-            crate::log::record::FILE_HEADER_SIZE as u64,
-        );
+        manifest.record_roll(2, SystemTime::UNIX_EPOCH, crate::log::record::FILE_HEADER_SIZE as u64);
         assert_eq!(manifest.logs.len(), 2);
         assert_eq!(manifest.logs[1].generation, 2);
         assert_eq!(manifest.next_generation, 3);
-        assert_eq!(manifest.next_filename, "000003.log");
+        assert_eq!(manifest.next_filename(), "000003.log");
 
         let bytes = crate::wire::serialize(&manifest).unwrap();
         let deserialized: LogManifest = crate::wire::deserialize(&bytes).unwrap();

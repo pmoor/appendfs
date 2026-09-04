@@ -77,12 +77,7 @@ impl InMemoryFS {
                 {
                     let mut manifest = self.manifest.write().unwrap();
                     manifest.set_generation_md5(sealed_gen, md5);
-                    manifest.record_roll(
-                        next_gen,
-                        format!("{:06}.log", next_gen),
-                        self.clock.now(),
-                        crate::log::record::FILE_HEADER_SIZE as u64,
-                    );
+                    manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
                 }
 
                 self.generations_since_last_summary.fetch_add(1, Ordering::SeqCst);
@@ -121,12 +116,7 @@ impl InMemoryFS {
                 }
             } else {
                 let mut manifest = self.manifest.write().unwrap();
-                manifest.record_roll(
-                    next_gen,
-                    format!("{:06}.log", next_gen),
-                    self.clock.now(),
-                    crate::log::record::FILE_HEADER_SIZE as u64,
-                );
+                manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
             }
             self.notify_replication();
         }
@@ -305,12 +295,7 @@ impl InMemoryFS {
             {
                 let mut manifest = self.manifest.write().unwrap();
                 manifest.set_generation_md5(sealed_gen, sealed_md5);
-                manifest.record_roll(
-                    next_gen,
-                    format!("{:06}.log", next_gen),
-                    self.clock.now(),
-                    crate::log::record::FILE_HEADER_SIZE as u64,
-                );
+                manifest.record_roll(next_gen, self.clock.now(), crate::log::record::FILE_HEADER_SIZE as u64);
             }
             self.notify_replication();
             Ok(Some((next_gen, sealed_md5)))
@@ -1515,7 +1500,6 @@ mod tests {
 
         crate::log::init_volume(
             storage.clone(),
-            Some("main"),
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )

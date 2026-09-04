@@ -68,7 +68,6 @@ impl IntegrityIssue {
 /// Aggregated report produced by the filesystem integrity check.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IntegrityReport {
-    pub branch: String,
     pub total_inodes: usize,
     pub directories: usize,
     pub regular_files: usize,
@@ -105,7 +104,6 @@ impl IntegrityReport {
         if let Some(dir) = log_dir {
             out.push_str(&format!("  Log Directory:     {}\n", dir.display()));
         }
-        out.push_str(&format!("  Branch:            {}\n", self.branch));
         out.push_str(&format!(
             "  Total Inodes:      {} (Directories: {}, Files: {}, Symlinks: {})\n",
             self.total_inodes, self.directories, self.regular_files, self.symlinks
@@ -245,7 +243,6 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
 
     // 0. Extract manifest and base snapshot
     let manifest = fs.manifest.read().unwrap().clone();
-    report.branch = manifest.branch.clone();
 
     let base_map = fs.base.read().unwrap();
     report.total_inodes = base_map.len();
@@ -567,7 +564,7 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
                     }
 
                     if verify_data && let Some(ref c) = cache {
-                        let log_filename = format!("{:06}.log", generation);
+                        let log_filename = crate::log::log_filename(generation);
                         if !c.storage().exists(&log_filename) {
                             report.issues.push(IntegrityIssue::error(
                                     "MISSING_LOG_FILE",
@@ -699,13 +696,6 @@ pub fn check_fs_integrity(fs: &InMemoryFS, log_dir: Option<&Path>, verify_data: 
     }
 
     // Pass 4: Manifest & Physical File Consistency
-    if manifest.branch.trim().is_empty() {
-        report.issues.push(IntegrityIssue::error(
-            "MANIFEST_EMPTY_BRANCH",
-            None,
-            "Manifest branch name is empty",
-        ));
-    }
     if manifest.next_generation == 0 {
         report.issues.push(IntegrityIssue::error(
             "MANIFEST_INVALID_NEXT_GEN",
@@ -766,10 +756,7 @@ pub fn check_remote_integrity(
     remote_name: &str,
     manifest: &crate::log::LogManifest,
 ) -> IntegrityReport {
-    let mut report = IntegrityReport {
-        branch: manifest.branch.clone(),
-        ..Default::default()
-    };
+    let mut report = IntegrityReport::default();
     for log_entry in &manifest.logs {
         // Only verify sealed generations that have an authenticated MD5 ledger entry
         let Some(expected_md5) = log_entry.md5 else {
@@ -854,7 +841,6 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         crate::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -906,7 +892,6 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         crate::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -943,7 +928,6 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         crate::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -995,7 +979,6 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         crate::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -1043,7 +1026,6 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         crate::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -1097,7 +1079,6 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::OsStorage::new(dir.path()));
         crate::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -1144,7 +1125,6 @@ mod tests {
         let storage = Arc::new(crate::storage::MemoryStorage::new());
         crate::log::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )

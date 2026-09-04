@@ -279,12 +279,7 @@ pub fn recover_fs(
                     entry.total_data_bytes = log_data_bytes;
                     entry.total_bytes = log_file_len;
                 } else {
-                    manifest.record_roll(
-                        gen_num,
-                        format!("{:06}.log", gen_num),
-                        log_created_at,
-                        crate::log::record::FILE_HEADER_SIZE as u64,
-                    );
+                    manifest.record_roll(gen_num, log_created_at, crate::log::record::FILE_HEADER_SIZE as u64);
                     if let Some(entry) = manifest.get_mut_by_generation(gen_num) {
                         entry.record_count = committed_records_count;
                         entry.total_data_bytes = log_data_bytes;
@@ -332,7 +327,6 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(OsStorage::new(dir.path()));
         crate::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -422,7 +416,6 @@ mod tests {
         let storage: Arc<dyn crate::storage::Storage> = Arc::new(OsStorage::new(dir.path()));
         crate::init_volume(
             storage.clone(),
-            Some("main"),
             &VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )

@@ -219,11 +219,7 @@ fn main() {
                 }
             }
 
-            println!(
-                "Initializing appendfs volume at '{}' (branch: {})...",
-                args.log_dir.display(),
-                args.branch
-            );
+            println!("Initializing appendfs volume at '{}'...", args.log_dir.display());
 
             let key_source = args.key_source();
             if key_source != KeySource::None {
@@ -246,12 +242,11 @@ fn main() {
                 let volume_id = hex_string(&volume_header.volume_id);
 
                 let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&args.log_dir));
-                match init_volume(storage, Some(&args.branch), &volume_key, volume_header) {
+                match init_volume(storage, &volume_key, volume_header) {
                     Ok(summary_filename) => {
                         println!("Initialized encrypted appendfs volume successfully!");
                         println!("  Log Directory:   {}", args.log_dir.display());
                         println!("  Summary File:    {}", summary_filename);
-                        println!("  Branch:          {}", args.branch);
                         println!("  Cipher:          ChaCha20-Poly1305");
                         println!("  Unlocked by:     {}", key_source);
                         println!("  Compression:     {}", args.compression());
@@ -274,12 +269,11 @@ fn main() {
                 // still honour --compress rather than silently dropping it.
                 let mut volume_header = VolumeHeader::plaintext();
                 volume_header.compression = args.compression();
-                match init_volume(storage, Some(&args.branch), &VolumeKey::plaintext(), volume_header) {
+                match init_volume(storage, &VolumeKey::plaintext(), volume_header) {
                     Ok(summary_filename) => {
                         println!("Initialized empty appendfs volume successfully!");
                         println!("  Log Directory:   {}", args.log_dir.display());
                         println!("  Summary File:    {}", summary_filename);
-                        println!("  Branch:          {}", args.branch);
                         println!("  Cipher:          Plaintext (None)");
                         println!("  Compression:     {}", args.compression());
                         println!("  Root Inode:      1 (/)");

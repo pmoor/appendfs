@@ -180,7 +180,7 @@ impl InMemoryFS {
             .unwrap_or_else(|| Arc::new(crate::crypto::VolumeKey::plaintext()));
 
         let start_gen = log_writer.as_ref().map_or(1, |w| w.generation());
-        let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(start_gen, "main", now)));
+        let manifest = Arc::new(RwLock::new(LogManifest::new_with_time(start_gen, now)));
 
         let virtual_files = Arc::new(virtual_files::VirtualFileRegistry::new());
 
@@ -237,12 +237,7 @@ impl InMemoryFS {
         {
             let mut manifest = self.manifest.write().unwrap();
             if manifest.get_by_generation(generation).is_none() {
-                manifest.record_roll(
-                    generation,
-                    format!("{:06}.log", generation),
-                    now,
-                    crate::log::record::FILE_HEADER_SIZE as u64,
-                );
+                manifest.record_roll(generation, now, crate::log::record::FILE_HEADER_SIZE as u64);
             }
         }
         self.log_writer = Some(writer);

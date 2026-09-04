@@ -701,7 +701,6 @@ pub fn dump_summary_reader_with_path(
     } else {
         writeln!(out, "File:                <in-memory>").unwrap();
     }
-    writeln!(out, "Branch:              {}", reader.manifest.branch).unwrap();
     writeln!(out, "Generation:          {}", reader.header.generation).unwrap();
     writeln!(out, "Format Version:      {}", reader.header.version).unwrap();
     writeln!(out, "Last Transaction ID: {}", reader.header.last_tx_id).unwrap();
@@ -801,7 +800,8 @@ pub fn dump_summary_reader_with_path(
     writeln!(
         out,
         "Next Generation:     {} ({})",
-        reader.manifest.next_generation, reader.manifest.next_filename
+        reader.manifest.next_generation,
+        reader.manifest.next_filename()
     )
     .unwrap();
     if reader.manifest.logs.is_empty() {
@@ -945,8 +945,8 @@ pub fn dump_summary_reader_with_path(
                                             length,
                                         } => {
                                             format!(
-                                                "{:06}.log [record offset 0x{:08x} / {:<8}, payload offset {:<4}, len {}]",
-                                                generation,
+                                                "{} [record offset 0x{:08x} / {:<8}, payload offset {:<4}, len {}]",
+                                                crate::log::log_filename(generation),
                                                 record_log_offset,
                                                 record_log_offset,
                                                 payload_offset,
@@ -1269,7 +1269,6 @@ mod tests {
         let storage = Arc::new(OsStorage::new(dir.path()));
         init_volume(
             storage.clone(),
-            Some("feature-branch"),
             &crate::crypto::VolumeKey::plaintext(),
             crate::crypto::VolumeHeader::plaintext(),
         )
@@ -1280,7 +1279,6 @@ mod tests {
         // Level 0: Summary
         let dump_v0 = dump_file(storage.as_ref(), "000000.summary", 0, None).unwrap();
         assert!(dump_v0.contains("=== appendfs Summary File Dump ==="));
-        assert!(dump_v0.contains("Branch:              feature-branch"));
         assert!(dump_v0.contains("Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)"));
         assert!(dump_v0.contains("Checksum (BLAKE3):"));
         assert!(dump_v0.contains("VERIFIED"));
@@ -1329,7 +1327,6 @@ mod tests {
 
         let snapshot = fs.snapshot_all();
         let manifest = LogManifest {
-            branch: "feature-branch".to_string(),
             logs: vec![
                 crate::log::LogFileInfo {
                     generation: 1,
@@ -1351,7 +1348,6 @@ mod tests {
                 },
             ],
             next_generation: 3,
-            next_filename: "000003.log".to_string(),
         };
 
         export_summary(

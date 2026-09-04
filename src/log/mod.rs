@@ -13,7 +13,7 @@ pub use cache::LogFileCache;
 pub use codec::{RecordId, decode as decode_record, encode as encode_record};
 pub use extent::{ExtentState, SharedExtentState, ZERO_EXTENT_GENERATION, zero_extent_fields, zero_extent_len};
 pub use flusher::BackgroundFlusher;
-pub use manifest::{GenerationLiveStats, LogFileInfo, LogManifest};
+pub use manifest::{GenerationLiveStats, LogFileInfo, LogManifest, log_filename};
 pub use reader::{LogReader, LogRecord};
 pub use record::{
     DecodedPayload, FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, LogAttrDelta, LogDirectoryDelta, LogEntryDelta,
