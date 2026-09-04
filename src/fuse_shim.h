@@ -3,6 +3,9 @@
 
 #include <cstdint>
 
+// High bit flag indicating dynamic synthesized virtual file handles (bit 63)
+constexpr uint64_t VIRTUAL_FH_FLAG = 1ULL << 63;
+
 extern "C" {
 typedef void *shim_req_t;
 
