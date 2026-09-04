@@ -50,6 +50,7 @@ All code contributions follow a standard fork-and-pull-request workflow:
      ```
    - Devise a concrete action plan, implement the requested adjustments on the feature branch, and verify (`cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`).
    - Push updated commits to `origin` (or amend and force-push with `git push origin <branch> --force-with-lease`).
+   - Keep the Pull Request description updated: Always run `gh pr edit <pr> --body-file <file>` (or `--body "..."`) whenever review adjustments modify scope, rationale, or behavior so the PR text stays synchronized with the latest commits.
    - Respond to comment threads explaining the resolution (`gh api repos/pmoor/appendfs/pulls/<pr>/comments -X POST -F in_reply_to=<comment-id> -f body="..."`).
    - Resolve comment threads via GraphQL once fully addressed and verified:
      ```bash
