@@ -1677,18 +1677,23 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
         "check_remote_integrity must NOT issue individual head_object requests"
     );
 
-    // Fallback: If list_objects fails, check_remote_integrity falls back to head_object
+    // If list_objects fails, check_remote_integrity returns an error report without making head_object calls
     let failing_raw = Arc::new(FailingRemoteStore::new(raw_remote.clone()));
     let failing_counting = Arc::new(CountingRemoteStore::new(failing_raw.clone()));
     failing_raw.fail_method("list_objects");
 
-    let fallback_report = check_remote_integrity(failing_counting.as_ref(), "failing", &manifest);
-    assert!(fallback_report.is_clean(), "Fallback integrity check must still pass");
+    let failure_report = check_remote_integrity(failing_counting.as_ref(), "failing", &manifest);
+    assert!(
+        !failure_report.is_clean(),
+        "Integrity check must fail when remote listing fails"
+    );
+    assert_eq!(failure_report.issues.len(), 1);
+    assert_eq!(failure_report.issues[0].code, "REMOTE_LIST_FAILED");
     assert_eq!(failing_counting.lists(), 1, "list_objects was attempted once");
     assert_eq!(
         failing_counting.heads(),
-        3,
-        "Fell back to individual head_object requests for all 3 sealed generations"
+        0,
+        "No head_object calls should be made when list_objects fails"
     );
 
     // =========================================================================
@@ -1739,7 +1744,7 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     );
 
     // =========================================================================
-    // Part C: Test pruning fallback when list_objects fails on remote
+    // Part C: Test that failing list_objects skips remote without falling back to head_object
     // =========================================================================
     let file4 = create_core(&fs_arc, 1, "file_4.txt", 0o644, 0, 1000, 1000).unwrap();
     write_core(&fs_arc, file4.ino, b"Payload for generation 4", 0).unwrap();
@@ -1762,6 +1767,9 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     assert!(dir.path().join("000004.log").exists());
     failing_counting.metrics().reset();
 
+    // First cycle with list_objects failing:
+    // Replicates 000004.log and summary (which use head/put for initial upload),
+    // but pruning cannot verify remote quorum because list_objects fails.
     appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
         &fs_arc,
         &registry_arc,
@@ -1775,13 +1783,66 @@ fn test_remote_listing_md5_optimization_in_pruning_and_integrity_check() {
     )
     .unwrap();
 
-    // 000004.log must be replicated and then successfully pruned via head_object fallback
+    // 000004.log must NOT be pruned because listing failed on the remote
+    assert!(
+        dir.path().join("000004.log").exists(),
+        "000004.log must NOT be pruned when remote listing fails"
+    );
+
+    // Reset metrics and run another cycle while list_objects is still failing:
+    // Files are now confirmed in confirmed_gens/confirmed_sums, so Step 2 and 3 do 0 heads.
+    // Pruning must attempt list_objects and do 0 head_object calls!
+    failing_counting.metrics().reset();
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+
+    assert!(
+        dir.path().join("000004.log").exists(),
+        "000004.log must still NOT be pruned when listing continues to fail"
+    );
+    assert_eq!(failing_counting.lists(), 1, "Attempted 1 list_objects call");
+    assert_eq!(
+        failing_counting.heads(),
+        0,
+        "No head_object fallback calls should be issued during pruning"
+    );
+
+    // Now clear the failure so list_objects succeeds on the next cycle
+    failing_raw.clear_fail_method("list_objects");
+    failing_counting.metrics().reset();
+
+    appendfs::remote::RemoteReplicationWorker::run_cycle_with_audit(
+        &fs_arc,
+        &registry_arc,
+        dir.path(),
+        &mut last_part_sync,
+        &mut uploaded_parts,
+        &mut last_audit,
+        &mut confirmed_gens,
+        &mut confirmed_sums,
+        false,
+    )
+    .unwrap();
+
+    // 000004.log should now be cleanly pruned via batch listing
     assert!(
         !dir.path().join("000004.log").exists(),
-        "000004.log must be pruned via fallback"
+        "000004.log must be pruned once remote listing succeeds"
     );
-    assert!(
-        failing_counting.heads() >= 1,
-        "Fallback head_object was used during pruning"
+    assert_eq!(
+        failing_counting.lists(),
+        1,
+        "Pruning quorum check used 1 list_objects request"
     );
+    assert_eq!(failing_counting.heads(), 0, "No head_object calls were issued");
 }

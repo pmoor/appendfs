@@ -760,15 +760,15 @@ pub fn check_remote_integrity(
 
     // Batch-list all objects from the remote store to compare sizes and ETags (MD5)
     // in O(1) listing requests rather than dispatching individual head_object requests per log.
-    let listed_objects: Option<HashMap<String, crate::remote::RemoteObject>> = match remote.list_objects("") {
-        Ok(objs) => Some(objs.into_iter().map(|o| (o.key.clone(), o)).collect()),
+    let listed_objects: HashMap<String, crate::remote::RemoteObject> = match remote.list_objects("") {
+        Ok(objs) => objs.into_iter().map(|o| (o.key.clone(), o)).collect(),
         Err(e) => {
-            log::warn!(
-                "list_objects failed on remote '{}': {}, falling back to individual head_object requests",
-                remote_name,
-                e
-            );
-            None
+            report.issues.push(IntegrityIssue::error(
+                "REMOTE_LIST_FAILED",
+                None,
+                format!("Failed to list objects on remote '{}': {}", remote_name, e),
+            ));
+            return report;
         }
     };
 
@@ -778,13 +778,8 @@ pub fn check_remote_integrity(
             continue;
         };
 
-        let remote_obj_res = match listed_objects {
-            Some(ref map) => Ok(map.get(&log_entry.filename).cloned()),
-            None => remote.head_object(&log_entry.filename),
-        };
-
-        match remote_obj_res {
-            Ok(Some(remote_obj)) => {
+        match listed_objects.get(&log_entry.filename) {
+            Some(remote_obj) => {
                 if remote_obj.size != log_entry.total_bytes {
                     report.issues.push(IntegrityIssue::error(
                         "REMOTE_SIZE_MISMATCH",
@@ -823,21 +818,11 @@ pub fn check_remote_integrity(
                     }
                 }
             }
-            Ok(None) => {
+            None => {
                 report.issues.push(IntegrityIssue::error(
                     "REMOTE_OBJECT_MISSING",
                     None,
                     format!("Remote '{}' is missing object {}", remote_name, log_entry.filename),
-                ));
-            }
-            Err(e) => {
-                report.issues.push(IntegrityIssue::error(
-                    "REMOTE_IO_ERROR",
-                    None,
-                    format!(
-                        "Error querying remote '{}' for {}: {}",
-                        remote_name, log_entry.filename, e
-                    ),
                 ));
             }
         }

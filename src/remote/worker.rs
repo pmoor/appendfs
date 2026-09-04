@@ -875,7 +875,7 @@ impl RemoteReplicationWorker {
                 }
                 Err(e) => {
                     log::warn!(
-                        "list_objects failed on remote '{}' during pruning: {}, falling back to head_object",
+                        "list_objects failed on remote '{}' during pruning: {}. Remote will be skipped for this pruning cycle",
                         remote_name,
                         e
                     );
@@ -890,13 +890,13 @@ impl RemoteReplicationWorker {
 
             // Verify quorum k of N stores have matching size and ETag
             let mut verified_copies = 0;
-            for (i, (_, remote, _, _)) in stores.iter().enumerate() {
-                let remote_obj_res = match &store_listings[i] {
-                    Some(map) => Ok(map.get(filename).cloned()),
-                    None => remote.head_object(filename),
+            for (i, _) in stores.iter().enumerate() {
+                let Some(map) = &store_listings[i] else {
+                    // Remote listing failed; skip this remote for now rather than issuing expensive head_object requests
+                    continue;
                 };
 
-                if let Ok(Some(remote_obj)) = remote_obj_res
+                if let Some(remote_obj) = map.get(filename)
                     && remote_obj.size == log_entry.total_bytes
                 {
                     if let Some(expected_md5) = log_entry.md5 {
