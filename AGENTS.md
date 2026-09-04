@@ -11,6 +11,35 @@ AppendFS is a high-performance append-only log-structured filesystem with FUSE s
    - Use injected testable clocks (`Arc<dyn Clock>` / `Clock` trait) rather than unmocked calls to `SystemTime::now()`.
    - Use injected randomness with fixed or reproducible seeds (e.g. `ChaCha8Rng::seed_from_u64(...)`) in tests, fuzzers, and stress suites so every failure can be reliably reproduced and investigated.
 
+## Development & Review Workflow
+
+All code contributions follow a standard fork-and-pull-request workflow:
+- **`upstream`**: `pmoor/appendfs` (canonical repository). **Never push directly to `upstream`.**
+- **`origin`**: `pmoor-agent/appendfs` (agent working fork). Always push feature branches to `origin`.
+
+### Step-by-Step Lifecycle
+
+1. **Develop on a local feature branch**:
+   - Always branch off an up-to-date `main` (synchronized with `upstream/main`).
+   - Keep changes focused and atomic.
+2. **Push feature branch to `pmoor-agent/appendfs` (`origin`)**:
+   - Push to `origin`: `git push -u origin <branch-name>`.
+   - Remember: **NEVER push directly to `upstream`**.
+3. **Open a Pull Request against upstream (`pmoor/appendfs`)**:
+   - Open the PR targeting `main` and assign to `pmoor` (e.g. `gh pr create --repo pmoor/appendfs --base main --assignee pmoor ...`).
+   - Include a concise summary of changes, rationale, and verification commands executed.
+4. **Wait for review & address feedback**:
+   - Inspect review feedback and inline comments (`gh api repos/pmoor/appendfs/pulls/<pr>/comments`).
+   - Devise a concrete action plan, implement the requested adjustments on the feature branch, and verify (`cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`).
+   - Push updated commits to `origin` (or amend and force-push with `git push origin <branch> --force-with-lease`).
+   - Respond to comment threads explaining the resolution. Feel free to resolve comment threads once they are fully addressed.
+5. **Repeat until all unresolved comments are resolved**.
+6. **Wait for PR to be approved and merged** into `upstream/main`.
+7. **Clean up local and remote feature branches**:
+   - Fetch `upstream/main`, fast-forward local `main`, and push `main` to `origin/main`.
+   - Delete the local feature branch (`git branch -d <branch-name>`).
+   - Delete / prune the merged remote branch on `origin` (`git remote prune origin`).
+
 ## Common Commands
 
 ### Build
