@@ -60,7 +60,7 @@ pub fn list_dir_core(fs: &InMemoryFS, ino: u64) -> Result<Vec<(String, u64)>, i3
     let mut entries = fs.list_directory(ino).ok_or(libc::ENOENT)?;
     if ino == 1 {
         let mut map: BTreeMap<String, u64> = entries.into_iter().collect();
-        for (name, v_ino) in fs.virtual_files.list_entries() {
+        for (name, v_ino) in fs.list_virtual_entries() {
             map.entry(name).or_insert(v_ino);
         }
         entries = map.into_iter().collect();

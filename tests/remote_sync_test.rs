@@ -863,7 +863,6 @@ fn test_latency_remote_store_in_tiered_reading() {
 
 #[test]
 fn test_virtual_remotes_status_file_lifecycle_and_content() {
-    use appendfs::fs::VIRTUAL_FH_FLAG;
     use appendfs::operations::dir::list_dir_core;
 
     let storage = Arc::new(MemoryStorage::new());
@@ -914,7 +913,8 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
         ".remotes must appear in root directory listing"
     );
     let remotes_ino = remotes_entry.unwrap().1;
-    assert!(fs_arc.virtual_files.is_virtual_ino(remotes_ino));
+    let attr = fs_arc.get_attr(remotes_ino).unwrap();
+    assert_eq!(attr.file_type, appendfs::shim::FileType::RegularFile);
 
     // 2. Lookup child .remotes on parent 1
     assert_eq!(fs_arc.lookup_child(1, ".remotes"), Some(remotes_ino));
@@ -945,8 +945,7 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     .unwrap();
 
     // 4. Open virtual file handle
-    let fh = fs_arc.open_file_handle(remotes_ino, 0);
-    assert_ne!(fh & VIRTUAL_FH_FLAG, 0, "Virtual handle must have high-bit flag set");
+    let fh = open_core(&fs_arc, remotes_ino, libc::O_RDONLY as u32).unwrap();
 
     // 5. Read .remotes content
     let content_bytes = read_core(&fs_arc, remotes_ino, fh, 0, 4096).unwrap();
@@ -967,8 +966,12 @@ fn test_virtual_remotes_status_file_lifecycle_and_content() {
     assert!(content_str.contains("Synced Generation:  1 / 1"));
 
     // 6. Release file handle
-    fs_arc.release_file_handle(fh, remotes_ino).unwrap();
-    assert!(fs_arc.virtual_handles.read().unwrap().get(&fh).is_none());
+    release_core(&fs_arc, remotes_ino, fh).unwrap();
+    assert_eq!(
+        read_core(&fs_arc, remotes_ino, fh, 0, 4096),
+        Err(libc::EBADF),
+        "Reading from released handle must return EBADF"
+    );
 }
 
 #[test]

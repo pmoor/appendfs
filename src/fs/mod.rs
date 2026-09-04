@@ -117,9 +117,9 @@ pub struct InMemoryFS {
     /// module has already paid for.
     pub volume_header: crate::crypto::VolumeHeader,
     /// Dynamic virtual files registered in the filesystem root (`/`).
-    pub virtual_files: Arc<virtual_files::VirtualFileRegistry>,
+    pub(crate) virtual_files: Arc<virtual_files::VirtualFileRegistry>,
     /// Active open virtual file handles holding frozen point-in-time snapshot strings.
-    pub virtual_handles: RwLock<HashMap<u64, Vec<u8>>>,
+    pub(crate) virtual_handles: RwLock<HashMap<u64, Vec<u8>>>,
     /// Optional live RemoteRegistry instance for remote status reporting.
     pub remote_registry: RwLock<Option<Arc<RwLock<crate::remote::RemoteRegistry>>>>,
     /// Live telemetry counters and synchronization state across all remotes.
@@ -264,6 +264,16 @@ impl InMemoryFS {
     pub fn register_remote_status(&self) {
         self.virtual_files
             .register(".remotes", crate::remote::worker::format_remotes_status);
+    }
+
+    /// Returns true if `ino` is a synthesized virtual file.
+    pub fn is_virtual_ino(&self, ino: u64) -> bool {
+        self.virtual_files.is_virtual_ino(ino)
+    }
+
+    /// Returns all registered root directory virtual entries `(name, ino)`.
+    pub fn list_virtual_entries(&self) -> Vec<(String, u64)> {
+        self.virtual_files.list_entries()
     }
 
     pub fn with_clock_and_storage(clock: Arc<dyn Clock>, storage: Arc<dyn Storage>) -> Self {

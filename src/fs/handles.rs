@@ -33,6 +33,22 @@ impl InMemoryFS {
         self.file_handles.read().unwrap().get(&fh).copied()
     }
 
+    pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+        if (fh & super::VIRTUAL_FH_FLAG) != 0 {
+            let handles = self.virtual_handles.read().unwrap();
+            let buf = handles.get(&fh).ok_or(libc::EBADF)?;
+            let start = (offset as usize).min(buf.len());
+            let end = (start + size).min(buf.len());
+            return Ok(buf[start..end].to_vec());
+        }
+
+        let handle = self.get_file_handle(fh).ok_or(libc::EBADF)?;
+        if handle.ino != ino {
+            return Err(libc::EBADF);
+        }
+        self.read_file_data(ino, offset, size)
+    }
+
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {
         if (fh & super::VIRTUAL_FH_FLAG) != 0 {
             self.virtual_handles.write().unwrap().remove(&fh).ok_or(libc::EBADF)?;

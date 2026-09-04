@@ -23,7 +23,7 @@ pub fn unlink_core(fs: &InMemoryFS, parent: u64, name: &str) -> Result<(), i32> 
         }
 
         let child_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
-        if fs.virtual_files.is_virtual_ino(child_ino) {
+        if fs.is_virtual_ino(child_ino) {
             return Err(libc::EPERM);
         }
         let child_attr = fs.get_attr(child_ino).ok_or(libc::ENOENT)?;
@@ -190,7 +190,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
         }
 
         let source_ino = fs.lookup_child(parent, name).ok_or(libc::ENOENT)?;
-        if fs.virtual_files.is_virtual_ino(source_ino) {
+        if fs.is_virtual_ino(source_ino) {
             return Err(libc::EPERM);
         }
         let source_attr = fs.get_attr(source_ino).ok_or(libc::ENOENT)?;
@@ -217,7 +217,7 @@ pub fn rename_core(fs: &InMemoryFS, parent: u64, name: &str, newparent: u64, new
 
         let mut dest_was_dir = false;
         if let Some(dest_ino) = fs.lookup_child(newparent, newname) {
-            if fs.virtual_files.is_virtual_ino(dest_ino) {
+            if fs.is_virtual_ino(dest_ino) {
                 return Err(libc::EPERM);
             }
             // POSIX: when old and new resolve to different directory entries for the same
@@ -338,7 +338,7 @@ pub fn link_core(fs: &InMemoryFS, ino: u64, newparent: u64, newname: &str) -> Re
         }
 
         let target_attr = fs.get_attr(ino).ok_or(libc::ENOENT)?;
-        if target_attr.file_type == FileType::Directory {
+        if target_attr.file_type == FileType::Directory || fs.is_virtual_ino(ino) {
             return Err(libc::EPERM);
         }
         if target_attr.nlink == 0 {

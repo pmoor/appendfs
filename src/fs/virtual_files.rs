@@ -179,14 +179,14 @@ mod tests {
         assert_eq!(data3, b"counter: 2\n");
         fs.release_file_handle(fh3, v_ino).unwrap();
 
-        // 5. Release fh1: buffer is freed
+        // 5. Release fh1: handle is freed and subsequent read returns EBADF
         fs.release_file_handle(fh1, v_ino).unwrap();
-        assert!(fs.virtual_handles.read().unwrap().get(&fh1).is_none());
+        assert_eq!(read_core(&fs, v_ino, fh1, 0, 100), Err(libc::EBADF));
         // fh2 remains untouched
-        assert!(fs.virtual_handles.read().unwrap().get(&fh2).is_some());
+        assert_eq!(read_core(&fs, v_ino, fh2, 0, 100).unwrap(), b"counter: 1\n");
 
         fs.release_file_handle(fh2, v_ino).unwrap();
-        assert!(fs.virtual_handles.read().unwrap().is_empty());
+        assert_eq!(read_core(&fs, v_ino, fh2, 0, 100), Err(libc::EBADF));
     }
 
     #[test]
@@ -279,6 +279,30 @@ mod tests {
 
         // 6. Creating over an existing virtual file returns EEXIST
         assert_eq!(create_core(&fs, 1, ".remotes", 0o644, 0, 1000, 1000), Err(libc::EEXIST));
+
+        // 7. Hardlinking a virtual file is rejected with EPERM
+        assert_eq!(
+            crate::operations::links::link_core(&fs, v_ino, 1, "link.txt"),
+            Err(libc::EPERM)
+        );
+
+        // 8. Xattr operations on virtual files are rejected / empty
+        assert_eq!(
+            crate::operations::xattr::setxattr_core(&fs, v_ino, "user.v", b"val", 0),
+            Err(libc::EPERM)
+        );
+        assert_eq!(
+            crate::operations::xattr::removexattr_core(&fs, v_ino, "user.v"),
+            Err(libc::EPERM)
+        );
+        assert_eq!(
+            crate::operations::xattr::getxattr_core(&fs, v_ino, "user.v", 0),
+            Err(libc::ENODATA)
+        );
+        assert_eq!(
+            crate::operations::xattr::listxattr_core(&fs, v_ino, 0),
+            Ok(crate::operations::xattr::ListxattrResult::Size(0))
+        );
     }
 
     #[test]
@@ -286,11 +310,13 @@ mod tests {
         let fs = InMemoryFS::new();
         fs.register_remote_status();
 
-        // Check unconfigured default
-        let initial_status = fs
-            .virtual_files
-            .generate_content(fs.virtual_files.get_ino_by_name(".remotes").unwrap(), &fs)
-            .unwrap();
+        let v_ino = fs.lookup_child(1, ".remotes").unwrap();
+
+        // Check unconfigured default via read_core
+        let fh1 = fs.open_file_handle(v_ino, 0);
+        let initial_bytes = read_core(&fs, v_ino, fh1, 0, 4096).unwrap();
+        let initial_status = String::from_utf8(initial_bytes).unwrap();
+        fs.release_file_handle(fh1, v_ino).unwrap();
         assert!(initial_status.contains("No remotes configured."));
         assert!(initial_status.contains("Volume Head Generation: 1"));
 
@@ -315,10 +341,10 @@ mod tests {
             telem.record_active_part("nas", 2, 3, now);
         }
 
-        let updated_status = fs
-            .virtual_files
-            .generate_content(fs.virtual_files.get_ino_by_name(".remotes").unwrap(), &fs)
-            .unwrap();
+        let fh2 = fs.open_file_handle(v_ino, 0);
+        let updated_bytes = read_core(&fs, v_ino, fh2, 0, 4096).unwrap();
+        let updated_status = String::from_utf8(updated_bytes).unwrap();
+        fs.release_file_handle(fh2, v_ino).unwrap();
 
         assert!(updated_status.contains("=== Remote Status (Volume Head Generation: 1) ==="));
         assert!(updated_status.contains("[Remote: nas]"));

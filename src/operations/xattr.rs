@@ -19,6 +19,9 @@ pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Resu
     if fs.get_attr(ino).is_none() {
         return Err(libc::ENOENT);
     }
+    if fs.is_virtual_ino(ino) {
+        return Err(libc::ENODATA);
+    }
 
     let val = fs.get_xattr(ino, name).ok_or(libc::ENODATA)?;
     if size == 0 {
@@ -33,6 +36,9 @@ pub fn getxattr_core(fs: &InMemoryFS, ino: u64, name: &str, size: usize) -> Resu
 pub fn setxattr_core(fs: &InMemoryFS, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
+    }
+    if fs.is_virtual_ino(ino) {
+        return Err(libc::EPERM);
     }
 
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
@@ -65,6 +71,13 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<Listxatt
     if fs.get_attr(ino).is_none() {
         return Err(libc::ENOENT);
     }
+    if fs.is_virtual_ino(ino) {
+        return Ok(if size == 0 {
+            ListxattrResult::Size(0)
+        } else {
+            ListxattrResult::Data(Vec::new())
+        });
+    }
 
     let keys = fs.list_xattrs(ino).ok_or(libc::ENOENT)?;
     let mut buf = Vec::new();
@@ -85,6 +98,9 @@ pub fn listxattr_core(fs: &InMemoryFS, ino: u64, size: usize) -> Result<Listxatt
 pub fn removexattr_core(fs: &InMemoryFS, ino: u64, name: &str) -> Result<(), i32> {
     if fs.is_read_only() {
         return Err(libc::EROFS);
+    }
+    if fs.is_virtual_ino(ino) {
+        return Err(libc::EPERM);
     }
 
     if fs.get_attr(ino).is_none() {

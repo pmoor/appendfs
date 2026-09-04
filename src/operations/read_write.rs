@@ -30,22 +30,7 @@ pub fn read_core(fs: &InMemoryFS, ino: u64, fh: u64, offset: i64, size: usize) -
     if offset < 0 {
         return Err(libc::EINVAL);
     }
-    if (fh & crate::fs::VIRTUAL_FH_FLAG) != 0 {
-        let handles = fs.virtual_handles.read().unwrap();
-        if let Some(buf) = handles.get(&fh) {
-            let start = (offset as usize).min(buf.len());
-            let end = (start + size).min(buf.len());
-            return Ok(buf[start..end].to_vec());
-        } else {
-            return Err(libc::EBADF);
-        }
-    }
-
-    let handle = fs.get_file_handle(fh).ok_or(libc::EBADF)?;
-    if handle.ino != ino {
-        return Err(libc::EBADF);
-    }
-    fs.read_file_data(ino, offset as u64, size)
+    fs.read_handle(ino, fh, offset as u64, size)
 }
 
 pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
@@ -66,7 +51,7 @@ pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
         if fs.is_read_only() {
             return Err(libc::EROFS);
         }
-        if fs.virtual_files.is_virtual_ino(ino) {
+        if fs.is_virtual_ino(ino) {
             return Err(libc::EACCES);
         }
     }
@@ -93,7 +78,7 @@ pub fn write_core(fs: &InMemoryFS, ino: u64, buf: &[u8], offset: i64) -> Result<
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    if fs.virtual_files.is_virtual_ino(ino) {
+    if fs.is_virtual_ino(ino) {
         return Err(libc::EPERM);
     }
     fs.check_flush_capacity()?;
@@ -193,7 +178,7 @@ pub fn setattr_core(
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    if fs.virtual_files.is_virtual_ino(ino) {
+    if fs.is_virtual_ino(ino) {
         return Err(libc::EPERM);
     }
     fs.check_flush_capacity()?;
@@ -374,7 +359,7 @@ pub fn fallocate_core(fs: &InMemoryFS, ino: u64, mode: i32, offset: i64, length:
     if fs.is_read_only() {
         return Err(libc::EROFS);
     }
-    if fs.virtual_files.is_virtual_ino(ino) {
+    if fs.is_virtual_ino(ino) {
         return Err(libc::EPERM);
     }
     if offset < 0 || length <= 0 {
