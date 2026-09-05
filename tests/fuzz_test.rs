@@ -47,10 +47,6 @@ fn test_differential_fuzzing_and_crash_recovery() {
         fs_crash.set_max_extent_size(101);
         fs_remote.set_max_extent_size(83);
 
-        for lat in &fs_remote.latency_remotes {
-            lat.set_random_delay(Duration::from_millis(0), Duration::from_millis(1));
-        }
-
         let mut observed_flush_failures = 0usize;
 
         // Keep track of created subdirectories (inode IDs) to perform operations on
