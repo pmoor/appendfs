@@ -2956,3 +2956,216 @@ fn test_periodic_summary_generation_by_bytes() {
     assert!(names.contains(&"f3.bin".to_string()));
     assert!(names.contains(&"f4.bin".to_string()));
 }
+
+#[test]
+fn test_fuse_async_read_concurrency() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut mount = TestMount::new_rw();
+    let mount_path = mount.path().to_path_buf();
+
+    // 1. Prepare deterministic patterned test datasets exceeding 128 KiB (LARGE_READ_THRESHOLD)
+    let pattern_256k: Vec<u8> = (0..(256 * 1024)).map(|i| ((i * 31 + 17) % 251) as u8).collect();
+    let pattern_384k: Vec<u8> = (0..(384 * 1024)).map(|i| ((i * 37 + 19) % 251) as u8).collect();
+
+    let path_256k = mount_path.join("large_256k.bin");
+    let path_384k = mount_path.join("large_384k.bin");
+    let path_sparse = mount_path.join("large_sparse.bin");
+
+    // Write large files
+    fs::write(&path_256k, &pattern_256k).unwrap();
+    fs::write(&path_384k, &pattern_384k).unwrap();
+
+    // Write sparse file (gap of 150 KiB followed by 64 KiB data = 214 KiB total, exceeding threshold)
+    let sparse_data: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 253) as u8).collect();
+    {
+        let mut sparse_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path_sparse)
+            .unwrap();
+        sparse_file.seek(SeekFrom::Start(150 * 1024)).unwrap();
+        sparse_file.write_all(&sparse_data).unwrap();
+        sparse_file.sync_all().unwrap();
+    }
+
+    // Sync all files to ensure persistence
+    fs::File::open(&path_256k).unwrap().sync_all().unwrap();
+    fs::File::open(&path_384k).unwrap().sync_all().unwrap();
+
+    // 2. Concurrently read staged/live large files, sparse file, concurrent writers, and directory listings
+    let mut threads = Vec::new();
+
+    // Reader 1: Full 256 KiB reads (triggers LARGE_READ_THRESHOLD async offload)
+    {
+        let p = path_256k.clone();
+        let expected = pattern_256k.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..15 {
+                let data = fs::read(&p).unwrap();
+                assert_eq!(data.len(), expected.len());
+                assert_eq!(data, expected);
+            }
+        }));
+    }
+
+    // Reader 2: Full 384 KiB reads
+    {
+        let p = path_384k.clone();
+        let expected = pattern_384k.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..15 {
+                let data = fs::read(&p).unwrap();
+                assert_eq!(data.len(), expected.len());
+                assert_eq!(data, expected);
+            }
+        }));
+    }
+
+    // Reader 3: Chunked offset reads on 256 KiB file
+    {
+        let p = path_256k.clone();
+        let expected = pattern_256k.clone();
+        threads.push(thread::spawn(move || {
+            let mut file = fs::File::open(&p).unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            for i in 0..20 {
+                let offset = ((i * 13 * 1024) % (200 * 1024)) as u64;
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.read_exact(&mut buf).unwrap();
+                let start = offset as usize;
+                let end = start + buf.len();
+                assert_eq!(&buf[..], &expected[start..end]);
+            }
+        }));
+    }
+
+    // Reader 4: Read sparse file across the hole into the populated extent
+    {
+        let p = path_sparse.clone();
+        let sparse_data_clone = sparse_data.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..15 {
+                let data = fs::read(&p).unwrap();
+                assert_eq!(data.len(), (150 + 64) * 1024);
+                // First 150 KiB must be all zeros
+                assert!(data[..(150 * 1024)].iter().all(|&b| b == 0));
+                // Remaining 64 KiB must match sparse_data
+                assert_eq!(&data[(150 * 1024)..], &sparse_data_clone[..]);
+            }
+        }));
+    }
+
+    // Writer 1: Concurrent writes and removes in a subdirectory
+    {
+        let mount_p = mount_path.clone();
+        threads.push(thread::spawn(move || {
+            let sub = mount_p.join("writers_1");
+            fs::create_dir_all(&sub).unwrap();
+            let chunk = vec![0xABu8; 8 * 1024];
+            for i in 0..15 {
+                let file_p = sub.join(format!("scratch_{}.bin", i));
+                fs::write(&file_p, &chunk).unwrap();
+                let readback = fs::read(&file_p).unwrap();
+                assert_eq!(readback, chunk);
+                fs::remove_file(&file_p).unwrap();
+            }
+        }));
+    }
+
+    // Directory lister: Concurrent readdir and stat calls
+    {
+        let mount_p = mount_path.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..15 {
+                thread::sleep(Duration::from_millis(5));
+                if let Ok(entries) = fs::read_dir(&mount_p) {
+                    for entry in entries.flatten() {
+                        let _ = entry.metadata();
+                    }
+                }
+            }
+        }));
+    }
+
+    // Join all live-layer concurrent threads
+    for t in threads {
+        t.join().expect("Concurrent live-layer thread failed");
+    }
+
+    // 3. Remount filesystem cleanly to test the cold / storage read path
+    mount.remount_rw();
+    let mount_path = mount.path().to_path_buf();
+
+    let path_256k = mount_path.join("large_256k.bin");
+    let path_384k = mount_path.join("large_384k.bin");
+    let path_sparse = mount_path.join("large_sparse.bin");
+
+    // 4. Verify cold reads from flushed log extents via Tokio async offload
+    let mut cold_threads = Vec::new();
+
+    // Cold Reader 1: Full 256 KiB read from disk
+    {
+        let p = path_256k.clone();
+        let expected = pattern_256k.clone();
+        cold_threads.push(thread::spawn(move || {
+            for _ in 0..10 {
+                let data = fs::read(&p).unwrap();
+                assert_eq!(data.len(), expected.len());
+                assert_eq!(data, expected);
+            }
+        }));
+    }
+
+    // Cold Reader 2: Full 384 KiB read from disk
+    {
+        let p = path_384k.clone();
+        let expected = pattern_384k.clone();
+        cold_threads.push(thread::spawn(move || {
+            for _ in 0..10 {
+                let data = fs::read(&p).unwrap();
+                assert_eq!(data.len(), expected.len());
+                assert_eq!(data, expected);
+            }
+        }));
+    }
+
+    // Cold Reader 3: Sparse file cold read
+    {
+        let p = path_sparse.clone();
+        let sparse_data_clone = sparse_data.clone();
+        cold_threads.push(thread::spawn(move || {
+            for _ in 0..10 {
+                let data = fs::read(&p).unwrap();
+                assert_eq!(data.len(), (150 + 64) * 1024);
+                assert!(data[..(150 * 1024)].iter().all(|&b| b == 0));
+                assert_eq!(&data[(150 * 1024)..], &sparse_data_clone[..]);
+            }
+        }));
+    }
+
+    // Cold Reader 4: Chunked seeks across disk blocks
+    {
+        let p = path_384k.clone();
+        let expected = pattern_384k.clone();
+        cold_threads.push(thread::spawn(move || {
+            let mut file = fs::File::open(&p).unwrap();
+            let mut buf = vec![0u8; 32 * 1024];
+            for i in 0..15 {
+                let offset = ((i * 23 * 1024) % (300 * 1024)) as u64;
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.read_exact(&mut buf).unwrap();
+                let start = offset as usize;
+                let end = start + buf.len();
+                assert_eq!(&buf[..], &expected[start..end]);
+            }
+        }));
+    }
+
+    for t in cold_threads {
+        t.join().expect("Concurrent cold-layer read thread failed");
+    }
+
+    mount.unmount();
+}

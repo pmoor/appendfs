@@ -16,7 +16,7 @@ mod layers;
 mod overlay;
 pub mod virtual_files;
 
-pub use layers::InodeLayerStack;
+pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use virtual_files::{VIRTUAL_FH_FLAG, VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};

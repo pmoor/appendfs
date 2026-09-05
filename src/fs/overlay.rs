@@ -4,7 +4,7 @@
 //! into them. Reads go through [`InMemoryFS::with_layer_stack`], which takes all three
 //! layer locks in a safe order - see [`super::layers`] for why the order matters.
 
-use super::{InMemoryFS, InodeLayerStack};
+use super::{InMemoryFS, InodeLayerStack, ReadPlan};
 use crate::node::{AttrDelta, DirectoryDelta, EntryDelta, FileDelta, Node, NodeDelta, SpecialDelta, SymlinkDelta};
 use crate::range_map::RangeMap;
 use crate::shim::{FileAttr, FileType};
@@ -338,11 +338,11 @@ impl InMemoryFS {
         self.update_attr_delta(ino, delta);
     }
 
-    /// Reads file data at `[offset, offset + size)` resolving extents across layers.
-    pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
-        let read_buf = self.with_inode_layers(ino, |layers| layers.read_file_data(offset, size, self))?;
+    /// Plans file data read resolving extents across layers into a [`ReadPlan`].
+    pub fn plan_read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
+        let plan = self.with_inode_layers(ino, |layers| layers.plan_read_file_data(offset, size, self))?;
 
-        if self.track_atime {
+        if self.track_atime && plan.total_len > 0 {
             let now = self.clock.now();
             self.update_attr_delta(
                 ino,
@@ -353,7 +353,13 @@ impl InMemoryFS {
             );
         }
 
-        Ok(read_buf)
+        Ok(plan)
+    }
+
+    /// Reads file data at `[offset, offset + size)` resolving extents across layers.
+    pub fn read_file_data(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+        let plan = self.plan_read_file_data(ino, offset, size)?;
+        self.execute_read_plan_sync(&plan)
     }
 
     /// Merges all layers into a consolidated snapshot map atomically while holding all 3 layer guards.

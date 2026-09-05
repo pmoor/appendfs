@@ -5,7 +5,7 @@
 //! Directory handles hold an immutable snapshot of the listing taken at `opendir`, so a
 //! paginated `readdir` is isolated from concurrent mutations.
 
-use super::{FileHandle, FlockState, InMemoryFS};
+use super::{FileHandle, FlockState, InMemoryFS, ReadPlan, ReadSlice, ReadSliceSource};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -33,20 +33,41 @@ impl InMemoryFS {
         self.file_handles.read().unwrap().get(&fh).copied()
     }
 
-    pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+    pub fn plan_read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<ReadPlan, i32> {
         if (fh & super::VIRTUAL_FH_FLAG) != 0 {
             let handles = self.virtual_handles.read().unwrap();
             let buf = handles.get(&fh).ok_or(libc::EBADF)?;
             let start = (offset as usize).min(buf.len());
             let end = (start + size).min(buf.len());
-            return Ok(buf[start..end].to_vec());
+            let slice_len = end - start;
+            return Ok(ReadPlan {
+                total_len: slice_len,
+                has_cold_slices: false,
+                slices: if slice_len > 0 {
+                    vec![ReadSlice {
+                        dst_offset: 0,
+                        len: slice_len,
+                        source: ReadSliceSource::Memory {
+                            data: Arc::new(buf.clone()),
+                            src_offset: start,
+                        },
+                    }]
+                } else {
+                    Vec::new()
+                },
+            });
         }
 
         let handle = self.get_file_handle(fh).ok_or(libc::EBADF)?;
         if handle.ino != ino {
             return Err(libc::EBADF);
         }
-        self.read_file_data(ino, offset, size)
+        self.plan_read_file_data(ino, offset, size)
+    }
+
+    pub fn read_handle(&self, ino: u64, fh: u64, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+        let plan = self.plan_read_handle(ino, fh, offset, size)?;
+        self.execute_read_plan_sync(&plan)
     }
 
     pub fn release_file_handle(&self, fh: u64, ino: u64) -> Result<(), i32> {

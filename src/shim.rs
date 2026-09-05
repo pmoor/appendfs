@@ -262,6 +262,8 @@ pub struct Request {
     req: shim_req_t,
 }
 
+unsafe impl Send for Request {}
+
 impl Request {
     pub fn reply_err(self, err: i32) {
         unsafe {

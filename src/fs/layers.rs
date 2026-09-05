@@ -244,8 +244,13 @@ impl<'a> InodeLayerStack<'a> {
         Some(names.into_iter().collect())
     }
 
-    /// Reads file data resolving extents across layers.
-    pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, i32> {
+    /// Plans a read across layers, resolving extents into disjoint, ordered [`ReadSlice`] descriptors.
+    ///
+    /// For memory-resident chunks (staged extents or in-memory decrypted record cache hits),
+    /// references to [`Arc<Vec<u8>>`] are cloned with zero byte-copying.
+    ///
+    /// If all requested bytes are covered by in-memory slices or holes, `has_cold_slices` will be false.
+    pub fn plan_read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<ReadPlan, i32> {
         let attr = self.attr().ok_or(libc::ENOENT)?;
         if attr.file_type != FileType::RegularFile {
             return Err(libc::EISDIR);
@@ -253,16 +258,91 @@ impl<'a> InodeLayerStack<'a> {
 
         let file_size = attr.size as u64;
         if offset >= file_size {
-            return Ok(Vec::new());
+            return Ok(ReadPlan::empty());
         }
 
-        let read_len = std::cmp::min(size as u64, file_size - offset);
-        let mut read_buf = vec![0u8; read_len as usize];
-        let mut filled = vec![false; read_len as usize];
+        let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
+        let mut filled = vec![false; read_len];
+        let mut raw_slices = Vec::new();
 
-        // Newest layer first. Truncation and hole punching both leave `Zero` extents, which
-        // claim their range in `filled` and so stop older layers contributing there - no
-        // separate mask has to be threaded down the stack.
+        let mut add_extent = |ext_start: u64, ext_len: u64, shared_state: &SharedExtentState| {
+            let seg_start = std::cmp::max(offset, ext_start);
+            let seg_end = std::cmp::min(offset + read_len as u64, ext_start + ext_len);
+            if seg_start >= seg_end {
+                return;
+            }
+
+            let dst_offset = (seg_start - offset) as usize;
+            let seg_len = (seg_end - seg_start) as usize;
+            let slice_inner_offset = (seg_start - ext_start) as usize;
+
+            if filled[dst_offset..dst_offset + seg_len].iter().all(|&b| b) {
+                return;
+            }
+
+            // Find all contiguous unfilled intervals within [dst_offset..dst_offset + seg_len]
+            let mut idx = dst_offset;
+            let end_idx = dst_offset + seg_len;
+            while idx < end_idx {
+                if filled[idx] {
+                    idx += 1;
+                    continue;
+                }
+                let sub_start = idx;
+                while idx < end_idx && !filled[idx] {
+                    filled[idx] = true;
+                    idx += 1;
+                }
+                let sub_end = idx;
+                let sub_len = sub_end - sub_start;
+                let inner_offset = slice_inner_offset + (sub_start - dst_offset);
+
+                let state = shared_state.read_state();
+                let source = match state {
+                    ExtentState::Zero { .. } => ReadSliceSource::Zero,
+                    ExtentState::Staged {
+                        data,
+                        payload_offset,
+                        length: _,
+                    } => {
+                        let src_offset = payload_offset as usize + inner_offset;
+                        ReadSliceSource::Memory { data, src_offset }
+                    }
+                    ExtentState::Disk {
+                        generation,
+                        record_log_offset,
+                        payload_offset,
+                        length: _,
+                    } => {
+                        let cached = fs
+                            .log_cache
+                            .as_ref()
+                            .and_then(|c| c.decrypted_cache.get(generation, record_log_offset));
+                        if let Some(cached_data) = cached {
+                            let src_offset = payload_offset as usize + inner_offset;
+                            ReadSliceSource::Memory {
+                                data: cached_data,
+                                src_offset,
+                            }
+                        } else {
+                            ReadSliceSource::Disk {
+                                generation,
+                                record_log_offset,
+                                payload_offset,
+                                slice_inner_offset: inner_offset as u32,
+                            }
+                        }
+                    }
+                };
+
+                raw_slices.push(ReadSlice {
+                    dst_offset: sub_start,
+                    len: sub_len,
+                    source,
+                });
+            }
+        };
+
         let mut hit_tombstone = false;
         for delta in self.deltas.iter().rev() {
             match delta {
@@ -271,16 +351,8 @@ impl<'a> InodeLayerStack<'a> {
                     break;
                 }
                 EntryDelta::Node(NodeDelta::File(f)) => {
-                    for (ext_start, ext_len, shared_state) in f.extents.query(offset, read_len) {
-                        fs.copy_extent_data(
-                            &mut read_buf,
-                            &mut filled,
-                            offset,
-                            read_len,
-                            ext_start,
-                            ext_len,
-                            &shared_state,
-                        )?;
+                    for (ext_start, ext_len, shared_state) in f.extents.query(offset, read_len as u64) {
+                        add_extent(ext_start, ext_len, &shared_state);
                     }
                 }
                 _ => {}
@@ -290,114 +362,199 @@ impl<'a> InodeLayerStack<'a> {
         if !hit_tombstone && let Some(arc) = self.base {
             let node = arc.as_ref();
             if let NodeKind::File { range_map, .. } = &node.kind {
-                {
-                    for (ext_start, ext_len, shared_state) in range_map.query(offset, read_len) {
-                        fs.copy_extent_data(
-                            &mut read_buf,
-                            &mut filled,
-                            offset,
-                            read_len,
-                            ext_start,
-                            ext_len,
-                            &shared_state,
-                        )?;
-                    }
+                for (ext_start, ext_len, shared_state) in range_map.query(offset, read_len as u64) {
+                    add_extent(ext_start, ext_len, &shared_state);
                 }
             }
         }
 
-        Ok(read_buf)
+        // Any bytes never covered by any extent are holes (Zero)
+        let mut idx = 0;
+        while idx < read_len {
+            if filled[idx] {
+                idx += 1;
+                continue;
+            }
+            let hole_start = idx;
+            while idx < read_len && !filled[idx] {
+                idx += 1;
+            }
+            raw_slices.push(ReadSlice {
+                dst_offset: hole_start,
+                len: idx - hole_start,
+                source: ReadSliceSource::Zero,
+            });
+        }
+
+        raw_slices.sort_by_key(|s| s.dst_offset);
+
+        // Coalesce adjacent contiguous slices with matching source
+        let mut coalesced: Vec<ReadSlice> = Vec::with_capacity(raw_slices.len());
+        for slice in raw_slices {
+            if let Some(prev) = coalesced.last_mut()
+                && prev.dst_offset + prev.len == slice.dst_offset
+            {
+                match (&mut prev.source, &slice.source) {
+                    (ReadSliceSource::Zero, ReadSliceSource::Zero) => {
+                        prev.len += slice.len;
+                        continue;
+                    }
+                    (
+                        ReadSliceSource::Memory {
+                            data: d1,
+                            src_offset: s1,
+                        },
+                        ReadSliceSource::Memory {
+                            data: d2,
+                            src_offset: s2,
+                        },
+                    ) if Arc::ptr_eq(d1, d2) && *s1 + prev.len == *s2 => {
+                        prev.len += slice.len;
+                        continue;
+                    }
+                    (
+                        ReadSliceSource::Disk {
+                            generation: g1,
+                            record_log_offset: r1,
+                            payload_offset: p1,
+                            slice_inner_offset: i1,
+                        },
+                        ReadSliceSource::Disk {
+                            generation: g2,
+                            record_log_offset: r2,
+                            payload_offset: p2,
+                            slice_inner_offset: i2,
+                        },
+                    ) if g1 == g2 && r1 == r2 && p1 == p2 && *i1 + prev.len as u32 == *i2 => {
+                        prev.len += slice.len;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            coalesced.push(slice);
+        }
+
+        let has_cold_slices = coalesced
+            .iter()
+            .any(|s| matches!(s.source, ReadSliceSource::Disk { .. }));
+
+        Ok(ReadPlan {
+            total_len: read_len,
+            has_cold_slices,
+            slices: coalesced,
+        })
+    }
+
+    /// Reads file data resolving extents across layers.
+    pub fn read_file_data(&self, offset: u64, size: usize, fs: &InMemoryFS) -> Result<Vec<u8>, i32> {
+        let plan = self.plan_read_file_data(offset, size, fs)?;
+        fs.execute_read_plan_sync(&plan)
     }
 }
 
-/// Extent payload resolution, used by [`InodeLayerStack::read_file_data`] to fill a read
-/// buffer from whichever layer owns each byte range.
+/// Source of data for a specific byte segment within a read plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadSliceSource {
+    /// Zero-filled (hole, punch-hole, or truncated region).
+    Zero,
+    /// In-memory: atomic pointer clone of `Arc<Vec<u8>>` (~10 ns).
+    Memory { data: Arc<Vec<u8>>, src_offset: usize },
+    /// Cold disk or remote S3 extent.
+    Disk {
+        generation: u64,
+        record_log_offset: u64,
+        payload_offset: u32,
+        slice_inner_offset: u32,
+    },
+}
+
+/// A contiguous segment of data within a read plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadSlice {
+    pub dst_offset: usize,
+    pub len: usize,
+    pub source: ReadSliceSource,
+}
+
+/// A complete recipe for fulfilling a read request across layer boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPlan {
+    pub total_len: usize,
+    pub has_cold_slices: bool,
+    pub slices: Vec<ReadSlice>,
+}
+
+impl ReadPlan {
+    pub fn empty() -> Self {
+        Self {
+            total_len: 0,
+            has_cold_slices: false,
+            slices: Vec::new(),
+        }
+    }
+}
+
 impl InMemoryFS {
-    #[allow(clippy::too_many_arguments)]
-    fn copy_extent_data(
-        &self,
-        dst_buf: &mut [u8],
-        filled: &mut [bool],
-        read_start: u64,
-        read_len: u64,
-        ext_start: u64,
-        ext_len: u64,
-        shared_state: &SharedExtentState,
-    ) -> Result<(), i32> {
-        let seg_start = std::cmp::max(read_start, ext_start);
-        let seg_end = std::cmp::min(read_start + read_len, ext_start + ext_len);
-        if seg_start >= seg_end {
-            return Ok(());
-        }
+    /// Executes a [`ReadPlan`] synchronously, reading any cold disk extents via [`LogFileCache`].
+    pub fn execute_read_plan_sync(&self, plan: &ReadPlan) -> Result<Vec<u8>, i32> {
+        execute_read_plan(plan, self.log_cache.as_deref(), &self.volume_key)
+    }
 
-        let seg_len = (seg_end - seg_start) as usize;
-        let dst_offset = (seg_start - read_start) as usize;
-        let slice_inner_offset = (seg_start - ext_start) as usize;
+    /// Executes a [`ReadPlan`] asynchronously, offloading cold disk I/O and large memory copies
+    /// to the Tokio thread pool with zero locks on [`InMemoryFS`].
+    pub async fn execute_read_plan_async(
+        plan: ReadPlan,
+        log_cache: Option<Arc<crate::log::LogFileCache>>,
+        volume_key: Arc<crate::crypto::VolumeKey>,
+    ) -> Result<Vec<u8>, i32> {
+        tokio::task::spawn_blocking(move || execute_read_plan(&plan, log_cache.as_deref(), &volume_key))
+            .await
+            .map_err(|_| libc::EIO)?
+    }
+}
 
-        if filled[dst_offset..dst_offset + seg_len].iter().all(|&b| b) {
-            return Ok(());
-        }
-
-        let mut temp_buf = vec![0u8; seg_len];
-        let mut bytes_read = 0usize;
-
-        let state = shared_state.read_state();
-        match state {
-            ExtentState::Staged {
-                data,
-                payload_offset,
-                length: _,
-            } => {
-                let src_start = payload_offset as usize + slice_inner_offset;
-                let src_end = std::cmp::min(src_start + seg_len, data.len());
-                let actual_len = std::cmp::min(seg_len, src_end.saturating_sub(src_start));
+/// Core execution helper for [`ReadPlan`] completely decoupled from [`InMemoryFS`].
+pub fn execute_read_plan(
+    plan: &ReadPlan,
+    log_cache: Option<&crate::log::LogFileCache>,
+    volume_key: &crate::crypto::VolumeKey,
+) -> Result<Vec<u8>, i32> {
+    let mut dst_buf = vec![0u8; plan.total_len];
+    for slice in &plan.slices {
+        match &slice.source {
+            ReadSliceSource::Zero => {}
+            ReadSliceSource::Memory { data, src_offset } => {
+                let src_start = *src_offset;
+                let src_end = std::cmp::min(src_start + slice.len, data.len());
+                let actual_len = std::cmp::min(slice.len, src_end.saturating_sub(src_start));
                 if actual_len > 0 && src_start < data.len() {
-                    temp_buf[..actual_len].copy_from_slice(&data[src_start..src_start + actual_len]);
-                    bytes_read = actual_len;
+                    dst_buf[slice.dst_offset..slice.dst_offset + actual_len]
+                        .copy_from_slice(&data[src_start..src_start + actual_len]);
                 }
             }
-            // A hole contributes zeros, which `temp_buf` already holds. Claiming the
-            // segment is the whole point: it marks these bytes `filled`, so lower layers
-            // are not consulted and the punched-out data stays punched out.
-            ExtentState::Zero { .. } => {
-                bytes_read = seg_len;
-            }
-            ExtentState::Disk {
+            ReadSliceSource::Disk {
                 generation,
                 record_log_offset,
                 payload_offset,
-                length: _,
+                slice_inner_offset,
             } => {
-                if let Some(ref cache) = self.log_cache {
-                    match cache.read_extent_payload(
-                        generation,
-                        record_log_offset,
-                        payload_offset,
-                        slice_inner_offset as u32,
-                        &mut temp_buf[..seg_len],
-                        &self.volume_key,
-                    ) {
-                        Ok(n) => bytes_read = n,
-                        // A Disk extent is authoritative for these bytes. Swallowing the
-                        // error would leave the segment unfilled, so the read falls through
-                        // to lower layers and ultimately returns zeros - turning bitrot, a
-                        // failed I/O, or a detected AEAD forgery into silent, plausible
-                        // data. Report it instead.
-                        Err(_) => return Err(libc::EIO),
-                    }
+                let cache = log_cache.ok_or(libc::EIO)?;
+                match cache.read_extent_payload(
+                    *generation,
+                    *record_log_offset,
+                    *payload_offset,
+                    *slice_inner_offset,
+                    &mut dst_buf[slice.dst_offset..slice.dst_offset + slice.len],
+                    volume_key,
+                ) {
+                    Ok(_) => {}
+                    Err(_) => return Err(libc::EIO),
                 }
             }
         }
-
-        for i in 0..bytes_read {
-            if !filled[dst_offset + i] {
-                dst_buf[dst_offset + i] = temp_buf[i];
-                filled[dst_offset + i] = true;
-            }
-        }
-
-        Ok(())
     }
+    Ok(dst_buf)
 }
 
 #[cfg(test)]
@@ -445,5 +602,167 @@ mod tests {
         // Tombstoned inode 4 and non-existent inode 999 must NOT be present
         assert!(!batch_map.contains_key(&attr4.ino));
         assert!(!batch_map.contains_key(&999));
+    }
+
+    #[test]
+    fn test_plan_read_file_data_staged_and_holes() {
+        let fs = InMemoryFS::new();
+        let attr = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, attr.ino, &[0xAA; 100], 0).unwrap();
+        crate::operations::read_write::fallocate_core(
+            &fs,
+            attr.ino,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            40,
+            20,
+        )
+        .unwrap();
+
+        let plan = fs.plan_read_file_data(attr.ino, 0, 100).unwrap();
+        assert_eq!(plan.total_len, 100);
+        assert!(!plan.has_cold_slices);
+        assert_eq!(plan.slices.len(), 3);
+
+        assert_eq!(plan.slices[0].dst_offset, 0);
+        assert_eq!(plan.slices[0].len, 40);
+        assert!(matches!(plan.slices[0].source, ReadSliceSource::Memory { .. }));
+
+        assert_eq!(plan.slices[1].dst_offset, 40);
+        assert_eq!(plan.slices[1].len, 20);
+        assert_eq!(plan.slices[1].source, ReadSliceSource::Zero);
+
+        assert_eq!(plan.slices[2].dst_offset, 60);
+        assert_eq!(plan.slices[2].len, 40);
+        assert!(matches!(plan.slices[2].source, ReadSliceSource::Memory { .. }));
+
+        let read_buf = fs.execute_read_plan_sync(&plan).unwrap();
+        assert_eq!(&read_buf[0..40], &[0xAA; 40]);
+        assert_eq!(&read_buf[40..60], &[0x00; 20]);
+        assert_eq!(&read_buf[60..100], &[0xAA; 40]);
+    }
+
+    #[test]
+    fn test_plan_read_out_of_bounds() {
+        let fs = InMemoryFS::new();
+        let attr = crate::operations::read_write::create_core(&fs, 1, "empty.bin", 0o644, 0, 1000, 1000).unwrap();
+        let plan = fs.plan_read_file_data(attr.ino, 100, 50).unwrap();
+        assert_eq!(plan.total_len, 0);
+        assert!(!plan.has_cold_slices);
+        assert!(plan.slices.is_empty());
+
+        let res = fs.execute_read_plan_sync(&plan).unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn test_plan_read_handle_virtual_file() {
+        let fs = InMemoryFS::new();
+        fs.register_runtime_status();
+
+        let status_ino = crate::fs::VIRTUAL_INO_BASE;
+        let fh = fs.open_file_handle(status_ino, libc::O_RDONLY as u32);
+        assert_ne!(fh & crate::fs::VIRTUAL_FH_FLAG, 0);
+
+        let plan = fs.plan_read_handle(status_ino, fh, 0, 50).unwrap();
+        assert_eq!(plan.total_len, 50);
+        assert!(!plan.has_cold_slices);
+        assert_eq!(plan.slices.len(), 1);
+        assert!(matches!(plan.slices[0].source, ReadSliceSource::Memory { .. }));
+
+        let buf = fs.read_handle(status_ino, fh, 0, 50).unwrap();
+        assert_eq!(buf.len(), 50);
+        assert!(
+            std::str::from_utf8(&buf)
+                .unwrap()
+                .starts_with("=== appendfs Runtime Status ===")
+        );
+    }
+
+    #[test]
+    fn test_plan_read_file_data_multi_layer_precedence() {
+        use crate::node::{FileDelta, InodeMeta};
+        use crate::range_map::RangeMap;
+        use std::time::SystemTime;
+
+        let fs = InMemoryFS::new();
+        let attr = crate::operations::read_write::create_core(&fs, 1, "layers.bin", 0o644, 0, 1000, 1000).unwrap();
+
+        // 1. Base layer: Disk extent at 0..100
+        let shared_disk = SharedExtentState::new_disk(1, 1024, 0, 100);
+        let mut base_range = RangeMap::new();
+        base_range.insert(0, 100, shared_disk);
+        let mut base_map = HashMap::new();
+        base_map.insert(
+            attr.ino,
+            Arc::new(Node {
+                meta: InodeMeta::new(0o644, 1, 1000, 1000, SystemTime::UNIX_EPOCH),
+                kind: NodeKind::File {
+                    range_map: base_range,
+                    size: 100,
+                },
+            }),
+        );
+        *fs.base.write().unwrap() = base_map;
+
+        // 2. Flushing layer: punch hole (Zero) at 20..40
+        let mut flushing_batch = HashMap::new();
+        let mut f_delta = FileDelta::default();
+        f_delta.extents.insert(20, 20, SharedExtentState::new_zero(20));
+        flushing_batch.insert(attr.ino, EntryDelta::Node(NodeDelta::File(f_delta)));
+        fs.flushing.write().unwrap().push_back(flushing_batch);
+
+        // 3. Live layer: Staged extent at 30..50
+        let staged_data = Arc::new(vec![0xBB; 20]);
+        let mut live_delta = FileDelta::default();
+        live_delta
+            .extents
+            .insert(30, 20, SharedExtentState::new_staged(staged_data, 0, 20));
+        fs.live
+            .write()
+            .unwrap()
+            .insert(attr.ino, EntryDelta::Node(NodeDelta::File(live_delta)));
+
+        // Now plan read from 0..100:
+        // - 0..20: from Base (Disk)
+        // - 20..30: from Flushing (Zero)
+        // - 30..50: from Live (Memory)
+        // - 50..100: from Base (Disk)
+        let plan = fs.plan_read_file_data(attr.ino, 0, 100).unwrap();
+        assert_eq!(plan.total_len, 100);
+        assert!(plan.has_cold_slices);
+        assert_eq!(plan.slices.len(), 4);
+
+        assert_eq!(plan.slices[0].dst_offset, 0);
+        assert_eq!(plan.slices[0].len, 20);
+        assert!(matches!(
+            plan.slices[0].source,
+            ReadSliceSource::Disk {
+                generation: 1,
+                slice_inner_offset: 0,
+                ..
+            }
+        ));
+
+        assert_eq!(plan.slices[1].dst_offset, 20);
+        assert_eq!(plan.slices[1].len, 10);
+        assert_eq!(plan.slices[1].source, ReadSliceSource::Zero);
+
+        assert_eq!(plan.slices[2].dst_offset, 30);
+        assert_eq!(plan.slices[2].len, 20);
+        assert!(matches!(
+            plan.slices[2].source,
+            ReadSliceSource::Memory { src_offset: 0, .. }
+        ));
+
+        assert_eq!(plan.slices[3].dst_offset, 50);
+        assert_eq!(plan.slices[3].len, 50);
+        assert!(matches!(
+            plan.slices[3].source,
+            ReadSliceSource::Disk {
+                generation: 1,
+                slice_inner_offset: 50,
+                ..
+            }
+        ));
     }
 }

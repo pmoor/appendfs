@@ -35,10 +35,38 @@ pub fn read_core(fs: &InMemoryFS, ino: u64, fh: u64, offset: i64, size: usize) -
 
 pub fn read(fs: &InMemoryFS, req: Request, ino: u64, size: usize, offset: i64, fh: u64) {
     log::trace!("read(ino={}, size={}, offset={}, fh={})", ino, size, offset, fh);
-    match read_core(fs, ino, fh, offset, size) {
-        Ok(buf) => req.reply_buf(&buf),
-        Err(e) => req.reply_err(e),
+    if offset < 0 {
+        req.reply_err(libc::EINVAL);
+        return;
     }
+
+    let plan = match fs.plan_read_handle(ino, fh, offset as u64, size) {
+        Ok(p) => p,
+        Err(e) => {
+            req.reply_err(e);
+            return;
+        }
+    };
+
+    // Fast path: small in-memory read (<= 128 KiB) with zero cold disk slices
+    const MAX_INLINE_READ_BYTES: usize = 128 * 1024;
+    if !plan.has_cold_slices && plan.total_len <= MAX_INLINE_READ_BYTES {
+        match fs.execute_read_plan_sync(&plan) {
+            Ok(buf) => req.reply_buf(&buf),
+            Err(e) => req.reply_err(e),
+        }
+        return;
+    }
+
+    // Async offload: cold disk/remote read or large in-memory read
+    let log_cache = fs.log_cache.clone();
+    let volume_key = fs.volume_key.clone();
+    crate::async_runtime::spawn(async move {
+        match InMemoryFS::execute_read_plan_async(plan, log_cache, volume_key).await {
+            Ok(buf) => req.reply_buf(&buf),
+            Err(e) => req.reply_err(e),
+        }
+    });
 }
 
 pub fn open_core(fs: &InMemoryFS, ino: u64, flags: u32) -> Result<u64, i32> {
