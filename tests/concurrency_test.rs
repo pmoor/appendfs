@@ -146,11 +146,13 @@ fn worker(fs: Arc<InMemoryFS>, shared_dirs: Arc<Vec<u64>>, seed: u64) {
                 }
             }
             9 => {
-                // Exercise open handle allocation, read, and release concurrently
+                // Exercise open handle allocation, variable-offset / larger reads, and release concurrently
                 if let Some((_, ino)) = pick_entry(&fs, dir_a, &mut rng)
                     && let Ok(fh) = open_core(&fs, ino, 0)
                 {
-                    let _ = read_core(&fs, ino, fh, 0, 64);
+                    let offset = rng.gen_range(0, 128) as i64;
+                    let size = rng.gen_range(1, 128 * 1024);
+                    let _ = read_core(&fs, ino, fh, offset, size);
                     let _ = release_core(&fs, ino, fh);
                 }
             }

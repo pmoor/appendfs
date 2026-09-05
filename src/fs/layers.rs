@@ -388,61 +388,14 @@ impl<'a> InodeLayerStack<'a> {
 
         raw_slices.sort_by_key(|s| s.dst_offset);
 
-        // Coalesce adjacent contiguous slices with matching source
-        let mut coalesced: Vec<ReadSlice> = Vec::with_capacity(raw_slices.len());
-        for slice in raw_slices {
-            if let Some(prev) = coalesced.last_mut()
-                && prev.dst_offset + prev.len == slice.dst_offset
-            {
-                match (&mut prev.source, &slice.source) {
-                    (ReadSliceSource::Zero, ReadSliceSource::Zero) => {
-                        prev.len += slice.len;
-                        continue;
-                    }
-                    (
-                        ReadSliceSource::Memory {
-                            data: d1,
-                            src_offset: s1,
-                        },
-                        ReadSliceSource::Memory {
-                            data: d2,
-                            src_offset: s2,
-                        },
-                    ) if Arc::ptr_eq(d1, d2) && *s1 + prev.len == *s2 => {
-                        prev.len += slice.len;
-                        continue;
-                    }
-                    (
-                        ReadSliceSource::Disk {
-                            generation: g1,
-                            record_log_offset: r1,
-                            payload_offset: p1,
-                            slice_inner_offset: i1,
-                        },
-                        ReadSliceSource::Disk {
-                            generation: g2,
-                            record_log_offset: r2,
-                            payload_offset: p2,
-                            slice_inner_offset: i2,
-                        },
-                    ) if g1 == g2 && r1 == r2 && p1 == p2 && *i1 + prev.len as u32 == *i2 => {
-                        prev.len += slice.len;
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            coalesced.push(slice);
-        }
-
-        let has_cold_slices = coalesced
+        let has_cold_slices = raw_slices
             .iter()
             .any(|s| matches!(s.source, ReadSliceSource::Disk { .. }));
 
         Ok(ReadPlan {
             total_len: read_len,
             has_cold_slices,
-            slices: coalesced,
+            slices: raw_slices,
         })
     }
 

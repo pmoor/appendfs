@@ -5,8 +5,11 @@ use std::sync::LazyLock;
 use tokio::runtime::{Builder, Handle, Runtime};
 
 static GLOBAL_ASYNC_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().max(16))
+        .unwrap_or(16);
     Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(workers)
         .thread_name("appendfs-io")
         .enable_all()
         .build()

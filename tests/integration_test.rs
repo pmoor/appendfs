@@ -388,15 +388,21 @@ fn test_fuse_stress() {
             // Read target thread dir
             let target_dir = mount_path_clone.join(format!("dir_{}", iter_idx % 4));
             if let Ok(entries) = fs::read_dir(&target_dir) {
-                // Just iterate over them to trigger readdir/lookup calls
-                for entry in entries {
-                    let _ = entry;
+                // Iterate over entries and concurrently read any existing files
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let _ = fs::read(&path);
+                    }
                 }
             }
             // List root directory
             if let Ok(entries) = fs::read_dir(&mount_path_clone) {
-                for entry in entries {
-                    let _ = entry;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let _ = fs::read(&path);
+                    }
                 }
             }
         }
