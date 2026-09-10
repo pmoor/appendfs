@@ -690,9 +690,7 @@ mod tests {
 
         // 1. Create file1 in live -> freeze to flushing -> fold to base
         let attr1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.begin_flush();
-        let batch = fs.pop_flushing_batch().unwrap();
-        fs.fold_flushed_batch(batch);
+        fs.flush_to_base().unwrap();
 
         // 2. Create file2 in live -> freeze to flushing (stays in flushing)
         let attr2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();

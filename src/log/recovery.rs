@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::crypto::VolumeKey;
-use crate::fs::{FlushBatch, InMemoryFS, WriteArena};
+use crate::fs::InMemoryFS;
 use crate::log::manifest::{parse_log_filename, parse_summary_filename};
 use crate::log::reader::{LogReader, LogRecord};
 use crate::log::record::{DecodedPayload, FlushCommitPayload, OpCode};
@@ -265,7 +265,7 @@ pub fn recover_fs(
                 }
 
                 if !current_batch.is_empty() {
-                    fs_instance.fold_flushed_batch(FlushBatch::new(0, current_batch, WriteArena::new(), 0, 0));
+                    fs_instance.apply_delta_batch(current_batch);
                 }
 
                 if target_cutoff_reached {

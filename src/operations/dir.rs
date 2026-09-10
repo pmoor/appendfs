@@ -364,12 +364,67 @@ pub fn releasedir(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
 
 #[cfg(any(test, feature = "testing"))]
 pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
-    crate::operations::read_write::fsync_core(fs, 0, 0).await
+    let completion = fs.rollover_for_fdirsync(0, 0)?;
+    let Some(completion) = completion else {
+        if let Some(ref writer) = fs.log_writer {
+            let writer_clone = Arc::clone(writer);
+            tokio::task::spawn_blocking(move || writer_clone.sync())
+                .await
+                .map_err(|_| libc::EIO)?
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        }
+        return Ok(());
+    };
+
+    if !fs.trigger_flusher_with_motivation(crate::log::FlushMotivation::Fdirsync) {
+        let _ = fs.flush_with_motivation(crate::log::FlushMotivation::Fdirsync);
+    }
+    completion
+        .wait()
+        .await
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 pub fn fsyncdir(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
     log::trace!("fsyncdir(ino={}, datasync={})", ino, datasync);
-    crate::operations::read_write::fsync(fs, req, 0, datasync, 0);
+    let completion = match fs.rollover_for_fdirsync(0, 0) {
+        Ok(c) => c,
+        Err(e) => {
+            req.reply_err(e);
+            return;
+        }
+    };
+
+    let Some(completion) = completion else {
+        if let Some(ref writer) = fs.log_writer {
+            let guard = fs.begin_async_op();
+            let writer_clone = Arc::clone(writer);
+            crate::async_runtime::spawn(async move {
+                let _guard = guard;
+                let res = tokio::task::spawn_blocking(move || writer_clone.sync()).await;
+                match res {
+                    Ok(Ok(())) => req.reply_err(0),
+                    Ok(Err(e)) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
+                    Err(_) => req.reply_err(libc::EIO),
+                }
+            });
+            return;
+        }
+        req.reply_err(0);
+        return;
+    };
+
+    if !fs.trigger_flusher_with_motivation(crate::log::FlushMotivation::Fdirsync) {
+        let _ = fs.flush_with_motivation(crate::log::FlushMotivation::Fdirsync);
+    }
+    let guard = fs.begin_async_op();
+    crate::async_runtime::spawn(async move {
+        let _guard = guard;
+        match completion.wait().await {
+            Ok(()) => req.reply_err(0),
+            Err(e) => req.reply_err(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    });
 }
 
 #[cfg(test)]

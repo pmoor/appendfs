@@ -12,6 +12,7 @@
 
 pub mod arena;
 mod flush;
+pub mod flusher;
 mod handles;
 mod layers;
 mod overlay;
@@ -19,11 +20,12 @@ pub mod virtual_files;
 
 pub use crate::operations::locks::{FlockState, FlockWaiter, LockManager, RangeLock, RangeLockWaiter};
 pub use arena::WriteArena;
+pub use flusher::*;
 pub use layers::{InodeLayerStack, ReadPlan, ReadSlice, ReadSliceSource};
 pub use virtual_files::{VIRTUAL_INO_BASE, VirtualFileRegistry};
 
 use crate::clock::{Clock, SystemClock};
-use crate::log::{BackgroundFlusher, LogFileCache, LogManifest, LogWriter};
+use crate::log::{FlushMotivation, LogFileCache, LogManifest, LogWriter};
 use crate::node::{EntryDelta, Node};
 use crate::storage::Storage;
 use crate::sync::{ActionGuard, ActionMutex, OpTag, PostUnlockQueue};
@@ -242,10 +244,32 @@ pub struct FlushBatch {
     pub bytes: usize,
     pub ops: usize,
     pub completion: BatchCompletion,
+    pub motivation: FlushMotivation,
+    pub created_at: SystemTime,
 }
 
 impl FlushBatch {
     pub fn new(id: u64, entries: HashMap<u64, EntryDelta>, arena: WriteArena, bytes: usize, ops: usize) -> Self {
+        Self::with_motivation(
+            id,
+            entries,
+            arena,
+            bytes,
+            ops,
+            FlushMotivation::Manual,
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    pub fn with_motivation(
+        id: u64,
+        entries: HashMap<u64, EntryDelta>,
+        arena: WriteArena,
+        bytes: usize,
+        ops: usize,
+        motivation: FlushMotivation,
+        created_at: SystemTime,
+    ) -> Self {
         assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
         Self {
             id,
@@ -254,6 +278,8 @@ impl FlushBatch {
             bytes,
             ops,
             completion: BatchCompletion::new(),
+            motivation,
+            created_at,
         }
     }
 }
@@ -307,16 +333,6 @@ impl FsInner {
         popped
     }
 
-    /// Pops the front batch from the flushing queue and notifies `capacity_cvar` with lock held.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn pop_flushing_batch(&mut self) -> Option<FlushBatch> {
-        let batch = self.flushing.pop_front()?;
-        self.flushing_bytes -= batch.bytes;
-        self.flushing_ops -= batch.ops;
-        self.capacity_cvar.notify_all();
-        Some(batch)
-    }
-
     /// Records a mutation of `additional_bytes` and increments staged operation count by 1.
     pub fn record_mutation(&mut self, additional_bytes: usize) {
         self.staged_bytes += additional_bytes;
@@ -324,18 +340,30 @@ impl FsInner {
     }
 
     /// Freezes `live` into the `flushing` queue and transfers staged byte/op counts,
-    /// provided that the `flushing` queue depth does not exceed `max_flush_queue_depth`,
-    /// `flushing_bytes` does not exceed `max_flush_queue_bytes`, and
-    /// `flushing_ops` does not exceed `max_flush_queue_ops`.
-    ///
-    /// If queue depth, byte count, or op count reaches or exceeds capacity, this is a no-op
-    /// that preserves `live` and staged byte/op counters, returning `false`.
-    /// Returns `true` if a batch was frozen, or `false` if `live` was empty or `flushing` was full.
+    /// provided that capacity bounds are not exceeded.
     pub fn freeze_live(
         &mut self,
         max_flush_queue_depth: usize,
         max_flush_queue_bytes: usize,
         max_flush_queue_ops: usize,
+    ) -> bool {
+        self.freeze_live_with_motivation(
+            max_flush_queue_depth,
+            max_flush_queue_bytes,
+            max_flush_queue_ops,
+            FlushMotivation::Manual,
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// Freezes `live` into the `flushing` queue with an explicit `FlushMotivation` and timestamp.
+    pub fn freeze_live_with_motivation(
+        &mut self,
+        max_flush_queue_depth: usize,
+        max_flush_queue_bytes: usize,
+        max_flush_queue_ops: usize,
+        motivation: FlushMotivation,
+        now: SystemTime,
     ) -> bool {
         if self.flushing.len() >= max_flush_queue_depth
             || self.flushing_bytes >= max_flush_queue_bytes
@@ -355,16 +383,18 @@ impl FsInner {
             self.flushing_ops += ops;
             let id = self.next_batch_id;
             self.next_batch_id += 1;
-            self.flushing.push_back(FlushBatch::new(id, entries, arena, bytes, ops));
+            self.flushing.push_back(FlushBatch::with_motivation(
+                id, entries, arena, bytes, ops, motivation, now,
+            ));
             true
         } else {
             false
         }
     }
 
-    /// Merges a flushed batch into `base`.
-    pub fn fold_flushed_batch(&mut self, flushed: FlushBatch) {
-        for (ino, entry) in flushed.entries {
+    /// Directly applies a batch of delta records into `base` without requiring a `FlushBatch` wrapper.
+    pub fn apply_base_deltas(&mut self, entries: HashMap<u64, EntryDelta>) {
+        for (ino, entry) in entries {
             match entry {
                 EntryDelta::Tombstone => {
                     self.base.remove(&ino);
@@ -380,6 +410,11 @@ impl FsInner {
                 }
             }
         }
+    }
+
+    /// Merges a flushed batch into `base`.
+    pub fn fold_flushed_batch(&mut self, flushed: FlushBatch) {
+        self.apply_base_deltas(flushed.entries);
     }
 }
 
@@ -527,9 +562,14 @@ impl<'a> Drop for FsInnerGuard<'a> {
             let max_flush_queue_bytes = self.fs.max_flush_queue_bytes;
             let max_flush_queue_ops = self.fs.max_flush_queue_ops;
             if self.guard.staged_bytes >= max_buffer_size || self.guard.staged_ops >= max_staged_ops {
-                let froze = self
-                    .guard
-                    .freeze_live(max_flush_queue_depth, max_flush_queue_bytes, max_flush_queue_ops);
+                let now = self.fs.clock.now();
+                let froze = self.guard.freeze_live_with_motivation(
+                    max_flush_queue_depth,
+                    max_flush_queue_bytes,
+                    max_flush_queue_ops,
+                    FlushMotivation::Threshold,
+                    now,
+                );
                 if froze || !self.guard.flushing.is_empty() {
                     let fs = self.fs;
                     self.guard.defer(move || {
@@ -566,8 +606,7 @@ pub struct InMemoryFS {
     /// Maximum total mutating operations across all frozen flush batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_ops: usize,
     pub flush_interval: AtomicU64,
-    pub(crate) flusher: Mutex<Option<BackgroundFlusher>>,
-    pub flush_lock: Mutex<()>,
+    pub flusher: Arc<Flusher>,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to true.
     pub track_atime: bool,
     /// When true, filesystem is mounted strictly read-only (EROFS).
@@ -686,8 +725,7 @@ impl InMemoryFS {
             max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
             max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
             flush_interval: AtomicU64::new(0),
-            flusher: Mutex::new(None),
-            flush_lock: Mutex::new(()),
+            flusher: Arc::new(Flusher::new()),
             track_atime: true,
             read_only: std::sync::atomic::AtomicBool::new(false),
             volume_key,

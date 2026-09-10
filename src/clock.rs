@@ -63,6 +63,22 @@ pub fn format_local_civil_time(time: SystemTime) -> String {
     }
 }
 
+/// Formats a `SystemTime` concisely: `HH:MM:SS.mmm` if timestamp is modern (> 1e9 unix secs),
+/// or `+<secs>.<millis>s` if near epoch (common in tests and mock clocks).
+pub fn format_timestamp_display(time: SystemTime) -> String {
+    let (secs, nsecs) = system_time_to_unix(time);
+    let millis = nsecs / 1_000_000;
+    if secs >= 1_000_000_000 {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let time_t = secs as libc::time_t;
+        let res = unsafe { libc::localtime_r(&time_t, &mut tm) };
+        if !res.is_null() {
+            return format!("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, millis);
+        }
+    }
+    format!("+{}.{:03}s", secs, millis)
+}
+
 /// Parses a human-readable or unix timestamp string into `SystemTime`.
 /// Supports unix seconds (`1755424800`), decimals (`1755424800.5`),
 /// ISO 8601 / RFC 3339 (`2026-08-17T10:00:00Z`), `2026-08-17 10:00:00`, and `2026-08-17`.

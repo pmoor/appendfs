@@ -414,7 +414,45 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     out.push_str(&format!("    Last Summary Gen: {}\n", last_summary_gen));
     out.push('\n');
 
-    // 4. Cache Stats
+    // 4. Recent Flushes
+    let recent_flushes = fs.recent_flushes();
+    out.push_str("[Recent Flushes]\n");
+    if recent_flushes.is_empty() {
+        out.push_str("  No flush operations recorded yet.\n");
+    } else {
+        out.push_str(&format!(
+            "  {:<6} {:<12} {:>12} {:>6} {:>11}  {:<12}  {:<12}  {:<10}\n",
+            "ID", "MOTIVATION", "DATA SIZE", "OPS", "DURATION", "STARTED", "COMPLETED", "AGE"
+        ));
+        out.push_str(&format!(
+            "  {:-<6} {:-<12} {:-<12} {:-<6} {:-<11}  {:-<12}  {:-<12}  {:-<10}\n",
+            "", "", "", "", "", "", "", ""
+        ));
+        for r in &recent_flushes {
+            let start_str = crate::clock::format_timestamp_display(r.started_at);
+            let comp_str = crate::clock::format_timestamp_display(r.completed_at);
+            let comp_elapsed = fs.clock.now().duration_since(r.completed_at).unwrap_or_default();
+            let age_str = if comp_elapsed.as_secs() > 0 {
+                format!("{}s ago", comp_elapsed.as_secs())
+            } else {
+                format!("{} ago", format_duration(comp_elapsed))
+            };
+            out.push_str(&format!(
+                "  {:<6} {:<12} {:>12} {:>6} {:>11}  {:<12}  {:<12}  {:<10}\n",
+                r.id,
+                r.motivation.as_str(),
+                format_bytes(r.data_bytes),
+                r.ops_count,
+                format_duration(r.duration),
+                start_str,
+                comp_str,
+                age_str,
+            ));
+        }
+    }
+    out.push('\n');
+
+    // 5. Cache Stats
     out.push_str("[Cache]\n");
     if let Some(ref log_cache) = fs.log_cache {
         let cur_bytes = log_cache.decrypted_cache.current_bytes();
@@ -704,5 +742,54 @@ mod tests {
         fs.set_read_only(true);
         let ro_status = format_runtime_status(&fs);
         assert!(ro_status.contains("Access Mode:        Read-Only"));
+    }
+
+    #[test]
+    fn test_format_runtime_status_recent_flushes_output() {
+        use crate::fs::FlushRecord;
+        use crate::log::FlushMotivation;
+        use std::time::{Duration, SystemTime};
+
+        let fs = InMemoryFS::new();
+        // 1. Fresh FS has no flushes recorded
+        let status_fresh = format_runtime_status(&fs);
+        assert!(status_fresh.contains("[Recent Flushes]"));
+        assert!(status_fresh.contains("No flush operations recorded yet."));
+
+        // 2. Record simulated flushes
+        let t0 = SystemTime::UNIX_EPOCH;
+        fs.flusher.record_flush(FlushRecord {
+            id: 1,
+            motivation: FlushMotivation::Fsync,
+            data_bytes: 4096,
+            ops_count: 12,
+            started_at: t0,
+            completed_at: t0 + Duration::from_millis(25),
+            duration: Duration::from_millis(25),
+        });
+        fs.flusher.record_flush(FlushRecord {
+            id: 2,
+            motivation: FlushMotivation::Threshold,
+            data_bytes: 65536,
+            ops_count: 150,
+            started_at: t0,
+            completed_at: t0 + Duration::from_millis(150),
+            duration: Duration::from_millis(150),
+        });
+
+        let status_with_flushes = format_runtime_status(&fs);
+        assert!(status_with_flushes.contains("[Recent Flushes]"));
+        assert!(status_with_flushes.contains("MOTIVATION"));
+        assert!(status_with_flushes.contains("DATA SIZE"));
+        assert!(status_with_flushes.contains("DURATION"));
+        assert!(status_with_flushes.contains("STARTED"));
+        assert!(status_with_flushes.contains("COMPLETED"));
+        assert!(status_with_flushes.contains("AGE"));
+        assert!(status_with_flushes.contains("fsync"));
+        assert!(status_with_flushes.contains("4.00 KiB"));
+        assert!(status_with_flushes.contains("25.00 ms"));
+        assert!(status_with_flushes.contains("threshold"));
+        assert!(status_with_flushes.contains("64.00 KiB"));
+        assert!(status_with_flushes.contains("150.00 ms"));
     }
 }

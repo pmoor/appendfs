@@ -581,7 +581,9 @@ pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
         return Ok(());
     };
 
-    fs.notify_flush_trigger(true);
+    if !fs.trigger_flusher_with_motivation(crate::log::FlushMotivation::Fsync) {
+        let _ = fs.flush_with_motivation(crate::log::FlushMotivation::Fsync);
+    }
     completion
         .wait()
         .await
@@ -617,7 +619,9 @@ pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
         return;
     };
 
-    fs.notify_flush_trigger(true);
+    if !fs.trigger_flusher_with_motivation(crate::log::FlushMotivation::Fsync) {
+        let _ = fs.flush_with_motivation(crate::log::FlushMotivation::Fsync);
+    }
     let guard = fs.begin_async_op();
     crate::async_runtime::spawn(async move {
         let _guard = guard;
