@@ -983,13 +983,11 @@ impl InMemoryFS {
 
 impl Drop for InMemoryFS {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            self.flusher.stop_background();
-            if !self.is_read_only() {
-                let _ = self.sync_and_export_summary();
-            }
-            self.destroy();
+        self.flusher.stop_background();
+        if !std::thread::panicking() && !self.is_read_only() {
+            let _ = self.sync_and_export_summary();
         }
+        self.drain_async_ops();
     }
 }
 

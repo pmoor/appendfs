@@ -220,7 +220,10 @@ impl Flusher {
     /// Stops the background flusher thread and joins its worker handle.
     /// Returns `true` if a background flusher was active and stopped.
     pub fn stop_background(&self) -> bool {
-        let mut bg = self.background.lock().unwrap();
+        let mut bg = match self.background.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         if let Some(mut f) = bg.take() {
             f.stop();
             true

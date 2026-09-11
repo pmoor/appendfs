@@ -55,24 +55,7 @@ impl FlushHost for InMemoryFS {
 
     fn persist_flush_batch(&self, batch: &mut FlushBatch) -> std::io::Result<u64> {
         if let Some(ref writer) = self.log_writer {
-            match self.synthesize_and_write_flushing_layer(&mut batch.entries, writer) {
-                Ok(bytes) => Ok(bytes),
-                Err(e) => {
-                    log::error!("Failed to write flushing layer to log: {}", e);
-                    {
-                        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-                        if let Some(front) = inner.flushing.front_mut()
-                            && front.id == batch.id
-                        {
-                            front.completion = super::BatchCompletion::new();
-                        }
-                    }
-                    batch
-                        .completion
-                        .complete(Err(std::io::Error::new(e.kind(), e.to_string())));
-                    Err(e)
-                }
-            }
+            self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)
         } else {
             Ok(batch.bytes as u64)
         }
@@ -2555,5 +2538,112 @@ mod tests {
         let records = fs.recent_flushes();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].id, step_record.id);
+    }
+
+    #[test]
+    fn test_persist_flush_batch_failure_leaves_completion_intact_for_retry() {
+        let mem = Arc::new(crate::storage::MemoryStorage::new());
+        let fault_storage = crate::storage::FaultStorage::new(mem);
+        let storage = Arc::new(fault_storage.clone());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+
+        let file = crate::operations::read_write::create_core(&fs, 1, "retry_test.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, file.ino, b"retry test payload", 0).unwrap();
+
+        let initial_offset = storage.file_len("000001.log").unwrap();
+
+        // Rollover for sync to generate a FlushBatch with a Completion handle
+        let completion = fs
+            .rollover_for_sync(file.ino, 0, FlushMotivation::Fsync)
+            .unwrap()
+            .expect("completion expected");
+        assert!(!completion.is_completed());
+        assert_eq!(fs.flush_queue_depth(), 1);
+
+        // Inject write failure on storage
+        fault_storage.fail_writes_after_bytes(initial_offset, true);
+
+        // Use TestFlusher to attempt stepping the batch
+        let test_flusher = TestFlusher::with_flusher(&fs, &fs.flusher, clock.clone());
+        let step_res = test_flusher.step();
+        assert!(step_res.is_err(), "Step must fail on injected write error");
+
+        // Contract verification:
+        // 1. Batch remains in the queue for retry
+        assert_eq!(fs.flush_queue_depth(), 1);
+        // 2. Completion is NOT resolved/completed yet
+        assert!(
+            !completion.is_completed(),
+            "Completion must not be resolved on persist failure"
+        );
+
+        // Clear the fault
+        fault_storage.clear_write_limit();
+
+        // Retry stepping the batch
+        let retry_record = test_flusher
+            .step()
+            .expect("retry step must not error")
+            .expect("record expected");
+        assert_eq!(retry_record.motivation, FlushMotivation::Fsync);
+
+        // Contract verification after successful retry:
+        // 1. Batch popped from queue
+        assert_eq!(fs.flush_queue_depth(), 0);
+        // 2. Completion is now successfully completed with Ok(())
+        assert!(completion.is_completed());
+        assert!(completion.wait_blocking().is_ok());
+
+        // Verify data was properly persisted and folded
+        let read_back = fs.read_file_data(file.ino, 0, 18).unwrap();
+        assert_eq!(&read_back, b"retry test payload");
+    }
+
+    #[test]
+    fn test_lifecycle_flusher_stopped_and_joined_on_panic_drop() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = Arc::new(InMemoryFS::with_clock_and_log(clock, Some(writer)));
+        fs.init();
+        assert!(fs.flusher.is_background_active());
+
+        let flusher = Arc::clone(&fs.flusher);
+
+        // Simulate a panic in a thread holding the filesystem
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _fs_held = fs;
+            panic!("intentional test panic to verify drop lifecycle");
+        }));
+        assert!(res.is_err(), "Expected thread to panic");
+
+        // Even though drop occurred during panic unwind, the background worker thread
+        // must be cleanly stopped and joined, ensuring FileSystem strictly outlives Flusher.
+        assert!(
+            !flusher.is_background_active(),
+            "Flusher worker must be stopped and joined even on panic drop"
+        );
     }
 }

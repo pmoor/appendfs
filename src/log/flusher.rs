@@ -230,7 +230,10 @@ impl BackgroundFlusher {
     /// Signals the background flusher thread to exit immediately and joins it.
     pub fn stop(&mut self) {
         let (lock, cvar) = &*self.state;
-        let mut state = lock.lock().unwrap();
+        let mut state = match lock.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         if !state.stop {
             state.stop = true;
             cvar.notify_all();

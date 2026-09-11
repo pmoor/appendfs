@@ -624,6 +624,15 @@ pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
         return;
     };
 
+    if !fs.flusher.is_background_active() {
+        let clock = Arc::clone(&fs.clock);
+        let test_flusher = crate::fs::flusher::TestFlusher::with_flusher(fs, &fs.flusher, clock);
+        if let Err(e) = test_flusher.drain() {
+            req.reply_err(e.raw_os_error().unwrap_or(libc::EIO));
+            return;
+        }
+    }
+
     let guard = fs.begin_async_op();
     crate::async_runtime::spawn(async move {
         let _guard = guard;
