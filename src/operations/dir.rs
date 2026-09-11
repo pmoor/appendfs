@@ -364,7 +364,7 @@ pub fn releasedir(fs: &InMemoryFS, req: Request, ino: u64, fh: u64) {
 
 #[cfg(any(test, feature = "testing"))]
 pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
-    let completion = fs.rollover_for_fdirsync(0, 0)?;
+    let completion = fs.rollover_for_sync(0, 0, crate::log::FlushMotivation::Fdirsync)?;
     let Some(completion) = completion else {
         if let Some(ref writer) = fs.log_writer {
             let writer_clone = Arc::clone(writer);
@@ -376,9 +376,6 @@ pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
         return Ok(());
     };
 
-    if !fs.trigger_flusher_with_motivation(crate::log::FlushMotivation::Fdirsync) {
-        let _ = fs.flush_with_motivation(crate::log::FlushMotivation::Fdirsync);
-    }
     completion
         .wait()
         .await
@@ -387,7 +384,7 @@ pub async fn fsyncdir_core(fs: &InMemoryFS) -> Result<(), i32> {
 
 pub fn fsyncdir(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
     log::trace!("fsyncdir(ino={}, datasync={})", ino, datasync);
-    let completion = match fs.rollover_for_fdirsync(0, 0) {
+    let completion = match fs.rollover_for_sync(0, 0, crate::log::FlushMotivation::Fdirsync) {
         Ok(c) => c,
         Err(e) => {
             req.reply_err(e);
@@ -414,9 +411,6 @@ pub fn fsyncdir(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool) {
         return;
     };
 
-    if !fs.trigger_flusher_with_motivation(crate::log::FlushMotivation::Fdirsync) {
-        let _ = fs.flush_with_motivation(crate::log::FlushMotivation::Fdirsync);
-    }
     let guard = fs.begin_async_op();
     crate::async_runtime::spawn(async move {
         let _guard = guard;

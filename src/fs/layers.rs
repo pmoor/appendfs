@@ -826,6 +826,8 @@ mod tests {
             WriteArena::new(),
             0,
             0,
+            crate::log::FlushMotivation::Manual,
+            std::time::SystemTime::UNIX_EPOCH,
         ));
 
         // 3. Live layer: Staged extent at 30..50

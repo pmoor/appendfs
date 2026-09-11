@@ -151,11 +151,11 @@ struct BatchCompletionInner {
     callbacks: Vec<BatchCallback>,
 }
 
-/// Thread-safe synchronization handle allowing one or more waiters (via non-blocking callbacks
-/// or async wait) to be notified when a specific `FlushBatch` has been committed and synced to disk.
+/// Thread-safe synchronization handle allowing one or more waiters (via non-blocking callbacks,
+/// blocking wait, or async wait) to be notified when a specific `FlushBatch` has been committed and synced to disk.
 #[derive(Clone)]
 pub struct BatchCompletion {
-    state: Arc<Mutex<BatchCompletionInner>>,
+    state: Arc<(Mutex<BatchCompletionInner>, Condvar)>,
 }
 
 impl Default for BatchCompletion {
@@ -176,17 +176,21 @@ impl fmt::Debug for BatchCompletion {
 impl BatchCompletion {
     pub fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(BatchCompletionInner {
-                result: None,
-                callbacks: Vec::new(),
-            })),
+            state: Arc::new((
+                Mutex::new(BatchCompletionInner {
+                    result: None,
+                    callbacks: Vec::new(),
+                }),
+                Condvar::new(),
+            )),
         }
     }
 
     /// Registers an asynchronous callback to be invoked when this batch completes.
     /// If the batch has already finished, the callback runs immediately.
     pub fn add_callback(&self, callback: BatchCallback) {
-        let mut guard = self.state.lock().unwrap();
+        let (lock, _) = &*self.state;
+        let mut guard = lock.lock().unwrap();
         if let Some(ref res) = guard.result {
             let res_clone = match res {
                 Ok(()) => Ok(()),
@@ -199,9 +203,10 @@ impl BatchCompletion {
         }
     }
 
-    /// Marks the batch as completed with `result`, running all registered callbacks.
+    /// Marks the batch as completed with `result`, running all registered callbacks and waking any waiters.
     pub fn complete(&self, result: std::io::Result<()>) {
-        let mut guard = self.state.lock().unwrap();
+        let (lock, cvar) = &*self.state;
+        let mut guard = lock.lock().unwrap();
         assert!(guard.result.is_none(), "batch has already been completed");
         guard.result = Some(match &result {
             Ok(()) => Ok(()),
@@ -216,6 +221,7 @@ impl BatchCompletion {
             };
             cb(res);
         }
+        cvar.notify_all();
     }
 
     /// Asynchronously waits until the batch completes and yields its result.
@@ -228,9 +234,22 @@ impl BatchCompletion {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Interrupted, "batch cancelled"))?
     }
 
+    /// Synchronously blocks the calling thread until the batch completes and yields its result.
+    pub fn wait_blocking(&self) -> std::io::Result<()> {
+        let (lock, cvar) = &*self.state;
+        let mut guard = lock.lock().unwrap();
+        while guard.result.is_none() {
+            guard = cvar.wait(guard).unwrap();
+        }
+        match guard.result.as_ref().unwrap() {
+            Ok(()) => Ok(()),
+            Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+        }
+    }
+
     /// Returns true if this batch has already completed.
     pub fn is_completed(&self) -> bool {
-        self.state.lock().unwrap().result.is_some()
+        self.state.0.lock().unwrap().result.is_some()
     }
 }
 
@@ -249,19 +268,7 @@ pub struct FlushBatch {
 }
 
 impl FlushBatch {
-    pub fn new(id: u64, entries: HashMap<u64, EntryDelta>, arena: WriteArena, bytes: usize, ops: usize) -> Self {
-        Self::with_motivation(
-            id,
-            entries,
-            arena,
-            bytes,
-            ops,
-            FlushMotivation::Manual,
-            SystemTime::UNIX_EPOCH,
-        )
-    }
-
-    pub fn with_motivation(
+    pub fn new(
         id: u64,
         entries: HashMap<u64, EntryDelta>,
         arena: WriteArena,
@@ -339,25 +346,9 @@ impl FsInner {
         self.staged_ops += 1;
     }
 
-    /// Freezes `live` into the `flushing` queue and transfers staged byte/op counts,
+    /// Freezes `live` into the `flushing` queue with an explicit `FlushMotivation` and timestamp,
     /// provided that capacity bounds are not exceeded.
     pub fn freeze_live(
-        &mut self,
-        max_flush_queue_depth: usize,
-        max_flush_queue_bytes: usize,
-        max_flush_queue_ops: usize,
-    ) -> bool {
-        self.freeze_live_with_motivation(
-            max_flush_queue_depth,
-            max_flush_queue_bytes,
-            max_flush_queue_ops,
-            FlushMotivation::Manual,
-            SystemTime::UNIX_EPOCH,
-        )
-    }
-
-    /// Freezes `live` into the `flushing` queue with an explicit `FlushMotivation` and timestamp.
-    pub fn freeze_live_with_motivation(
         &mut self,
         max_flush_queue_depth: usize,
         max_flush_queue_bytes: usize,
@@ -383,9 +374,8 @@ impl FsInner {
             self.flushing_ops += ops;
             let id = self.next_batch_id;
             self.next_batch_id += 1;
-            self.flushing.push_back(FlushBatch::with_motivation(
-                id, entries, arena, bytes, ops, motivation, now,
-            ));
+            self.flushing
+                .push_back(FlushBatch::new(id, entries, arena, bytes, ops, motivation, now));
             true
         } else {
             false
@@ -563,7 +553,7 @@ impl<'a> Drop for FsInnerGuard<'a> {
             let max_flush_queue_ops = self.fs.max_flush_queue_ops;
             if self.guard.staged_bytes >= max_buffer_size || self.guard.staged_ops >= max_staged_ops {
                 let now = self.fs.clock.now();
-                let froze = self.guard.freeze_live_with_motivation(
+                let froze = self.guard.freeze_live(
                     max_flush_queue_depth,
                     max_flush_queue_bytes,
                     max_flush_queue_ops,
@@ -584,15 +574,16 @@ impl<'a> Drop for FsInnerGuard<'a> {
 pub struct InMemoryFS {
     /// Consolidated critical section protecting all in-memory metadata, layer overlay,
     /// file/dir handles, open counts, and write arena buffers.
-    pub inner: ActionMutex<FsInner>,
+    pub inner: Arc<ActionMutex<FsInner>>,
     /// Independent whole-file BSD flock and POSIX byte-range record lock manager.
     pub locks: LockManager,
     /// Authoritative manifest of all active log generations and lineage.
     pub manifest: Arc<RwLock<LogManifest>>,
-    pub next_inode: AtomicU64,
+    pub next_inode: Arc<AtomicU64>,
     pub last_tx_id: AtomicU64,
     pub clock: Arc<dyn Clock>,
     pub log_writer: Option<Arc<LogWriter>>,
+    pub writer_slot: Arc<RwLock<Option<Arc<LogWriter>>>>,
     pub log_cache: Option<Arc<LogFileCache>>,
     pub max_buffer_size: usize,
     pub max_staged_ops: usize,
@@ -605,7 +596,7 @@ pub struct InMemoryFS {
     pub max_flush_queue_bytes: usize,
     /// Maximum total mutating operations across all frozen flush batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_ops: usize,
-    pub flush_interval: AtomicU64,
+    pub flush_interval: Arc<AtomicU64>,
     pub flusher: Arc<Flusher>,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to true.
     pub track_atime: bool,
@@ -629,24 +620,40 @@ pub struct InMemoryFS {
     /// Live telemetry counters and synchronization state across all remotes.
     pub replication_telemetry: Arc<RwLock<crate::remote::worker::ReplicationTelemetry>>,
     /// Threshold in bytes of committed log data before automatically exporting an intermediate .summary file on log roll (0 to disable).
-    pub summary_interval_bytes: AtomicU64,
+    pub summary_interval_bytes: Arc<AtomicU64>,
     /// Threshold in rolled generations before automatically exporting an intermediate .summary file on log roll (0 to disable).
-    pub summary_interval_generations: AtomicU64,
+    pub summary_interval_generations: Arc<AtomicU64>,
     /// Cumulative data bytes flushed to the log since the last summary was exported.
-    pub bytes_since_last_summary: AtomicU64,
+    pub bytes_since_last_summary: Arc<AtomicU64>,
     /// Number of generations rolled since the last summary was exported.
-    pub generations_since_last_summary: AtomicU64,
+    pub generations_since_last_summary: Arc<AtomicU64>,
     /// Generation number of the last exported summary file.
-    pub last_summary_generation: AtomicU64,
+    pub last_summary_generation: Arc<AtomicU64>,
     /// Condition variable and flag to immediately notify the background replication worker of new logs/summaries.
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
     /// Tracks in-flight asynchronous operations (e.g. cold reads, async fsyncs) to ensure safe unmount without use-after-free.
     pub async_tracker: Arc<crate::async_runtime::AsyncTracker>,
     /// Optional fixed IV for exported summary files (used for deterministic golden fixture generation and testing).
     pub deterministic_summary_iv: Option<[u8; 12]>,
+    /// Bundled flush target slot observing dynamic configuration updates.
+    pub target_slot: Arc<RwLock<flush::FlushTarget>>,
 }
 
 impl InMemoryFS {
+    pub fn sync_writer_slot(&self) {
+        self.sync_flush_target();
+    }
+
+    pub fn sync_flush_target(&self) {
+        *self.writer_slot.write().unwrap() = self.log_writer.clone();
+        *self.target_slot.write().unwrap() = self.flush_target();
+    }
+
+    pub fn set_max_extent_size(&mut self, size: usize) {
+        self.max_extent_size = size;
+        self.sync_flush_target();
+    }
+
     pub fn new() -> Self {
         Self::with_clock(Arc::new(SystemClock))
     }
@@ -709,14 +716,47 @@ impl InMemoryFS {
             capacity_cvar: Arc::new(Condvar::new()),
         };
 
+        let inner_arc = Arc::new(ActionMutex::new(inner));
+        let next_inode = Arc::new(AtomicU64::new(2));
+        let writer_slot = Arc::new(RwLock::new(log_writer.clone()));
+        let flush_interval = Arc::new(AtomicU64::new(0));
+        let summary_interval_bytes = Arc::new(AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_BYTES));
+        let summary_interval_generations = Arc::new(AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_GENERATIONS));
+        let bytes_since_last_summary = Arc::new(AtomicU64::new(0));
+        let generations_since_last_summary = Arc::new(AtomicU64::new(0));
+        let last_summary_generation = Arc::new(AtomicU64::new(0));
+        let replication_notifier = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let target = flush::FlushTarget {
+            inner: Arc::clone(&inner_arc),
+            manifest: Arc::clone(&manifest),
+            clock: Arc::clone(&clock),
+            writer_slot: Arc::clone(&writer_slot),
+            volume_key: Arc::clone(&volume_key),
+            volume_header: crate::crypto::VolumeHeader::plaintext(),
+            next_inode: Arc::clone(&next_inode),
+            summary_interval_bytes: Arc::clone(&summary_interval_bytes),
+            summary_interval_generations: Arc::clone(&summary_interval_generations),
+            bytes_since_last_summary: Arc::clone(&bytes_since_last_summary),
+            generations_since_last_summary: Arc::clone(&generations_since_last_summary),
+            last_summary_generation: Arc::clone(&last_summary_generation),
+            replication_notifier: Arc::clone(&replication_notifier),
+            max_extent_size: crate::cli::DEFAULT_MAX_EXTENT_SIZE,
+            max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
+            max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
+            max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
+        };
+        let target_slot = Arc::new(RwLock::new(target));
+
         let fs = Self {
-            inner: ActionMutex::new(inner),
+            inner: inner_arc,
             locks: LockManager::new(),
             manifest,
-            next_inode: AtomicU64::new(2),
+            next_inode,
             last_tx_id: AtomicU64::new(0),
             clock,
             log_writer,
+            writer_slot,
             log_cache,
             max_buffer_size: 128 * 1024 * 1024,
             max_staged_ops: crate::cli::DEFAULT_MAX_BUFFER_OPS,
@@ -724,7 +764,7 @@ impl InMemoryFS {
             max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
             max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
             max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
-            flush_interval: AtomicU64::new(0),
+            flush_interval,
             flusher: Arc::new(Flusher::new()),
             track_atime: true,
             read_only: std::sync::atomic::AtomicBool::new(false),
@@ -733,16 +773,18 @@ impl InMemoryFS {
             virtual_files,
             remote_registry: RwLock::new(None),
             replication_telemetry: Arc::new(RwLock::new(crate::remote::worker::ReplicationTelemetry::new())),
-            summary_interval_bytes: AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_BYTES),
-            summary_interval_generations: AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_GENERATIONS),
-            bytes_since_last_summary: AtomicU64::new(0),
-            generations_since_last_summary: AtomicU64::new(0),
-            last_summary_generation: AtomicU64::new(0),
-            replication_notifier: Arc::new((Mutex::new(false), Condvar::new())),
+            summary_interval_bytes,
+            summary_interval_generations,
+            bytes_since_last_summary,
+            generations_since_last_summary,
+            last_summary_generation,
+            replication_notifier,
             async_tracker: Arc::new(crate::async_runtime::AsyncTracker::new()),
             deterministic_summary_iv: None,
+            target_slot,
         };
         fs.register_runtime_status();
+        fs.start_flusher();
         fs
     }
 
@@ -957,8 +999,11 @@ impl InMemoryFS {
 impl Drop for InMemoryFS {
     fn drop(&mut self) {
         if !std::thread::panicking() {
+            let was_running = self.flusher.background.lock().unwrap().is_some();
+            if was_running && !self.is_read_only() {
+                let _ = self.sync_and_export_summary();
+            }
             self.destroy();
-            let _ = self.sync_and_export_summary();
         }
     }
 }
@@ -1008,6 +1053,7 @@ mod tests {
         let mut fs = InMemoryFS::new();
         fs.max_buffer_size = 50;
         fs.max_staged_ops = 5;
+        fs.flusher.stop_background();
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
         // File creation recorded name.len() = 8

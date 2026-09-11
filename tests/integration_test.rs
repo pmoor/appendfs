@@ -1073,11 +1073,15 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     appendfs::operations::dir::rmdir_core(&fs, 1, "bigdir").unwrap();
 
     // Verify that the manifest records flushes triggered automatically by operation count!
-    let manifest = fs.manifest.read().unwrap();
-    assert!(!manifest.logs.is_empty());
-    let total_records: u32 = manifest.logs.iter().map(|l| l.record_count).sum();
     assert!(
-        total_records > 0,
+        wait_until(
+            || {
+                let manifest = fs.manifest.read().unwrap();
+                let total_records: u32 = manifest.logs.iter().map(|l| l.record_count).sum();
+                total_records > 0
+            },
+            std::time::Duration::from_secs(5),
+        ),
         "metadata unlinks must have been automatically flushed to log"
     );
 }

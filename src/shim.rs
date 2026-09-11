@@ -903,6 +903,9 @@ extern "C" fn init_bridge(userdata: *mut c_void) {
 
 extern "C" fn destroy_bridge(userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    if !fs.is_read_only() {
+        let _ = fs.sync_and_export_summary();
+    }
     fs.destroy();
 }
 
@@ -967,12 +970,9 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
 
     let code = unsafe { run_fuse_ll(c_args.len() as c_int, c_args.as_ptr(), &ops, raw_userdata) };
 
-    // Clean up heap allocation and execute unmount flush/sync (only on read-write mounts)
+    // Clean up heap allocation (destroy was called by FUSE destroy_bridge)
     unsafe {
-        let arc_fs = Box::from_raw(raw_userdata as *mut std::sync::Arc<crate::fs::InMemoryFS>);
-        if !arc_fs.is_read_only() {
-            let _ = arc_fs.sync_and_export_summary();
-        }
+        let _arc_fs = Box::from_raw(raw_userdata as *mut std::sync::Arc<crate::fs::InMemoryFS>);
     }
 
     if code == 0 { Ok(()) } else { Err(code) }

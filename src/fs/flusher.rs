@@ -128,11 +128,11 @@ impl Flusher {
         self.background.lock().unwrap().is_some()
     }
 
-    /// Wakes up the background flusher thread immediately to execute a flush cycle with `motivation`.
+    /// Wakes up the background flusher thread immediately to execute a flush cycle.
     /// Returns `true` if a background flusher thread is running and was notified.
-    pub fn trigger(&self, motivation: FlushMotivation) -> bool {
+    pub fn trigger(&self) -> bool {
         if let Some(ref bg) = *self.background.lock().unwrap() {
-            bg.trigger(motivation);
+            bg.trigger();
             true
         } else {
             false
@@ -251,7 +251,7 @@ mod tests {
     fn test_flusher_encapsulation_methods() {
         let flusher = Flusher::new();
         assert!(!flusher.is_background_active());
-        assert!(!flusher.trigger(FlushMotivation::Manual));
+        assert!(!flusher.trigger());
         assert!(!flusher.stop_background());
 
         let t0 = SystemTime::UNIX_EPOCH;

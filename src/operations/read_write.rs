@@ -569,7 +569,7 @@ pub fn create(fs: &InMemoryFS, req: Request, parent: u64, name: &str, mode: u32,
 
 #[cfg(any(test, feature = "testing"))]
 pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
-    let completion = fs.rollover_for_fsync(ino, fh)?;
+    let completion = fs.rollover_for_sync(ino, fh, crate::log::FlushMotivation::Fsync)?;
     let Some(completion) = completion else {
         if let Some(ref writer) = fs.log_writer {
             let writer_clone = Arc::clone(writer);
@@ -581,9 +581,6 @@ pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
         return Ok(());
     };
 
-    if !fs.trigger_flusher_with_motivation(crate::log::FlushMotivation::Fsync) {
-        let _ = fs.flush_with_motivation(crate::log::FlushMotivation::Fsync);
-    }
     completion
         .wait()
         .await
@@ -592,7 +589,7 @@ pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
 
 pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
     log::trace!("fsync(ino={}, datasync={}, fh={})", ino, datasync, fh);
-    let completion = match fs.rollover_for_fsync(ino, fh) {
+    let completion = match fs.rollover_for_sync(ino, fh, crate::log::FlushMotivation::Fsync) {
         Ok(c) => c,
         Err(e) => {
             req.reply_err(e);
@@ -619,9 +616,6 @@ pub fn fsync(fs: &InMemoryFS, req: Request, ino: u64, datasync: bool, fh: u64) {
         return;
     };
 
-    if !fs.trigger_flusher_with_motivation(crate::log::FlushMotivation::Fsync) {
-        let _ = fs.flush_with_motivation(crate::log::FlushMotivation::Fsync);
-    }
     let guard = fs.begin_async_op();
     crate::async_runtime::spawn(async move {
         let _guard = guard;
@@ -829,7 +823,7 @@ mod tests {
         let pre_flush = pre_stats.iter().find(|s| s.tag == OpTag::Flush).unwrap().count;
 
         // Call fsync_core rollover with open file handle fh
-        let res = fs.rollover_for_fsync(file.ino, fh);
+        let res = fs.rollover_for_sync(file.ino, fh, crate::log::FlushMotivation::Fsync);
         assert!(res.is_ok());
 
         let post_total = fs.inner.lock_count();

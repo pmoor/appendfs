@@ -5,136 +5,213 @@
 //! trailing `FlushCommit` confirming atomic persistence. Recovery replays `LogEntryDelta`
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
-use super::{FlushBatch, FlushMotivation, FlushRecord, FsInner, InMemoryFS};
+use super::{FlushMotivation, FlushRecord, FsInner, InMemoryFS};
 use crate::extent_map::Extent;
 use crate::log::{BackgroundFlusher, GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
 use crate::storage::Storage;
-use crate::sync::OpTag;
+use crate::sync::{ActionMutex, OpTag};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-impl InMemoryFS {
-    // --- Flush & Fold Pipelines ---
+fn sync_manifest_md5s_and_snapshot(
+    manifest_lock: &Arc<RwLock<crate::log::LogManifest>>,
+    storage: &dyn Storage,
+    active_gen: u64,
+) -> crate::log::LogManifest {
+    let needed: Vec<(u64, String)> = {
+        let m = manifest_lock.read().unwrap();
+        m.logs
+            .iter()
+            .filter(|l| l.generation < active_gen && l.md5.is_none())
+            .map(|l| (l.generation, l.filename.clone()))
+            .collect()
+    };
 
-    /// Freezes `live` into the `flushing` queue if queue depth, bytes, and ops are within capacity limits.
-    pub fn begin_flush(&self) -> bool {
-        self.begin_flush_with_motivation(FlushMotivation::Manual)
-    }
-
-    /// Freezes `live` into the `flushing` queue with an explicit `FlushMotivation`.
-    pub fn begin_flush_with_motivation(&self, motivation: FlushMotivation) -> bool {
-        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-        self.begin_flush_locked_with_motivation(&mut inner, motivation)
-    }
-
-    /// Freezes `live` into the `flushing` queue with the inner lock already held.
-    pub fn begin_flush_locked(&self, inner: &mut FsInner) -> bool {
-        self.begin_flush_locked_with_motivation(inner, FlushMotivation::Manual)
-    }
-
-    /// Freezes `live` into the `flushing` queue with the inner lock already held and explicit `motivation`.
-    pub fn begin_flush_locked_with_motivation(&self, inner: &mut FsInner, motivation: FlushMotivation) -> bool {
-        inner.freeze_live_with_motivation(
-            self.max_flush_queue_depth,
-            self.max_flush_queue_bytes,
-            self.max_flush_queue_ops,
-            motivation,
-            self.clock.now(),
-        )
-    }
-
-    /// Freezes active `live` mutations into a `FlushBatch` under the inner lock, or retrieves
-    /// the completion handle of the latest in-flight batch if `live` is empty.
-    ///
-    /// If `fh != 0`, the file handle is validated against `ino` under the lock.
-    ///
-    /// If the `flushing` queue is at capacity (depth, bytes, or ops limit reached),
-    /// this kicks off the flusher and waits on `capacity_cvar` before retrying.
-    pub fn rollover_for_fsync(&self, ino: u64, fh: u64) -> Result<Option<super::BatchCompletion>, i32> {
-        let motivation = if ino == 0 {
-            FlushMotivation::Fdirsync
-        } else {
-            FlushMotivation::Fsync
-        };
-        self.rollover_for_sync(ino, fh, motivation)
-    }
-
-    /// Freezes active `live` mutations into a `FlushBatch` for directory sync operations (`fsyncdir`).
-    pub fn rollover_for_fdirsync(&self, ino: u64, fh: u64) -> Result<Option<super::BatchCompletion>, i32> {
-        self.rollover_for_sync(ino, fh, FlushMotivation::Fdirsync)
-    }
-
-    /// Freezes active `live` mutations into a `FlushBatch` with explicit `FlushMotivation`.
-    pub fn rollover_for_sync(
-        &self,
-        ino: u64,
-        fh: u64,
-        motivation: FlushMotivation,
-    ) -> Result<Option<super::BatchCompletion>, i32> {
-        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-        loop {
-            if fh != 0 {
-                inner.validate_regular_handle(ino, fh)?;
-            }
-            if self.log_writer.is_none() {
-                return Ok(None);
-            }
-            if !inner.live.is_empty() {
-                if self.begin_flush_locked_with_motivation(&mut inner, motivation) {
-                    let completion = inner.flushing.back().map(|b| b.completion.clone());
-                    return Ok(completion);
-                }
-                // Flushing queue is saturated. Wait on capacity_cvar.
-                if !self.trigger_flusher_with_motivation(motivation) {
-                    drop(inner);
-                    let _ = self.flush_with_motivation(motivation);
-                    inner = self.inner.lock(OpTag::Flush).unwrap();
-                } else {
-                    let cvar = inner.capacity_cvar.clone();
-                    let (guard, _) = inner.wait_timeout(&cvar, Duration::from_millis(50));
-                    inner = guard;
-                }
-                continue;
-            }
-
-            // Live is empty. If there are batches in flight, wait on the latest one.
-            if let Some(back) = inner.flushing.back() {
-                return Ok(Some(back.completion.clone()));
-            }
-
-            // No live mutations and no flushing batches.
-            return Ok(None);
+    let mut computed = Vec::new();
+    for (generation_num, fname) in needed {
+        if storage.exists(&fname)
+            && let Ok(digest) = crate::log::manifest::compute_storage_file_md5(storage, &fname)
+        {
+            computed.push((generation_num, digest));
         }
     }
 
-    /// Merges a flushed batch into `base` with the inner lock already held.
-    fn fold_flushed_batch_locked(&self, inner: &mut FsInner, flushed: FlushBatch) {
-        inner.fold_flushed_batch(flushed);
+    let mut m = manifest_lock.write().unwrap();
+    for (generation_num, digest) in computed {
+        m.set_generation_md5(generation_num, digest);
+    }
+    m.clone()
+}
+
+/// Target bundled for the flusher worker thread to empty the `flushing` queue and persist batches.
+#[derive(Clone)]
+pub struct FlushTarget {
+    pub inner: Arc<ActionMutex<FsInner>>,
+    pub manifest: Arc<RwLock<crate::log::LogManifest>>,
+    pub clock: Arc<dyn crate::clock::Clock>,
+    pub writer_slot: Arc<RwLock<Option<Arc<LogWriter>>>>,
+    pub volume_key: Arc<crate::crypto::VolumeKey>,
+    pub volume_header: crate::crypto::VolumeHeader,
+    pub next_inode: Arc<AtomicU64>,
+    pub summary_interval_bytes: Arc<AtomicU64>,
+    pub summary_interval_generations: Arc<AtomicU64>,
+    pub bytes_since_last_summary: Arc<AtomicU64>,
+    pub generations_since_last_summary: Arc<AtomicU64>,
+    pub last_summary_generation: Arc<AtomicU64>,
+    pub replication_notifier: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    pub max_extent_size: usize,
+    pub max_flush_queue_depth: usize,
+    pub max_flush_queue_bytes: usize,
+    pub max_flush_queue_ops: usize,
+}
+
+impl FlushTarget {
+    /// Freezes `live` into `flushing` with `TimeBased` motivation on interval timeout.
+    pub fn freeze_time_based(&self) {
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+        inner.freeze_live(
+            self.max_flush_queue_depth,
+            self.max_flush_queue_bytes,
+            self.max_flush_queue_ops,
+            FlushMotivation::TimeBased,
+            self.clock.now(),
+        );
     }
 
-    /// Directly applies replayed log deltas into `base` without requiring a `FlushBatch` wrapper.
-    pub fn apply_delta_batch(&self, deltas: HashMap<u64, EntryDelta>) {
-        let mut inner = self.inner.lock(OpTag::Fold).unwrap();
-        inner.apply_base_deltas(deltas);
+    /// Empties the `flushing` queue under the flusher lock until none remain.
+    pub fn drain_flushing_queue(&self, flusher: &super::Flusher) -> std::io::Result<usize> {
+        let _flush_guard = flusher.lock();
+        let mut count = 0;
+        while self.step_one_batch(flusher)?.is_some() {
+            count += 1;
+        }
+        Ok(count)
     }
 
-    /// Writes pending data extents and serialized `LogEntryDelta` records for a frozen batch,
-    /// followed by the `FlushCommit` trailer that makes the batch replayable.
-    ///
-    /// On any write error the entire batch is rolled back to its starting offset.
-    // TODO(too-many-lines): extract this into smaller units.
+    /// Steps a single batch from the `flushing` queue:
+    /// - Writes extents/deltas to disk if a LogWriter is present.
+    /// - Pops the batch from `flushing` and folds it into `base`.
+    /// - Completes the batch completion handle.
+    /// - Records the flush operation in the ring buffer.
+    pub fn step_one_batch(&self, flusher: &super::Flusher) -> std::io::Result<Option<FlushRecord>> {
+        let mut batch = {
+            let inner = self.inner.lock(OpTag::Flush).unwrap();
+            match inner.flushing.front() {
+                Some(b) => {
+                    assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
+                    b.clone()
+                }
+                None => return Ok(None),
+            }
+        };
+
+        let started_at = self.clock.now();
+        let writer_opt = self.writer_slot.read().unwrap().clone();
+
+        let flushed_bytes = if let Some(ref writer) = writer_opt {
+            match self.synthesize_and_write_flushing_layer(&mut batch.entries, writer) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::error!("Failed to write flushing layer to log: {}", e);
+                    {
+                        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+                        if let Some(front) = inner.flushing.front_mut()
+                            && front.id == batch.id
+                        {
+                            front.completion = super::BatchCompletion::new();
+                        }
+                    }
+                    batch
+                        .completion
+                        .complete(Err(std::io::Error::new(e.kind(), e.to_string())));
+                    return Err(e);
+                }
+            }
+        } else {
+            batch.bytes as u64
+        };
+
+        let popped = {
+            let mut inner = self.inner.lock(OpTag::Fold).unwrap();
+            let popped = inner.pop_flushed_batch(&batch);
+            inner.fold_flushed_batch(batch);
+            popped
+        };
+
+        let completed_at = self.clock.now();
+        let duration = completed_at.duration_since(started_at).unwrap_or_default();
+
+        let record = FlushRecord {
+            id: popped.id,
+            motivation: popped.motivation,
+            data_bytes: flushed_bytes,
+            ops_count: popped.ops,
+            started_at,
+            completed_at,
+            duration,
+        };
+        flusher.record_flush(record.clone());
+
+        popped.completion.complete(Ok(()));
+
+        Ok(Some(record))
+    }
+
+    fn notify_replication(&self) {
+        let (lock, cvar) = &*self.replication_notifier;
+        let mut pending = lock.lock().unwrap();
+        *pending = true;
+        cvar.notify_all();
+    }
+
+    pub fn export_summary_for_base(
+        &self,
+        storage: &dyn Storage,
+        sealed_gen: u64,
+        last_tx_id: u64,
+    ) -> std::io::Result<String> {
+        let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
+        let next_inode = self.next_inode.load(Ordering::SeqCst);
+        let manifest = sync_manifest_md5s_and_snapshot(&self.manifest, storage, sealed_gen + 1);
+        let now = self.clock.now();
+
+        if self.volume_header.cipher != self.volume_key.cipher() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to export an unreadable summary: volume header describes a {} volume \
+                     but the key in use is for {}",
+                    self.volume_header.cipher,
+                    self.volume_key.cipher()
+                ),
+            ));
+        }
+
+        crate::log::summary::export_summary(
+            &crate::log::summary::SummarySnapshot {
+                inodes: &snapshot,
+                manifest: &manifest,
+                volume_header: &self.volume_header,
+                generation: sealed_gen,
+                last_tx_id,
+                next_inode,
+                created_at: now,
+            },
+            storage,
+            &self.volume_key,
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn synthesize_and_write_flushing_layer(
         &self,
         frozen: &mut HashMap<u64, EntryDelta>,
         writer: &LogWriter,
     ) -> std::io::Result<u64> {
-        // Clamped because extent lengths are u32, and because a zero would make the
-        // chunking loop below never advance.
         let max_extent_size = self.max_extent_size.clamp(1, u32::MAX as usize);
 
         if let Some((next_gen, sealed_md5)) =
@@ -284,6 +361,13 @@ impl InMemoryFS {
             let active_offset = writer.current_offset();
             {
                 let mut manifest = self.manifest.write().unwrap();
+                if manifest.get_by_generation(active_gen).is_none() {
+                    manifest.record_roll(
+                        active_gen,
+                        self.clock.now(),
+                        crate::log::record::FILE_HEADER_SIZE as u64,
+                    );
+                }
                 if let Some(entry) = manifest.get_mut_by_generation(active_gen) {
                     entry.record_count += written_count + 1; // including FlushCommit
                     entry.total_data_bytes += flushed_data_bytes;
@@ -306,138 +390,210 @@ impl InMemoryFS {
 
         Ok(flushed_data_bytes)
     }
+}
 
-    /// Steps a single batch from the `flushing` queue:
-    /// - If `log_writer` is present, serializes and writes extents/deltas to disk and commits.
-    /// - Pops the batch from `flushing` and folds it into `base`.
-    /// - Completes the batch's completion handle.
-    /// - Records the flush operation in the recent flushes ring buffer.
+impl InMemoryFS {
+    /// Creates a bundled `FlushTarget` snapshot capturing shared Arcs needed for flush execution.
+    pub fn flush_target(&self) -> FlushTarget {
+        FlushTarget {
+            inner: Arc::clone(&self.inner),
+            manifest: Arc::clone(&self.manifest),
+            clock: Arc::clone(&self.clock),
+            writer_slot: Arc::clone(&self.writer_slot),
+            volume_key: Arc::clone(&self.volume_key),
+            volume_header: self.volume_header.clone(),
+            next_inode: Arc::clone(&self.next_inode),
+            summary_interval_bytes: Arc::clone(&self.summary_interval_bytes),
+            summary_interval_generations: Arc::clone(&self.summary_interval_generations),
+            bytes_since_last_summary: Arc::clone(&self.bytes_since_last_summary),
+            generations_since_last_summary: Arc::clone(&self.generations_since_last_summary),
+            last_summary_generation: Arc::clone(&self.last_summary_generation),
+            replication_notifier: Arc::clone(&self.replication_notifier),
+            max_extent_size: self.max_extent_size,
+            max_flush_queue_depth: self.max_flush_queue_depth,
+            max_flush_queue_bytes: self.max_flush_queue_bytes,
+            max_flush_queue_ops: self.max_flush_queue_ops,
+        }
+    }
+
+    /// Starts or restarts the background flusher thread responsible for emptying the flushing queue.
+    pub fn start_flusher(&self) {
+        self.sync_flush_target();
+        let target_slot = Arc::clone(&self.target_slot);
+        let flusher_clone = Arc::clone(&self.flusher);
+        let target_slot_timeout = Arc::clone(&self.target_slot);
+        let flusher_ref = Arc::clone(&self.flusher);
+
+        let bg = BackgroundFlusher::start_dynamic(
+            move || {
+                let target = target_slot.read().unwrap().clone();
+                target.drain_flushing_queue(&flusher_clone).map(|_| ())
+            },
+            move || {
+                let target = target_slot_timeout.read().unwrap().clone();
+                target.freeze_time_based();
+            },
+            Arc::clone(&self.flush_interval),
+        );
+        *flusher_ref.background.lock().unwrap() = Some(bg);
+    }
+
+    // --- Flush & Fold Pipelines ---
+
+    /// Freezes `live` into the `flushing` queue if queue depth, bytes, and ops are within capacity limits.
+    pub fn begin_flush(&self) -> bool {
+        self.begin_flush_with_motivation(FlushMotivation::Manual)
+    }
+
+    /// Freezes `live` into the `flushing` queue with an explicit `FlushMotivation`.
+    pub fn begin_flush_with_motivation(&self, motivation: FlushMotivation) -> bool {
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+        self.begin_flush_locked_with_motivation(&mut inner, motivation)
+    }
+
+    /// Freezes `live` into the `flushing` queue with the inner lock already held.
+    pub fn begin_flush_locked(&self, inner: &mut FsInner) -> bool {
+        self.begin_flush_locked_with_motivation(inner, FlushMotivation::Manual)
+    }
+
+    /// Freezes `live` into the `flushing` queue with the inner lock already held and explicit `motivation`.
+    pub fn begin_flush_locked_with_motivation(&self, inner: &mut FsInner, motivation: FlushMotivation) -> bool {
+        inner.freeze_live(
+            self.max_flush_queue_depth,
+            self.max_flush_queue_bytes,
+            self.max_flush_queue_ops,
+            motivation,
+            self.clock.now(),
+        )
+    }
+
+    /// Freezes active `live` mutations into a `FlushBatch` with explicit `FlushMotivation`.
+    ///
+    /// If `fh != 0`, the file handle is validated against `ino` under the lock.
+    ///
+    /// If the `flushing` queue is at capacity (depth, bytes, or ops limit reached),
+    /// this signals the flusher and waits on `capacity_cvar` before retrying.
+    pub fn rollover_for_sync(
+        &self,
+        ino: u64,
+        fh: u64,
+        motivation: FlushMotivation,
+    ) -> Result<Option<super::BatchCompletion>, i32> {
+        self.sync_flush_target();
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+        loop {
+            if fh != 0 {
+                inner.validate_regular_handle(ino, fh)?;
+            }
+            if self.log_writer.is_none() {
+                return Ok(None);
+            }
+            if !inner.live.is_empty() {
+                if self.begin_flush_locked_with_motivation(&mut inner, motivation) {
+                    let completion = inner.flushing.back().map(|b| b.completion.clone());
+                    drop(inner);
+                    self.flusher.trigger();
+                    return Ok(completion);
+                }
+                // Flushing queue is saturated. Signal flusher and wait on capacity_cvar.
+                self.flusher.trigger();
+                let cvar = inner.capacity_cvar.clone();
+                let (guard, _) = inner.wait_timeout(&cvar, Duration::from_millis(50));
+                inner = guard;
+                continue;
+            }
+
+            // Live is empty. If there are batches in flight, wait on the latest one.
+            if let Some(back) = inner.flushing.back() {
+                return Ok(Some(back.completion.clone()));
+            }
+
+            // No live mutations and no flushing batches.
+            return Ok(None);
+        }
+    }
+
+    /// Directly applies replayed log deltas into `base` without requiring a `FlushBatch` wrapper.
+    pub fn apply_delta_batch(&self, deltas: HashMap<u64, EntryDelta>) {
+        let mut inner = self.inner.lock(OpTag::Fold).unwrap();
+        inner.apply_base_deltas(deltas);
+    }
+
+    /// Steps a single batch from the `flushing` queue under the flusher lock.
     ///
     /// Returns `Ok(Some(record))` if a batch was stepped, or `Ok(None)` if `flushing` was empty.
     pub fn step_flush(&self) -> std::io::Result<Option<FlushRecord>> {
+        self.sync_flush_target();
         let _flush_guard = self.flusher.lock();
-        self.step_flush_locked(FlushMotivation::Manual)
+        let target = self.target_slot.read().unwrap().clone();
+        target.step_one_batch(&self.flusher)
     }
 
-    /// Steps a single batch from the `flushing` queue with an explicit fallback motivation.
-    pub fn step_flush_with_motivation(&self, motivation: FlushMotivation) -> std::io::Result<Option<FlushRecord>> {
-        let _flush_guard = self.flusher.lock();
-        self.step_flush_locked(motivation)
-    }
-
-    /// Internal batch step implementation called with `self.flusher.lock()` already held.
-    pub fn step_flush_locked(&self, motivation_fallback: FlushMotivation) -> std::io::Result<Option<FlushRecord>> {
-        let mut batch = {
-            let inner = self.inner.lock(OpTag::Flush).unwrap();
-            match inner.flushing.front() {
-                Some(b) => {
-                    assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
-                    b.clone()
-                }
-                None => return Ok(None),
-            }
-        };
-
-        let started_at = self.clock.now();
-
-        // Write batch to disk if log writer is present
-        let flushed_bytes = if let Some(ref writer) = self.log_writer {
-            self.synthesize_and_write_flushing_layer(&mut batch.entries, writer)?
-        } else {
-            batch.bytes as u64
-        };
-
-        // Pop from flushing queue (asserting matching ID) and fold into base
-        let popped = {
-            let mut inner = self.inner.lock(OpTag::Fold).unwrap();
-            let popped = inner.pop_flushed_batch(&batch);
-            self.fold_flushed_batch_locked(&mut inner, batch);
-            popped
-        };
-        if !popped.completion.is_completed() {
-            popped.completion.complete(Ok(()));
-        }
-
-        let completed_at = self.clock.now();
-        let duration = completed_at.duration_since(started_at).unwrap_or_default();
-
-        let motivation = popped.motivation.combine(motivation_fallback);
-
-        let record = FlushRecord {
-            id: popped.id,
-            motivation,
-            data_bytes: flushed_bytes,
-            ops_count: popped.ops,
-            started_at,
-            completed_at,
-            duration,
-        };
-        self.flusher.record_flush(record.clone());
-
-        Ok(Some(record))
-    }
-
-    /// Flushes all pending mutations and batches to disk.
+    /// Flushes all pending mutations and batches to disk via the flusher.
     pub fn flush_log(&self) -> std::io::Result<()> {
         self.flush_with_motivation(FlushMotivation::Manual).map(|_| ())
     }
 
+    /// Flushes mutations if threshold is reached and waits for flusher to drain.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn flush_log_locked(&self, _writer: &LogWriter) -> std::io::Result<()> {
+        let (froze, completion) = {
+            let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+            let froze = if inner.staged_bytes >= self.max_buffer_size || inner.staged_ops >= self.max_staged_ops {
+                self.begin_flush_locked_with_motivation(&mut inner, FlushMotivation::Threshold)
+            } else {
+                false
+            };
+            (froze, inner.flushing.back().map(|b| b.completion.clone()))
+        };
+        if froze {
+            self.trigger_flusher();
+            if let Some(comp) = completion {
+                comp.wait_blocking()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Flushes all pending mutations and batches with an explicit `FlushMotivation`.
     pub fn flush_with_motivation(&self, motivation: FlushMotivation) -> std::io::Result<usize> {
-        let _flush_guard = self.flusher.lock();
-        let Some(ref _writer) = self.log_writer else {
-            return Ok(0);
-        };
-        self.begin_flush_with_motivation(motivation);
-        self.flush_batches_locked(motivation)
-    }
-
-    /// Freezes all pending mutations and folds all queued batches into `base`.
-    pub fn flush_to_base(&self) -> std::io::Result<usize> {
-        let _flush_guard = self.flusher.lock();
-        self.begin_flush_with_motivation(FlushMotivation::Manual);
-        self.flush_batches_locked(FlushMotivation::Manual)
-    }
-
-    /// Internal loop that drains queued flushing batches while holding `self.flusher.lock()`.
-    pub fn flush_batches_locked(&self, motivation_fallback: FlushMotivation) -> std::io::Result<usize> {
-        let mut count = 0;
-        loop {
-            {
-                let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-                if inner.staged_bytes >= self.max_buffer_size || inner.staged_ops >= self.max_staged_ops {
-                    self.begin_flush_locked_with_motivation(&mut inner, FlushMotivation::Threshold);
-                }
-                if inner.flushing.is_empty() {
-                    break;
-                }
-            }
-
-            if self.step_flush_locked(motivation_fallback)?.is_some() {
+        self.sync_flush_target();
+        let (count, completion) = {
+            let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+            let mut count = inner.flushing.len();
+            if !inner.live.is_empty() && self.begin_flush_locked_with_motivation(&mut inner, motivation) {
                 count += 1;
-            } else {
-                break;
             }
+            (count, inner.flushing.back().map(|b| b.completion.clone()))
+        };
+        if self.flusher.trigger() {
+            if let Some(comp) = completion {
+                comp.wait_blocking()?;
+            }
+            let _flush_guard = self.flusher.lock();
+        } else {
+            let target = self.target_slot.read().unwrap().clone();
+            target.drain_flushing_queue(&self.flusher)?;
         }
         Ok(count)
     }
 
-    /// Internal flush implementation called while holding flush lock.
-    pub fn flush_log_locked(&self, _writer: &LogWriter) -> std::io::Result<()> {
-        self.flush_batches_locked(FlushMotivation::Manual).map(|_| ())
+    /// Freezes all pending mutations and folds all queued batches into `base`.
+    pub fn flush_to_base(&self) -> std::io::Result<usize> {
+        self.flush_with_motivation(FlushMotivation::Manual)
     }
 
     /// Safely rolls the active log generation under the flush lock, draining pending batches first.
     pub fn force_roll_active_log(&self) -> std::io::Result<Option<(u64, [u8; 16])>> {
-        let _flush_guard = self.flusher.lock();
+        self.sync_flush_target();
         let Some(ref writer) = self.log_writer else {
             return Ok(None);
         };
 
-        // Drain pending batches first so the current generation is cleanly flushed
-        self.begin_flush_with_motivation(FlushMotivation::Manual);
-        self.flush_batches_locked(FlushMotivation::Manual)?;
+        // Drain pending batches first via the flusher so the current generation is cleanly flushed
+        self.flush_log()?;
 
+        let _flush_guard = self.flusher.lock();
         if let Some((next_gen, sealed_md5)) = writer.force_roll(&*self.clock)? {
             let sealed_gen = next_gen - 1;
             {
@@ -471,61 +627,31 @@ impl InMemoryFS {
     /// Wakes up the background periodic flusher immediately to drain pending batches.
     /// Returns true if a background flusher is active and was notified, false otherwise.
     pub fn trigger_flusher(&self) -> bool {
-        self.trigger_flusher_with_motivation(FlushMotivation::Manual)
+        self.sync_flush_target();
+        self.flusher.trigger()
     }
 
-    /// Wakes up the background periodic flusher immediately with `motivation`.
-    pub fn trigger_flusher_with_motivation(&self, motivation: FlushMotivation) -> bool {
-        self.flusher.trigger(motivation)
-    }
-
-    /// Wakes up the background periodic flusher or flushes inline if thresholds were reached.
+    /// Wakes up the background periodic flusher immediately if thresholds were reached.
     pub fn notify_flush_trigger(&self, should_trigger: bool) {
-        if should_trigger && !self.trigger_flusher_with_motivation(FlushMotivation::Threshold) {
-            let _ = self.flush_with_motivation(FlushMotivation::Threshold);
+        if should_trigger {
+            self.sync_flush_target();
+            self.flusher.trigger();
+            std::thread::yield_now();
         }
     }
 
-    /// Initializes background services (e.g. periodic flusher) upon FUSE mount.
+    /// Initializes background services upon FUSE mount.
     pub fn init(self: &Arc<Self>) {
         if self.is_read_only() {
+            self.flusher.stop_background();
             return;
         }
-        let interval_secs = self.flush_interval.load(Ordering::SeqCst);
-        if interval_secs > 0 {
-            let self_clone = Arc::clone(self);
-            let mut flusher_bg = self.flusher.background.lock().unwrap();
-            *flusher_bg = Some(BackgroundFlusher::start(
-                move |motivation| {
-                    let _ = self_clone.flush_with_motivation(motivation);
-                    Ok(())
-                },
-                Duration::from_secs(interval_secs),
-            ));
-            log::info!(
-                "Started background periodic log flusher (interval: {} seconds)",
-                interval_secs
-            );
-        }
+        self.start_flusher();
     }
 
     /// Cleanly stops background services and drains in-flight async operations upon FUSE unmount.
     pub fn destroy(&self) {
-        if !self.is_read_only() {
-            self.flusher.stop_background();
-            let completions: Vec<_> = {
-                let inner = self.inner.lock(OpTag::Flush).unwrap();
-                inner.flushing.iter().map(|b| b.completion.clone()).collect()
-            };
-            for completion in completions {
-                if !completion.is_completed() {
-                    completion.complete(Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "filesystem destroyed",
-                    )));
-                }
-            }
-        }
+        self.flusher.stop_background();
         self.drain_async_ops();
     }
 
@@ -584,29 +710,7 @@ impl InMemoryFS {
     }
 
     fn sync_manifest_md5s_and_snapshot(&self, storage: &dyn Storage, active_gen: u64) -> crate::log::LogManifest {
-        let needed: Vec<(u64, String)> = {
-            let m = self.manifest.read().unwrap();
-            m.logs
-                .iter()
-                .filter(|l| l.generation < active_gen && l.md5.is_none())
-                .map(|l| (l.generation, l.filename.clone()))
-                .collect()
-        };
-
-        let mut computed = Vec::new();
-        for (generation_num, fname) in needed {
-            if storage.exists(&fname)
-                && let Ok(digest) = crate::log::manifest::compute_storage_file_md5(storage, &fname)
-            {
-                computed.push((generation_num, digest));
-            }
-        }
-
-        let mut m = self.manifest.write().unwrap();
-        for (generation_num, digest) in computed {
-            m.set_generation_md5(generation_num, digest);
-        }
-        m.clone()
+        sync_manifest_md5s_and_snapshot(&self.manifest, storage, active_gen)
     }
 
     /// Exports a single-file summary snapshot of the current in-memory filesystem state to `storage`.
@@ -649,7 +753,7 @@ impl InMemoryFS {
         }
 
         let explicit_iv = explicit_iv.or(self.deterministic_summary_iv);
-        let result = crate::log::summary::export_summary_with_iv(
+        let res = crate::log::summary::export_summary_with_iv(
             &crate::log::summary::SummarySnapshot {
                 inodes: &snapshot,
                 manifest: &manifest,
@@ -664,13 +768,13 @@ impl InMemoryFS {
             explicit_iv,
         );
 
-        if result.is_ok() {
+        if res.is_ok() {
             self.bytes_since_last_summary.store(0, Ordering::SeqCst);
             self.generations_since_last_summary.store(0, Ordering::SeqCst);
             self.last_summary_generation.store(generation, Ordering::SeqCst);
         }
 
-        result
+        res
     }
 
     /// Exports a single-file summary snapshot capturing the committed `base` layer for a sealed generation.
@@ -680,36 +784,8 @@ impl InMemoryFS {
         sealed_gen: u64,
         last_tx_id: u64,
     ) -> std::io::Result<String> {
-        let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
-        let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let manifest = self.sync_manifest_md5s_and_snapshot(storage, sealed_gen + 1);
-        let now = self.clock.now();
-
-        if self.volume_header.cipher != self.volume_key.cipher() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "refusing to export an unreadable summary: volume header describes a {} volume \
-                     but the key in use is for {}",
-                    self.volume_header.cipher,
-                    self.volume_key.cipher()
-                ),
-            ));
-        }
-
-        crate::log::summary::export_summary(
-            &crate::log::summary::SummarySnapshot {
-                inodes: &snapshot,
-                manifest: &manifest,
-                volume_header: &self.volume_header,
-                generation: sealed_gen,
-                last_tx_id,
-                next_inode,
-                created_at: now,
-            },
-            storage,
-            &self.volume_key,
-        )
+        self.flush_target()
+            .export_summary_for_base(storage, sealed_gen, last_tx_id)
     }
 
     pub fn sync_and_export_summary(&self) -> std::io::Result<Option<String>> {
@@ -1476,7 +1552,10 @@ mod tests {
 
         // Staged ops reset to 0 after automatic flush
         assert_eq!(fs.staged_ops(), 0);
-        assert_eq!(fs.manifest.read().unwrap().logs[0].record_count, 7); // 5 files + 1 root dir + 1 FlushCommit
+        assert!(crate::test_utils::wait_until(
+            || fs.manifest.read().unwrap().logs[0].record_count == 7,
+            Duration::from_secs(2)
+        ));
     }
 
     #[test]
@@ -2061,8 +2140,11 @@ mod tests {
         crate::operations::read_write::write_core(&fs, file.ino, &[0xAA; 100], 0).unwrap();
 
         // Automatic threshold triggered begin_flush()!
-        // In unmounted environment without background flusher, threshold trigger flushes inline,
-        // so queue depth is 0 and staged counters are 0.
+        // Background flusher drains the threshold batch so queue depth returns to 0.
+        assert!(crate::test_utils::wait_until(
+            || fs.flush_queue_depth() == 0,
+            Duration::from_secs(2)
+        ));
         assert_eq!(fs.staged_bytes(), 0);
         assert_eq!(fs.staged_ops(), 0);
 
@@ -2366,7 +2448,7 @@ mod tests {
 
         // Rollover under lock
         let completion = fs
-            .rollover_for_fsync(file.ino, 0)
+            .rollover_for_sync(file.ino, 0, FlushMotivation::Fsync)
             .unwrap()
             .expect("completion expected");
         assert!(!completion.is_completed());
@@ -2420,7 +2502,7 @@ mod tests {
         // Install a background flusher handle so trigger_flusher returns true
         {
             let mut flusher = fs.flusher.background.lock().unwrap();
-            *flusher = Some(BackgroundFlusher::start(|_| Ok(()), Duration::from_secs(60)));
+            *flusher = Some(BackgroundFlusher::start(|| Ok(()), Duration::from_secs(60)));
         }
 
         let file = crate::operations::read_write::create_core(&fs, 1, "saturate.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -2440,13 +2522,13 @@ mod tests {
         crate::operations::read_write::write_core(&fs, file.ino, b"live data", 14).unwrap();
         assert_eq!(fs.staged_bytes(), 9);
 
-        // In background thread, call rollover_for_fsync. It will find flushing full, drop inner, and wait on condvar.
+        // In background thread, call rollover_for_sync. It will find flushing full, drop inner, and wait on condvar.
         let fs_clone = Arc::clone(&fs);
         let ino = file.ino;
         let rolled_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rolled_over_clone = Arc::clone(&rolled_over);
         let waiter_handle = std::thread::spawn(move || {
-            let comp = fs_clone.rollover_for_fsync(ino, 0).unwrap();
+            let comp = fs_clone.rollover_for_sync(ino, 0, FlushMotivation::Fsync).unwrap();
             rolled_over_clone.store(true, Ordering::SeqCst);
             comp
         });
@@ -2468,7 +2550,8 @@ mod tests {
         assert_eq!(fs.flush_queue_depth(), 2);
         assert_eq!(fs.staged_bytes(), 0);
 
-        // Flush remaining batches
+        // Restart real flusher and flush remaining batches
+        fs.start_flusher();
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed_clone = Arc::clone(&completed);
         completion.add_callback(Box::new(move |res| {
