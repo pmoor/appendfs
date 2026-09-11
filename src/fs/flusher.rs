@@ -137,7 +137,7 @@ impl Flusher {
         let ring_buffer = Arc::clone(&self.ring_buffer);
         let flusher_lock = Arc::clone(&self.lock);
 
-        let bg = BackgroundFlusher::start_with_timeout(
+        let bg = BackgroundFlusher::start(
             move || {
                 let Some(host) = weak_host.upgrade() else {
                     return Ok(());
@@ -240,12 +240,14 @@ impl Drop for Flusher {
 }
 
 /// Synchronous, threadless flusher driver for executing flushes in unit tests without background OS threads.
+#[cfg(any(test, feature = "testing"))]
 pub struct TestFlusher<'a> {
     host: &'a dyn FlushHost,
     flusher: Option<&'a Flusher>,
     clock: Arc<dyn crate::clock::Clock>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl<'a> TestFlusher<'a> {
     /// Creates a new `TestFlusher` wrapping the specified `host` with the system clock.
     pub fn new(host: &'a dyn FlushHost) -> Self {

@@ -285,9 +285,10 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
             let mut symlinks = 0;
             let mut special = 0;
 
+            let guards: Vec<_> = flushing.iter().map(|b| b.entries.read().unwrap()).collect();
             for &ino in live
                 .keys()
-                .chain(flushing.iter().flat_map(|b| b.entries.keys()))
+                .chain(guards.iter().flat_map(|g| g.keys()))
                 .chain(base.keys())
             {
                 if !seen.insert(ino) {
@@ -298,7 +299,7 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
                         crate::node::EntryDelta::Tombstone => None,
                         crate::node::EntryDelta::Node(d) => Some(d.file_type()),
                     }
-                } else if let Some(delta) = flushing.iter().rev().find_map(|b| b.entries.get(&ino)) {
+                } else if let Some(delta) = guards.iter().rev().find_map(|g| g.get(&ino)) {
                     match delta {
                         crate::node::EntryDelta::Tombstone => None,
                         crate::node::EntryDelta::Node(d) => Some(d.file_type()),

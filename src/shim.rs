@@ -903,7 +903,7 @@ extern "C" fn init_bridge(userdata: *mut c_void) {
 
 extern "C" fn destroy_bridge(userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
-    if !fs.is_read_only() {
+    if !fs.is_read_only() && fs.log_writer.is_some() {
         let _ = fs.sync_and_export_summary();
     }
     fs.destroy();

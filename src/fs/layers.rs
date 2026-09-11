@@ -683,10 +683,24 @@ mod tests {
     use super::*;
     use crate::extent_map::{Extent, ExtentMap};
     use crate::fs::{FlushBatch, WriteArena};
+    use crate::log::FlushMotivation;
 
     #[test]
     fn test_get_attr_across_layers() {
-        let fs = InMemoryFS::new();
+        let storage: Arc<dyn crate::storage::Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(crate::clock::SystemClock);
+        let writer = Arc::new(
+            crate::log::LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
 
         // 1. Create file1 in live -> freeze to flushing -> fold to base
         let attr1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
@@ -694,7 +708,7 @@ mod tests {
 
         // 2. Create file2 in live -> freeze to flushing (stays in flushing)
         let attr2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
-        fs.begin_flush();
+        fs.begin_flush(FlushMotivation::Test);
 
         // 3. Create file3 in live (stays in live)
         let attr3 = crate::operations::read_write::create_core(&fs, 1, "file3.txt", 0o644, 0, 1000, 1000).unwrap();

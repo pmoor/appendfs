@@ -17,6 +17,8 @@ pub enum FlushMotivation {
     Manual,
     /// Filesystem shutdown or unmount flush.
     Shutdown,
+    /// Unit and integration test execution.
+    Test,
 }
 
 impl FlushMotivation {
@@ -28,6 +30,7 @@ impl FlushMotivation {
             FlushMotivation::Threshold => "threshold",
             FlushMotivation::Manual => "manual",
             FlushMotivation::Shutdown => "shutdown",
+            FlushMotivation::Test => "test",
         }
     }
 }
@@ -51,116 +54,9 @@ pub struct BackgroundFlusher {
 }
 
 impl BackgroundFlusher {
-    /// Starts a periodic background flusher thread that runs every `interval`.
-    pub fn start<F>(flush_fn: F, interval: Duration) -> Self
-    where
-        F: Fn() -> std::io::Result<()> + Send + 'static,
-    {
-        let pair = Arc::new((Mutex::new(FlusherState::default()), Condvar::new()));
-        let pair_clone = Arc::clone(&pair);
-
-        let handle = thread::spawn(move || {
-            let (lock, cvar) = &*pair_clone;
-            let mut state = lock.lock().unwrap();
-            while !state.stop {
-                if !state.triggered {
-                    state = if interval.is_zero() {
-                        cvar.wait(state).unwrap()
-                    } else {
-                        let result = cvar.wait_timeout(state, interval).unwrap();
-                        result.0
-                    };
-                }
-                let run_flush = state.triggered;
-                state.triggered = false;
-                if state.stop {
-                    if run_flush {
-                        drop(state);
-                        if let Err(e) = flush_fn() {
-                            log::error!("Background flush failed: {}", e);
-                        }
-                    }
-                    break;
-                }
-                drop(state);
-                if let Err(e) = flush_fn() {
-                    log::error!("Background flush failed: {}", e);
-                }
-                state = lock.lock().unwrap();
-            }
-        });
-
-        Self {
-            state: pair,
-            thread_handle: Some(handle),
-        }
-    }
-
-    /// Starts a periodic background flusher thread observing a dynamic atomic `interval` in seconds.
-    /// Runs `on_timeout` when the interval expires, followed by `flush_fn`.
-    pub fn start_dynamic<F, T>(flush_fn: F, on_timeout: T, interval: Arc<std::sync::atomic::AtomicU64>) -> Self
-    where
-        F: Fn() -> std::io::Result<()> + Send + 'static,
-        T: Fn() + Send + 'static,
-    {
-        let pair = Arc::new((Mutex::new(FlusherState::default()), Condvar::new()));
-        let pair_clone = Arc::clone(&pair);
-
-        let handle = thread::spawn(move || {
-            let (lock, cvar) = &*pair_clone;
-            let mut state = lock.lock().unwrap();
-            while !state.stop {
-                let interval_secs = interval.load(std::sync::atomic::Ordering::Relaxed);
-                let mut should_flush = state.triggered;
-                let mut timed_out = false;
-                if !should_flush {
-                    if interval_secs == 0 {
-                        let result = cvar.wait_timeout(state, Duration::from_millis(100)).unwrap();
-                        state = result.0;
-                        should_flush = state.triggered;
-                    } else {
-                        let result = cvar.wait_timeout(state, Duration::from_secs(interval_secs)).unwrap();
-                        state = result.0;
-                        timed_out = result.1.timed_out();
-                        should_flush = timed_out || state.triggered;
-                    }
-                }
-                state.triggered = false;
-                if state.stop {
-                    if should_flush {
-                        drop(state);
-                        if timed_out {
-                            on_timeout();
-                        }
-                        if let Err(e) = flush_fn() {
-                            log::error!("Background flush failed: {}", e);
-                        }
-                    }
-                    break;
-                }
-                if !should_flush {
-                    continue;
-                }
-                drop(state);
-                if timed_out {
-                    on_timeout();
-                }
-                if let Err(e) = flush_fn() {
-                    log::error!("Background flush failed: {}", e);
-                }
-                state = lock.lock().unwrap();
-            }
-        });
-
-        Self {
-            state: pair,
-            thread_handle: Some(handle),
-        }
-    }
-
     /// Starts a periodic background flusher thread observing a static `Duration` interval.
     /// Runs `on_timeout` when the interval expires, followed by `flush_fn`.
-    pub fn start_with_timeout<F, T>(flush_fn: F, on_timeout: T, interval: Duration) -> Self
+    pub fn start<F, T>(flush_fn: F, on_timeout: T, interval: Duration) -> Self
     where
         F: Fn() -> std::io::Result<()> + Send + 'static,
         T: Fn() + Send + 'static,
@@ -269,6 +165,7 @@ mod tests {
                 count_clone.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
+            || {},
             Duration::from_millis(50),
         );
 
@@ -291,6 +188,7 @@ mod tests {
                 count_clone.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
+            || {},
             Duration::from_secs(10),
         );
 

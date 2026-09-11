@@ -13,9 +13,7 @@ use std::time::Duration;
 
 #[test]
 fn test_fuse_filesystem() {
-    let log_dir = tempfile::Builder::new().prefix("appendfs_test_log_").tempdir().unwrap();
-    let mount_dir = tempfile::Builder::new().prefix("appendfs_test_").tempdir().unwrap();
-    let mut mount = TestMount::mount_custom(log_dir, mount_dir, appendfs::InMemoryFS::new(), false);
+    let mut mount = TestMount::new_rw();
     let mount_path = mount.path().to_path_buf();
 
     // Perform directory listing verification (initially contains only virtual control files like .status)
@@ -340,12 +338,7 @@ fn test_recovery_after_remount() {
 
 #[test]
 fn test_fuse_stress() {
-    let log_dir = tempfile::Builder::new()
-        .prefix("appendfs_stress_log_")
-        .tempdir()
-        .unwrap();
-    let mount_dir = tempfile::Builder::new().prefix("appendfs_test_").tempdir().unwrap();
-    let mut mount = TestMount::mount_custom(log_dir, mount_dir, appendfs::InMemoryFS::new(), false);
+    let mut mount = TestMount::new_rw();
     let mount_path = mount.path().to_path_buf();
 
     // Create 4 subdirectories for the threads
@@ -637,15 +630,7 @@ fn test_summary_single_file_export_and_recovery() {
 
 #[test]
 fn test_large_directory_readdir_and_readdirplus() {
-    let dummy_log = tempfile::Builder::new()
-        .prefix("appendfs_dummy_log_")
-        .tempdir()
-        .unwrap();
-    let temp_dir = tempfile::Builder::new()
-        .prefix("appendfs_large_dir_")
-        .tempdir()
-        .unwrap();
-    let mut mount = TestMount::mount_custom(dummy_log, temp_dir, appendfs::InMemoryFS::new(), false);
+    let mut mount = TestMount::new_rw();
     let mount_path = mount.path().to_path_buf();
 
     let large_dir = mount_path.join("large_dir");

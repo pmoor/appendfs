@@ -257,14 +257,27 @@ impl BatchCompletion {
 /// corresponding write arena chunk buffers and batch statistics.
 #[derive(Debug, Clone)]
 pub struct FlushBatch {
+    inner: Arc<FlushBatchInner>,
+}
+
+/// Inner state of `FlushBatch` shared via `Arc`.
+#[derive(Debug)]
+pub struct FlushBatchInner {
     pub id: u64,
-    pub entries: HashMap<u64, EntryDelta>,
+    pub entries: RwLock<HashMap<u64, EntryDelta>>,
     pub arena: WriteArena,
     pub bytes: usize,
     pub ops: usize,
     pub completion: BatchCompletion,
     pub motivation: FlushMotivation,
     pub created_at: SystemTime,
+}
+
+impl Deref for FlushBatch {
+    type Target = FlushBatchInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl FlushBatch {
@@ -277,16 +290,41 @@ impl FlushBatch {
         motivation: FlushMotivation,
         created_at: SystemTime,
     ) -> Self {
-        assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
-        Self {
+        Self::with_completion(
             id,
             entries,
             arena,
             bytes,
             ops,
-            completion: BatchCompletion::new(),
+            BatchCompletion::new(),
             motivation,
             created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_completion(
+        id: u64,
+        entries: HashMap<u64, EntryDelta>,
+        arena: WriteArena,
+        bytes: usize,
+        ops: usize,
+        completion: BatchCompletion,
+        motivation: FlushMotivation,
+        created_at: SystemTime,
+    ) -> Self {
+        assert!(!entries.is_empty(), "FlushBatch must contain at least one entry");
+        Self {
+            inner: Arc::new(FlushBatchInner {
+                id,
+                entries: RwLock::new(entries),
+                arena,
+                bytes,
+                ops,
+                completion,
+                motivation,
+                created_at,
+            }),
         }
     }
 }
@@ -303,6 +341,9 @@ pub struct FsInner {
     pub live: HashMap<u64, EntryDelta>,
     /// Active write arena staging extent payload allocations for `live`.
     pub live_arena: WriteArena,
+    /// Pending sync completion handle for the current active `live` layer, moved into
+    /// the newly frozen `FlushBatch` upon rollover.
+    pub live_completion: Option<BatchCompletion>,
     /// Active open handles (regular files, virtual files, and directories) keyed by allocated handle ID (`fh`).
     pub handles: HandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
@@ -392,8 +433,10 @@ impl FsInner {
             self.flushing_ops += ops;
             let id = self.next_batch_id;
             self.next_batch_id += 1;
-            self.flushing
-                .push_back(FlushBatch::new(id, entries, arena, bytes, ops, motivation, now));
+            let completion = self.live_completion.take().unwrap_or_default();
+            self.flushing.push_back(FlushBatch::with_completion(
+                id, entries, arena, bytes, ops, completion, motivation, now,
+            ));
             true
         } else {
             false
@@ -426,8 +469,9 @@ impl FsInner {
     }
 
     /// Merges a flushed batch into `base`.
-    pub fn fold_flushed_batch(&mut self, flushed: FlushBatch) {
-        self.apply_base_deltas_ref(&flushed.entries);
+    pub fn fold_flushed_batch(&mut self, flushed: &FlushBatch) {
+        let entries = flushed.entries.read().unwrap();
+        self.apply_base_deltas_ref(&entries);
     }
 }
 
@@ -715,6 +759,7 @@ impl InMemoryFS {
             next_batch_id: 1,
             live: HashMap::new(),
             live_arena: WriteArena::new(),
+            live_completion: None,
             handles: HashMap::new(),
             open_counts: HashMap::new(),
             next_fh: 1,

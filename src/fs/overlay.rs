@@ -156,9 +156,10 @@ impl FsInner {
 
     pub fn with_inode_layers<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
         let base_entry = self.base.get(&ino);
-        let mut deltas = Vec::with_capacity(self.flushing.len() + 1);
-        for batch in self.flushing.iter() {
-            if let Some(entry) = batch.entries.get(&ino) {
+        let guards: Vec<_> = self.flushing.iter().map(|b| b.entries.read().unwrap()).collect();
+        let mut deltas = Vec::with_capacity(guards.len() + 1);
+        for guard in &guards {
+            if let Some(entry) = guard.get(&ino) {
                 deltas.push(entry);
             }
         }
@@ -177,9 +178,10 @@ impl FsInner {
 
     pub fn with_inode_layers_below_live<R>(&self, ino: u64, f: impl FnOnce(InodeLayerStack<'_>) -> R) -> R {
         let base_entry = self.base.get(&ino);
-        let mut deltas = Vec::with_capacity(self.flushing.len());
-        for batch in self.flushing.iter() {
-            if let Some(entry) = batch.entries.get(&ino) {
+        let guards: Vec<_> = self.flushing.iter().map(|b| b.entries.read().unwrap()).collect();
+        let mut deltas = Vec::with_capacity(guards.len());
+        for guard in &guards {
+            if let Some(entry) = guard.get(&ino) {
                 deltas.push(entry);
             }
         }
@@ -229,7 +231,8 @@ impl FsInner {
         let mut result: HashMap<u64, Arc<Node>> = self.base.clone();
 
         for batch in self.flushing.iter() {
-            for (ino, entry) in &batch.entries {
+            let entries = batch.entries.read().unwrap();
+            for (ino, entry) in entries.iter() {
                 match entry {
                     EntryDelta::Tombstone => {
                         result.remove(ino);
@@ -363,7 +366,7 @@ impl InMemoryFS {
 mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
-    use crate::log::LogWriter;
+    use crate::log::{FlushMotivation, LogWriter};
     use crate::storage::Storage;
 
     #[test]
@@ -381,7 +384,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
 
         let attr = crate::operations::read_write::create_core(&fs, 1, "f.txt", 0o644, 0, 1000, 1000).unwrap();
         fs.sync_log().unwrap();
@@ -396,7 +399,7 @@ mod tests {
         // Freeze the tombstone out of `live`. From here `live.entry(ino)` sees nothing, so
         // a writer that validated before taking the lock would insert a fresh delta and
         // resurrect the inode at the next fold - this predicate is what stops it.
-        fs.begin_flush();
+        fs.begin_flush(FlushMotivation::Test);
         assert!(!fs.inner.lock_for_tests().unwrap().live.contains_key(&attr.ino));
         assert!(
             !fs.inner.lock_for_tests().unwrap().exists_below_live(attr.ino),
