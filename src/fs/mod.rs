@@ -340,6 +340,24 @@ impl FsInner {
         popped
     }
 
+    /// Pops the batch from the front of the flushing queue if its ID matches `batch_id`,
+    /// updating flushing capacity counters and notifying `capacity_cvar`.
+    pub fn pop_front_batch(&mut self, batch_id: u64) -> Option<FlushBatch> {
+        if let Some(front) = self.flushing.front() {
+            assert_eq!(
+                front.id, batch_id,
+                "front of flushing queue must match committed batch ID"
+            );
+            let popped = self.flushing.pop_front().unwrap();
+            self.flushing_bytes -= popped.bytes;
+            self.flushing_ops -= popped.ops;
+            self.capacity_cvar.notify_all();
+            Some(popped)
+        } else {
+            None
+        }
+    }
+
     /// Records a mutation of `additional_bytes` and increments staged operation count by 1.
     pub fn record_mutation(&mut self, additional_bytes: usize) {
         self.staged_bytes += additional_bytes;
@@ -384,7 +402,12 @@ impl FsInner {
 
     /// Directly applies a batch of delta records into `base` without requiring a `FlushBatch` wrapper.
     pub fn apply_base_deltas(&mut self, entries: HashMap<u64, EntryDelta>) {
-        for (ino, entry) in entries {
+        self.apply_base_deltas_ref(&entries);
+    }
+
+    /// Directly applies a borrowed map of delta records into `base`.
+    pub fn apply_base_deltas_ref(&mut self, entries: &HashMap<u64, EntryDelta>) {
+        for (&ino, entry) in entries {
             match entry {
                 EntryDelta::Tombstone => {
                     self.base.remove(&ino);
@@ -404,7 +427,7 @@ impl FsInner {
 
     /// Merges a flushed batch into `base`.
     pub fn fold_flushed_batch(&mut self, flushed: FlushBatch) {
-        self.apply_base_deltas(flushed.entries);
+        self.apply_base_deltas_ref(&flushed.entries);
     }
 }
 
@@ -574,16 +597,15 @@ impl<'a> Drop for FsInnerGuard<'a> {
 pub struct InMemoryFS {
     /// Consolidated critical section protecting all in-memory metadata, layer overlay,
     /// file/dir handles, open counts, and write arena buffers.
-    pub inner: Arc<ActionMutex<FsInner>>,
+    pub inner: ActionMutex<FsInner>,
     /// Independent whole-file BSD flock and POSIX byte-range record lock manager.
     pub locks: LockManager,
     /// Authoritative manifest of all active log generations and lineage.
     pub manifest: Arc<RwLock<LogManifest>>,
-    pub next_inode: Arc<AtomicU64>,
+    pub next_inode: AtomicU64,
     pub last_tx_id: AtomicU64,
     pub clock: Arc<dyn Clock>,
     pub log_writer: Option<Arc<LogWriter>>,
-    pub writer_slot: Arc<RwLock<Option<Arc<LogWriter>>>>,
     pub log_cache: Option<Arc<LogFileCache>>,
     pub max_buffer_size: usize,
     pub max_staged_ops: usize,
@@ -596,7 +618,7 @@ pub struct InMemoryFS {
     pub max_flush_queue_bytes: usize,
     /// Maximum total mutating operations across all frozen flush batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_ops: usize,
-    pub flush_interval: Arc<AtomicU64>,
+    pub flush_interval: AtomicU64,
     pub flusher: Arc<Flusher>,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to true.
     pub track_atime: bool,
@@ -620,38 +642,26 @@ pub struct InMemoryFS {
     /// Live telemetry counters and synchronization state across all remotes.
     pub replication_telemetry: Arc<RwLock<crate::remote::worker::ReplicationTelemetry>>,
     /// Threshold in bytes of committed log data before automatically exporting an intermediate .summary file on log roll (0 to disable).
-    pub summary_interval_bytes: Arc<AtomicU64>,
+    pub summary_interval_bytes: AtomicU64,
     /// Threshold in rolled generations before automatically exporting an intermediate .summary file on log roll (0 to disable).
-    pub summary_interval_generations: Arc<AtomicU64>,
+    pub summary_interval_generations: AtomicU64,
     /// Cumulative data bytes flushed to the log since the last summary was exported.
-    pub bytes_since_last_summary: Arc<AtomicU64>,
+    pub bytes_since_last_summary: AtomicU64,
     /// Number of generations rolled since the last summary was exported.
-    pub generations_since_last_summary: Arc<AtomicU64>,
+    pub generations_since_last_summary: AtomicU64,
     /// Generation number of the last exported summary file.
-    pub last_summary_generation: Arc<AtomicU64>,
+    pub last_summary_generation: AtomicU64,
     /// Condition variable and flag to immediately notify the background replication worker of new logs/summaries.
     pub replication_notifier: Arc<(Mutex<bool>, Condvar)>,
     /// Tracks in-flight asynchronous operations (e.g. cold reads, async fsyncs) to ensure safe unmount without use-after-free.
     pub async_tracker: Arc<crate::async_runtime::AsyncTracker>,
     /// Optional fixed IV for exported summary files (used for deterministic golden fixture generation and testing).
     pub deterministic_summary_iv: Option<[u8; 12]>,
-    /// Bundled flush target slot observing dynamic configuration updates.
-    pub target_slot: Arc<RwLock<flush::FlushTarget>>,
 }
 
 impl InMemoryFS {
-    pub fn sync_writer_slot(&self) {
-        self.sync_flush_target();
-    }
-
-    pub fn sync_flush_target(&self) {
-        *self.writer_slot.write().unwrap() = self.log_writer.clone();
-        *self.target_slot.write().unwrap() = self.flush_target();
-    }
-
     pub fn set_max_extent_size(&mut self, size: usize) {
         self.max_extent_size = size;
-        self.sync_flush_target();
     }
 
     pub fn new() -> Self {
@@ -716,47 +726,24 @@ impl InMemoryFS {
             capacity_cvar: Arc::new(Condvar::new()),
         };
 
-        let inner_arc = Arc::new(ActionMutex::new(inner));
-        let next_inode = Arc::new(AtomicU64::new(2));
-        let writer_slot = Arc::new(RwLock::new(log_writer.clone()));
-        let flush_interval = Arc::new(AtomicU64::new(0));
-        let summary_interval_bytes = Arc::new(AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_BYTES));
-        let summary_interval_generations = Arc::new(AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_GENERATIONS));
-        let bytes_since_last_summary = Arc::new(AtomicU64::new(0));
-        let generations_since_last_summary = Arc::new(AtomicU64::new(0));
-        let last_summary_generation = Arc::new(AtomicU64::new(0));
+        let inner = ActionMutex::new(inner);
+        let next_inode = AtomicU64::new(2);
+        let flush_interval = AtomicU64::new(0);
+        let summary_interval_bytes = AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_BYTES);
+        let summary_interval_generations = AtomicU64::new(crate::cli::DEFAULT_SUMMARY_INTERVAL_GENERATIONS);
+        let bytes_since_last_summary = AtomicU64::new(0);
+        let generations_since_last_summary = AtomicU64::new(0);
+        let last_summary_generation = AtomicU64::new(0);
         let replication_notifier = Arc::new((Mutex::new(false), Condvar::new()));
 
-        let target = flush::FlushTarget {
-            inner: Arc::clone(&inner_arc),
-            manifest: Arc::clone(&manifest),
-            clock: Arc::clone(&clock),
-            writer_slot: Arc::clone(&writer_slot),
-            volume_key: Arc::clone(&volume_key),
-            volume_header: crate::crypto::VolumeHeader::plaintext(),
-            next_inode: Arc::clone(&next_inode),
-            summary_interval_bytes: Arc::clone(&summary_interval_bytes),
-            summary_interval_generations: Arc::clone(&summary_interval_generations),
-            bytes_since_last_summary: Arc::clone(&bytes_since_last_summary),
-            generations_since_last_summary: Arc::clone(&generations_since_last_summary),
-            last_summary_generation: Arc::clone(&last_summary_generation),
-            replication_notifier: Arc::clone(&replication_notifier),
-            max_extent_size: crate::cli::DEFAULT_MAX_EXTENT_SIZE,
-            max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
-            max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
-            max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
-        };
-        let target_slot = Arc::new(RwLock::new(target));
-
         let fs = Self {
-            inner: inner_arc,
+            inner,
             locks: LockManager::new(),
             manifest,
             next_inode,
             last_tx_id: AtomicU64::new(0),
             clock,
             log_writer,
-            writer_slot,
             log_cache,
             max_buffer_size: 128 * 1024 * 1024,
             max_staged_ops: crate::cli::DEFAULT_MAX_BUFFER_OPS,
@@ -781,10 +768,8 @@ impl InMemoryFS {
             replication_notifier,
             async_tracker: Arc::new(crate::async_runtime::AsyncTracker::new()),
             deterministic_summary_iv: None,
-            target_slot,
         };
         fs.register_runtime_status();
-        fs.start_flusher();
         fs
     }
 
@@ -999,8 +984,8 @@ impl InMemoryFS {
 impl Drop for InMemoryFS {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            let was_running = self.flusher.background.lock().unwrap().is_some();
-            if was_running && !self.is_read_only() {
+            self.flusher.stop_background();
+            if !self.is_read_only() {
                 let _ = self.sync_and_export_summary();
             }
             self.destroy();

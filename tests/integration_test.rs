@@ -1056,6 +1056,8 @@ fn test_bulk_metadata_rm_rf_triggers_automatic_flush() {
     fs.set_log_dir(log_path);
     // Set threshold to 10 operations
     fs.max_staged_ops = 10;
+    let fs = std::sync::Arc::new(fs);
+    fs.init();
 
     // 1. Create a tree with 1 directory and 15 files
     let dir_attr = appendfs::operations::dir::mkdir_core(&fs, 1, "bigdir", 0o755, 1000, 1000).unwrap();

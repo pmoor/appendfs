@@ -581,6 +581,14 @@ pub async fn fsync_core(fs: &InMemoryFS, ino: u64, fh: u64) -> Result<(), i32> {
         return Ok(());
     };
 
+    if !fs.flusher.is_background_active() {
+        let clock = Arc::clone(&fs.clock);
+        let test_flusher = crate::fs::flusher::TestFlusher::with_flusher(fs, &fs.flusher, clock);
+        test_flusher
+            .drain()
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    }
+
     completion
         .wait()
         .await

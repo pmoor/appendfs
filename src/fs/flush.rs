@@ -5,15 +5,15 @@
 //! trailing `FlushCommit` confirming atomic persistence. Recovery replays `LogEntryDelta`
 //! records directly onto `base`, guaranteeing identical state transitions across crash recovery.
 
-use super::{FlushMotivation, FlushRecord, FsInner, InMemoryFS};
+use super::{FlushBatch, FlushHost, FlushMotivation, FlushRecord, FsInner, InMemoryFS, TestFlusher};
 use crate::extent_map::Extent;
-use crate::log::{BackgroundFlusher, GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
+use crate::log::{GenerationLiveStats, LogEntryDelta, LogWriter, OpCode, RECORD_HEADER_SIZE};
 use crate::node::{EntryDelta, NodeDelta, NodeKind};
 use crate::storage::Storage;
-use crate::sync::{ActionMutex, OpTag};
+use crate::sync::OpTag;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -47,74 +47,16 @@ fn sync_manifest_md5s_and_snapshot(
     m.clone()
 }
 
-/// Target bundled for the flusher worker thread to empty the `flushing` queue and persist batches.
-#[derive(Clone)]
-pub struct FlushTarget {
-    pub inner: Arc<ActionMutex<FsInner>>,
-    pub manifest: Arc<RwLock<crate::log::LogManifest>>,
-    pub clock: Arc<dyn crate::clock::Clock>,
-    pub writer_slot: Arc<RwLock<Option<Arc<LogWriter>>>>,
-    pub volume_key: Arc<crate::crypto::VolumeKey>,
-    pub volume_header: crate::crypto::VolumeHeader,
-    pub next_inode: Arc<AtomicU64>,
-    pub summary_interval_bytes: Arc<AtomicU64>,
-    pub summary_interval_generations: Arc<AtomicU64>,
-    pub bytes_since_last_summary: Arc<AtomicU64>,
-    pub generations_since_last_summary: Arc<AtomicU64>,
-    pub last_summary_generation: Arc<AtomicU64>,
-    pub replication_notifier: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-    pub max_extent_size: usize,
-    pub max_flush_queue_depth: usize,
-    pub max_flush_queue_bytes: usize,
-    pub max_flush_queue_ops: usize,
-}
-
-impl FlushTarget {
-    /// Freezes `live` into `flushing` with `TimeBased` motivation on interval timeout.
-    pub fn freeze_time_based(&self) {
-        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-        inner.freeze_live(
-            self.max_flush_queue_depth,
-            self.max_flush_queue_bytes,
-            self.max_flush_queue_ops,
-            FlushMotivation::TimeBased,
-            self.clock.now(),
-        );
+impl FlushHost for InMemoryFS {
+    fn get_next_flush_batch(&self) -> Option<FlushBatch> {
+        let inner = self.inner.lock(OpTag::Flush).unwrap();
+        inner.flushing.front().cloned()
     }
 
-    /// Empties the `flushing` queue under the flusher lock until none remain.
-    pub fn drain_flushing_queue(&self, flusher: &super::Flusher) -> std::io::Result<usize> {
-        let _flush_guard = flusher.lock();
-        let mut count = 0;
-        while self.step_one_batch(flusher)?.is_some() {
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// Steps a single batch from the `flushing` queue:
-    /// - Writes extents/deltas to disk if a LogWriter is present.
-    /// - Pops the batch from `flushing` and folds it into `base`.
-    /// - Completes the batch completion handle.
-    /// - Records the flush operation in the ring buffer.
-    pub fn step_one_batch(&self, flusher: &super::Flusher) -> std::io::Result<Option<FlushRecord>> {
-        let mut batch = {
-            let inner = self.inner.lock(OpTag::Flush).unwrap();
-            match inner.flushing.front() {
-                Some(b) => {
-                    assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
-                    b.clone()
-                }
-                None => return Ok(None),
-            }
-        };
-
-        let started_at = self.clock.now();
-        let writer_opt = self.writer_slot.read().unwrap().clone();
-
-        let flushed_bytes = if let Some(ref writer) = writer_opt {
+    fn persist_flush_batch(&self, batch: &mut FlushBatch) -> std::io::Result<u64> {
+        if let Some(ref writer) = self.log_writer {
             match self.synthesize_and_write_flushing_layer(&mut batch.entries, writer) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => Ok(bytes),
                 Err(e) => {
                     log::error!("Failed to write flushing layer to log: {}", e);
                     {
@@ -128,82 +70,61 @@ impl FlushTarget {
                     batch
                         .completion
                         .complete(Err(std::io::Error::new(e.kind(), e.to_string())));
-                    return Err(e);
+                    Err(e)
                 }
             }
         } else {
-            batch.bytes as u64
-        };
-
-        let popped = {
-            let mut inner = self.inner.lock(OpTag::Fold).unwrap();
-            let popped = inner.pop_flushed_batch(&batch);
-            inner.fold_flushed_batch(batch);
-            popped
-        };
-
-        let completed_at = self.clock.now();
-        let duration = completed_at.duration_since(started_at).unwrap_or_default();
-
-        let record = FlushRecord {
-            id: popped.id,
-            motivation: popped.motivation,
-            data_bytes: flushed_bytes,
-            ops_count: popped.ops,
-            started_at,
-            completed_at,
-            duration,
-        };
-        flusher.record_flush(record.clone());
-
-        popped.completion.complete(Ok(()));
-
-        Ok(Some(record))
+            Ok(batch.bytes as u64)
+        }
     }
 
-    fn notify_replication(&self) {
-        let (lock, cvar) = &*self.replication_notifier;
-        let mut pending = lock.lock().unwrap();
-        *pending = true;
-        cvar.notify_all();
+    fn fold_flush_batch(&self, batch: &FlushBatch) {
+        let mut inner = self.inner.lock(OpTag::Fold).unwrap();
+        inner.apply_base_deltas_ref(&batch.entries);
     }
 
-    pub fn export_summary_for_base(
-        &self,
-        storage: &dyn Storage,
-        sealed_gen: u64,
-        last_tx_id: u64,
-    ) -> std::io::Result<String> {
-        let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
-        let next_inode = self.next_inode.load(Ordering::SeqCst);
-        let manifest = sync_manifest_md5s_and_snapshot(&self.manifest, storage, sealed_gen + 1);
-        let now = self.clock.now();
+    fn remove_front_flush_batch(&self, batch_id: u64) {
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+        let popped = inner.pop_front_batch(batch_id);
 
-        if self.volume_header.cipher != self.volume_key.cipher() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "refusing to export an unreadable summary: volume header describes a {} volume \
-                     but the key in use is for {}",
-                    self.volume_header.cipher,
-                    self.volume_key.cipher()
-                ),
-            ));
+        if inner.staged_bytes >= self.max_buffer_size || inner.staged_ops >= self.max_staged_ops {
+            inner.freeze_live(
+                self.max_flush_queue_depth,
+                self.max_flush_queue_bytes,
+                self.max_flush_queue_ops,
+                FlushMotivation::Threshold,
+                self.clock.now(),
+            );
         }
 
-        crate::log::summary::export_summary(
-            &crate::log::summary::SummarySnapshot {
-                inodes: &snapshot,
-                manifest: &manifest,
-                volume_header: &self.volume_header,
-                generation: sealed_gen,
-                last_tx_id,
-                next_inode,
-                created_at: now,
-            },
-            storage,
-            &self.volume_key,
-        )
+        drop(inner);
+
+        if let Some(batch) = popped {
+            batch.completion.complete(Ok(()));
+        }
+    }
+
+    fn freeze_idle(&self) {
+        let mut inner = self.inner.lock(OpTag::Flush).unwrap();
+        if !inner.live.is_empty() {
+            inner.freeze_live(
+                self.max_flush_queue_depth,
+                self.max_flush_queue_bytes,
+                self.max_flush_queue_ops,
+                FlushMotivation::TimeBased,
+                self.clock.now(),
+            );
+        }
+    }
+}
+
+impl InMemoryFS {
+    /// Starts or restarts the background flusher thread responsible for emptying the flushing queue.
+    pub fn start_flusher(self: &Arc<Self>) {
+        let interval_secs = self.flush_interval.load(Ordering::SeqCst);
+        let interval = Duration::from_secs(interval_secs);
+        let host = Arc::clone(self) as Arc<dyn FlushHost>;
+        self.flusher.start(host, interval, Arc::clone(&self.clock));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -390,53 +311,6 @@ impl FlushTarget {
 
         Ok(flushed_data_bytes)
     }
-}
-
-impl InMemoryFS {
-    /// Creates a bundled `FlushTarget` snapshot capturing shared Arcs needed for flush execution.
-    pub fn flush_target(&self) -> FlushTarget {
-        FlushTarget {
-            inner: Arc::clone(&self.inner),
-            manifest: Arc::clone(&self.manifest),
-            clock: Arc::clone(&self.clock),
-            writer_slot: Arc::clone(&self.writer_slot),
-            volume_key: Arc::clone(&self.volume_key),
-            volume_header: self.volume_header.clone(),
-            next_inode: Arc::clone(&self.next_inode),
-            summary_interval_bytes: Arc::clone(&self.summary_interval_bytes),
-            summary_interval_generations: Arc::clone(&self.summary_interval_generations),
-            bytes_since_last_summary: Arc::clone(&self.bytes_since_last_summary),
-            generations_since_last_summary: Arc::clone(&self.generations_since_last_summary),
-            last_summary_generation: Arc::clone(&self.last_summary_generation),
-            replication_notifier: Arc::clone(&self.replication_notifier),
-            max_extent_size: self.max_extent_size,
-            max_flush_queue_depth: self.max_flush_queue_depth,
-            max_flush_queue_bytes: self.max_flush_queue_bytes,
-            max_flush_queue_ops: self.max_flush_queue_ops,
-        }
-    }
-
-    /// Starts or restarts the background flusher thread responsible for emptying the flushing queue.
-    pub fn start_flusher(&self) {
-        self.sync_flush_target();
-        let target_slot = Arc::clone(&self.target_slot);
-        let flusher_clone = Arc::clone(&self.flusher);
-        let target_slot_timeout = Arc::clone(&self.target_slot);
-        let flusher_ref = Arc::clone(&self.flusher);
-
-        let bg = BackgroundFlusher::start_dynamic(
-            move || {
-                let target = target_slot.read().unwrap().clone();
-                target.drain_flushing_queue(&flusher_clone).map(|_| ())
-            },
-            move || {
-                let target = target_slot_timeout.read().unwrap().clone();
-                target.freeze_time_based();
-            },
-            Arc::clone(&self.flush_interval),
-        );
-        *flusher_ref.background.lock().unwrap() = Some(bg);
-    }
 
     // --- Flush & Fold Pipelines ---
 
@@ -479,7 +353,6 @@ impl InMemoryFS {
         fh: u64,
         motivation: FlushMotivation,
     ) -> Result<Option<super::BatchCompletion>, i32> {
-        self.sync_flush_target();
         let mut inner = self.inner.lock(OpTag::Flush).unwrap();
         loop {
             if fh != 0 {
@@ -519,27 +392,21 @@ impl InMemoryFS {
         inner.apply_base_deltas(deltas);
     }
 
-    /// Ensures that the background flusher thread is active, starting it if stopped.
-    pub fn ensure_flusher_running(&self) {
-        if !self.flusher.is_background_active() {
-            self.start_flusher();
-        }
-    }
-
     /// Steps a single batch from the `flushing` queue under the flusher lock.
     ///
     /// Available only in tests or with the `testing` feature.
     #[cfg(any(test, feature = "testing"))]
     pub fn step_flush(&self) -> std::io::Result<Option<FlushRecord>> {
-        self.sync_flush_target();
-        let _flush_guard = self.flusher.lock();
-        let target = self.target_slot.read().unwrap().clone();
-        target.step_one_batch(&self.flusher)
+        TestFlusher::with_flusher(self, &self.flusher, Arc::clone(&self.clock)).step()
     }
 
     /// Flushes all pending mutations and batches to disk via the flusher.
     pub fn flush_log(&self) -> std::io::Result<()> {
-        self.flush_with_motivation(FlushMotivation::Manual).map(|_| ())
+        if self.flusher.is_background_active() {
+            self.flush_with_motivation(FlushMotivation::Manual).map(|_| ())
+        } else {
+            self.flush_to_base().map(|_| ())
+        }
     }
 
     /// Flushes mutations if threshold is reached and waits for flusher to drain.
@@ -555,9 +422,14 @@ impl InMemoryFS {
             (froze, inner.flushing.back().map(|b| b.completion.clone()))
         };
         if froze {
-            self.trigger_flusher();
-            if let Some(comp) = completion {
-                comp.wait_blocking()?;
+            if !self.flusher.is_background_active() {
+                let test_flusher = TestFlusher::with_flusher(self, &self.flusher, Arc::clone(&self.clock));
+                test_flusher.drain()?;
+            } else {
+                self.trigger_flusher();
+                if let Some(comp) = completion {
+                    comp.wait_blocking()?;
+                }
             }
         }
         Ok(())
@@ -565,7 +437,12 @@ impl InMemoryFS {
 
     /// Flushes all pending mutations and batches with an explicit `FlushMotivation`.
     pub fn flush_with_motivation(&self, motivation: FlushMotivation) -> std::io::Result<usize> {
-        self.sync_flush_target();
+        if !self.flusher.is_background_active() {
+            self.begin_flush_with_motivation(motivation);
+            let test_flusher = TestFlusher::with_flusher(self, &self.flusher, Arc::clone(&self.clock));
+            return test_flusher.drain();
+        }
+
         let (count, completion) = {
             let mut inner = self.inner.lock(OpTag::Flush).unwrap();
             let mut count = inner.flushing.len();
@@ -577,7 +454,6 @@ impl InMemoryFS {
         if count == 0 {
             return Ok(0);
         }
-        self.ensure_flusher_running();
         self.flusher.trigger();
         if let Some(comp) = completion {
             comp.wait_blocking()?;
@@ -588,12 +464,13 @@ impl InMemoryFS {
 
     /// Freezes all pending mutations and folds all queued batches into `base`.
     pub fn flush_to_base(&self) -> std::io::Result<usize> {
-        self.flush_with_motivation(FlushMotivation::Manual)
+        self.begin_flush();
+        let test_flusher = TestFlusher::with_flusher(self, &self.flusher, Arc::clone(&self.clock));
+        test_flusher.drain()
     }
 
     /// Safely rolls the active log generation under the flush lock, draining pending batches first.
     pub fn force_roll_active_log(&self) -> std::io::Result<Option<(u64, [u8; 16])>> {
-        self.sync_flush_target();
         let Some(ref writer) = self.log_writer else {
             return Ok(None);
         };
@@ -635,14 +512,12 @@ impl InMemoryFS {
     /// Wakes up the background periodic flusher immediately to drain pending batches.
     /// Returns true if a background flusher is active and was notified, false otherwise.
     pub fn trigger_flusher(&self) -> bool {
-        self.sync_flush_target();
         self.flusher.trigger()
     }
 
     /// Wakes up the background periodic flusher immediately if thresholds were reached.
     pub fn notify_flush_trigger(&self, should_trigger: bool) {
         if should_trigger {
-            self.sync_flush_target();
             self.flusher.trigger();
             std::thread::yield_now();
         }
@@ -792,8 +667,36 @@ impl InMemoryFS {
         sealed_gen: u64,
         last_tx_id: u64,
     ) -> std::io::Result<String> {
-        self.flush_target()
-            .export_summary_for_base(storage, sealed_gen, last_tx_id)
+        let snapshot = self.inner.lock(OpTag::Flush).unwrap().base.clone();
+        let next_inode = self.next_inode.load(Ordering::SeqCst);
+        let manifest = sync_manifest_md5s_and_snapshot(&self.manifest, storage, sealed_gen + 1);
+        let now = self.clock.now();
+
+        if self.volume_header.cipher != self.volume_key.cipher() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to export an unreadable summary: volume header describes a {} volume \
+                     but the key in use is for {}",
+                    self.volume_header.cipher,
+                    self.volume_key.cipher()
+                ),
+            ));
+        }
+
+        crate::log::summary::export_summary(
+            &crate::log::summary::SummarySnapshot {
+                inodes: &snapshot,
+                manifest: &manifest,
+                volume_header: &self.volume_header,
+                generation: sealed_gen,
+                last_tx_id,
+                next_inode,
+                created_at: now,
+            },
+            storage,
+            &self.volume_key,
+        )
     }
 
     pub fn sync_and_export_summary(&self) -> std::io::Result<Option<String>> {
@@ -868,6 +771,7 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, SystemClock};
     use crate::extent_map::ExtentMap;
+    use crate::log::BackgroundFlusher;
     use crate::node::{AttrDelta, FileDelta, InodeMeta, Node, NodeDelta, NodeKind};
     use crate::operations::read_write::write_core;
     use crate::storage::Storage;
@@ -1543,9 +1447,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
-        fs.max_buffer_size = 1000;
-        fs.max_staged_ops = 5; // Automatic flush after 5 operations
+        let mut fs_inst = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        fs_inst.max_buffer_size = 1000;
+        fs_inst.max_staged_ops = 5; // Automatic flush after 5 operations
+        let fs = Arc::new(fs_inst);
+        fs.start_flusher();
 
         // Perform 4 create operations - not flushed yet
         for i in 0..4 {
@@ -2137,10 +2043,12 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut fs = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
+        let mut fs_inst = InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
         // Threshold: 100 bytes or 10 ops
-        fs.max_buffer_size = 100;
-        fs.max_staged_ops = 10;
+        fs_inst.max_buffer_size = 100;
+        fs_inst.max_staged_ops = 10;
+        let fs = Arc::new(fs_inst);
+        fs.start_flusher();
 
         let file = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
 
