@@ -519,9 +519,17 @@ impl InMemoryFS {
         inner.apply_base_deltas(deltas);
     }
 
+    /// Ensures that the background flusher thread is active, starting it if stopped.
+    pub fn ensure_flusher_running(&self) {
+        if !self.flusher.is_background_active() {
+            self.start_flusher();
+        }
+    }
+
     /// Steps a single batch from the `flushing` queue under the flusher lock.
     ///
-    /// Returns `Ok(Some(record))` if a batch was stepped, or `Ok(None)` if `flushing` was empty.
+    /// Available only in tests or with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
     pub fn step_flush(&self) -> std::io::Result<Option<FlushRecord>> {
         self.sync_flush_target();
         let _flush_guard = self.flusher.lock();
@@ -566,15 +574,15 @@ impl InMemoryFS {
             }
             (count, inner.flushing.back().map(|b| b.completion.clone()))
         };
-        if self.flusher.trigger() {
-            if let Some(comp) = completion {
-                comp.wait_blocking()?;
-            }
-            let _flush_guard = self.flusher.lock();
-        } else {
-            let target = self.target_slot.read().unwrap().clone();
-            target.drain_flushing_queue(&self.flusher)?;
+        if count == 0 {
+            return Ok(0);
         }
+        self.ensure_flusher_running();
+        self.flusher.trigger();
+        if let Some(comp) = completion {
+            comp.wait_blocking()?;
+        }
+        let _flush_guard = self.flusher.lock();
         Ok(count)
     }
 

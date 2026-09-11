@@ -71,8 +71,15 @@ impl BackgroundFlusher {
                         result.0
                     };
                 }
+                let run_flush = state.triggered;
                 state.triggered = false;
                 if state.stop {
+                    if run_flush {
+                        drop(state);
+                        if let Err(e) = flush_fn() {
+                            log::error!("Background flush failed: {}", e);
+                        }
+                    }
                     break;
                 }
                 drop(state);
@@ -120,6 +127,15 @@ impl BackgroundFlusher {
                 }
                 state.triggered = false;
                 if state.stop {
+                    if should_flush {
+                        drop(state);
+                        if timed_out {
+                            on_timeout();
+                        }
+                        if let Err(e) = flush_fn() {
+                            log::error!("Background flush failed: {}", e);
+                        }
+                    }
                     break;
                 }
                 if !should_flush {
