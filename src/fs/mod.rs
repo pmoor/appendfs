@@ -344,6 +344,9 @@ pub struct FsInner {
     /// Pending sync completion handle for the current active `live` layer, moved into
     /// the newly frozen `FlushBatch` upon rollover.
     pub live_completion: Option<BatchCompletion>,
+    /// Explicit motivation that requested sync for the current active `live` layer,
+    /// preserved across queue saturation and applied upon freeze.
+    pub live_motivation: Option<FlushMotivation>,
     /// Active open handles (regular files, virtual files, and directories) keyed by allocated handle ID (`fh`).
     pub handles: HandleMap,
     /// Open descriptor reference count per inode for fast POSIX unlinking checks.
@@ -434,6 +437,7 @@ impl FsInner {
             let id = self.next_batch_id;
             self.next_batch_id += 1;
             let completion = self.live_completion.take().unwrap_or_default();
+            let motivation = self.live_motivation.take().unwrap_or(motivation);
             self.flushing.push_back(FlushBatch::with_completion(
                 id, entries, arena, bytes, ops, completion, motivation, now,
             ));
@@ -760,6 +764,7 @@ impl InMemoryFS {
             live: HashMap::new(),
             live_arena: WriteArena::new(),
             live_completion: None,
+            live_motivation: None,
             handles: HashMap::new(),
             open_counts: HashMap::new(),
             next_fh: 1,
@@ -1029,7 +1034,7 @@ impl InMemoryFS {
 impl Drop for InMemoryFS {
     fn drop(&mut self) {
         self.flusher.stop_background();
-        if !std::thread::panicking() && !self.is_read_only() {
+        if !std::thread::panicking() && !self.is_read_only() && self.log_writer.is_some() {
             let _ = self.sync_and_export_summary();
         }
         self.drain_async_ops();
