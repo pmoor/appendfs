@@ -208,40 +208,41 @@ impl FsInner {
         self.with_inode_layers_below_live(ino, |layers| layers.attr())
     }
 
-    /// Normalizes directory deltas across a batch about to be flushed against the folded `base`.
-    ///
-    /// The flusher drains `flushing` strictly in FIFO order, folding each batch into `base` before
-    /// writing the next. Therefore, the batch at the head of `flushing` has no intermediate flushing
-    /// layers underneath it—only `base`.
+    /// Normalizes directory deltas across a batch about to be flushed against the folded `base`
+    /// and any preceding flushing layers underneath it (`flushing[0..flushing_index]`).
     ///
     /// When self-canceling directory operations occur within the same flush batch (such as `mv a b; mv b a`,
-    /// or `touch foo; rm foo`), the in-memory `DirectoryDelta` accumulates redundant additions and phantom
-    /// tombstones (e.g. `added: ["a" -> 123], removed: ["b"]`).
+    /// or `touch foo; rm foo`), or across coalesced batches in `flushing`, the in-memory `DirectoryDelta`
+    /// accumulates redundant additions and phantom tombstones (e.g. `added: ["a" -> 123], removed: ["b"]`).
     ///
-    /// Normalization inspects the folded `base`:
-    /// - Retains `added` entries only if `base` does not already map `name` to the exact same `child_ino`.
-    /// - Retains `removed` entries only if `name` actually existed in `base`.
+    /// Normalization inspects the underlying layer stack (`base` + `flushing[0..flushing_index]`):
+    /// - Retains `added` entries only if the underlying layers do not already map `name` to the exact same `child_ino`.
+    /// - Retains `removed` entries only if `name` actually existed in the underlying layers.
     ///
     /// This eliminates redundant additions and phantom tombstones from log batches with zero disk I/O,
     /// writing only genuinely modified directory entries or pure timestamp attribute deltas.
-    pub fn normalize_directory_deltas(&self, entries: &mut HashMap<u64, EntryDelta>) {
+    pub fn normalize_directory_deltas(&self, entries: &mut HashMap<u64, EntryDelta>, flushing_index: usize) {
         for (&ino, entry) in entries.iter_mut() {
             if let EntryDelta::Node(NodeDelta::Directory(dir_delta)) = entry {
-                if let Some(node_arc) = self.base.get(&ino) {
-                    if let NodeKind::Directory {
-                        entries: ref base_entries,
-                        ..
-                    } = node_arc.kind
-                    {
-                        dir_delta.added.retain(|name, &mut child_ino| {
-                            !base_entries.iter().any(|(n, ino)| n == name && *ino == child_ino)
-                        });
-                        dir_delta
-                            .removed
-                            .retain(|name| base_entries.iter().any(|(n, _)| n == name));
+                let mut lower_deltas = Vec::with_capacity(flushing_index);
+                for batch in self.flushing.iter().take(flushing_index) {
+                    if let Some(e) = batch.entries.get(&ino) {
+                        lower_deltas.push(e);
                     }
-                } else {
+                }
+                let stack = InodeLayerStack {
+                    ino,
+                    base: self.base.get(&ino),
+                    deltas: lower_deltas,
+                };
+
+                if !stack.exists() || stack.file_type() != Some(FileType::Directory) {
                     dir_delta.removed.clear();
+                } else {
+                    dir_delta
+                        .added
+                        .retain(|name, &mut child_ino| stack.lookup_child(name) != Some(child_ino));
+                    dir_delta.removed.retain(|name| stack.lookup_child(name).is_some());
                 }
             }
         }
@@ -719,7 +720,7 @@ mod tests {
         fs.with_inner_for_tests(|inner| {
             let batch = inner.flushing.back().expect("batch must be in flushing");
             let mut entries = batch.entries.clone();
-            inner.normalize_directory_deltas(&mut entries);
+            inner.normalize_directory_deltas(&mut entries, 0);
             if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries.get(&1) {
                 assert!(
                     d.removed.is_empty(),
@@ -777,7 +778,7 @@ mod tests {
         fs.with_inner_for_tests(|inner| {
             let batch = inner.flushing.back().expect("batch must be in flushing");
             let mut entries = batch.entries.clone();
-            inner.normalize_directory_deltas(&mut entries);
+            inner.normalize_directory_deltas(&mut entries, 0);
             if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries.get(&1) {
                 assert!(d.added.is_empty(), "redundant addition must be pruned: {:?}", d.added);
                 assert!(
@@ -827,7 +828,7 @@ mod tests {
         fs.with_inner_for_tests(|inner| {
             let batch = inner.flushing.back().expect("batch must be in flushing");
             let mut entries = batch.entries.clone();
-            inner.normalize_directory_deltas(&mut entries);
+            inner.normalize_directory_deltas(&mut entries, 0);
             if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries.get(&1) {
                 assert_eq!(d.added.get("c.txt"), Some(&attr.ino), "c.txt must be retained in added");
                 assert!(
@@ -874,7 +875,7 @@ mod tests {
         fs.with_inner_for_tests(|inner| {
             let batch2 = inner.flushing.back().expect("batch2 must be in flushing");
             let mut entries2 = batch2.entries.clone();
-            inner.normalize_directory_deltas(&mut entries2);
+            inner.normalize_directory_deltas(&mut entries2, 0);
             if let Some(EntryDelta::Node(NodeDelta::Directory(d))) = entries2.get(&1) {
                 assert!(
                     d.removed.contains("file1.txt"),
@@ -882,6 +883,92 @@ mod tests {
                 );
             } else {
                 panic!("expected directory delta in batch2");
+            }
+        });
+    }
+
+    #[test]
+    fn test_normalize_directory_deltas_across_multiple_unflushed_batches() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage,
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let fs = InMemoryFS::with_clock_and_log(clock, Some(writer));
+
+        // Initial setup in base: base has root (ino 1) containing "existing.txt"
+        let existing_attr =
+            crate::operations::read_write::create_core(&fs, 1, "existing.txt", 0o644, 0, 1000, 1000).unwrap();
+        fs.quiesce().unwrap();
+
+        // Batch 0 (frozen, unflushed):
+        // 1. Create file1.txt
+        // 2. Hardlink existing.txt to keep inode alive, then unlink existing.txt
+        let _f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::links::link_core(&fs, existing_attr.ino, 1, "existing_link.txt").unwrap();
+        crate::operations::links::unlink_core(&fs, 1, "existing.txt").unwrap();
+        assert!(fs.freeze_now());
+
+        // Batch 1 (frozen, unflushed):
+        // 1. Unlink file1.txt (which was created in Batch 0, NOT in base!)
+        // 2. Re-create existing.txt with the same inode (which was unlinked in Batch 0, but still in base!)
+        crate::operations::links::unlink_core(&fs, 1, "file1.txt").unwrap();
+        crate::operations::links::link_core(&fs, existing_attr.ino, 1, "existing.txt").unwrap();
+        assert!(fs.freeze_now());
+
+        fs.with_inner_for_tests(|inner| {
+            assert_eq!(inner.flushing.len(), 2);
+
+            // Test normalizing Batch 0 against base (index 0)
+            let mut entries0 = inner.flushing[0].entries.clone();
+            inner.normalize_directory_deltas(&mut entries0, 0);
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d0))) = entries0.get(&1) {
+                assert!(d0.added.contains_key("file1.txt"));
+                assert!(d0.removed.contains("existing.txt"));
+            } else {
+                panic!("expected directory delta in batch 0");
+            }
+
+            // Test normalizing Batch 1 against base + Batch 0 (index 1)
+            let mut entries1 = inner.flushing[1].entries.clone();
+            inner.normalize_directory_deltas(&mut entries1, 1);
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d1))) = entries1.get(&1) {
+                // file1.txt was created in Batch 0. Normalizing Batch 1 against Batch 0 MUST retain file1.txt in removed!
+                assert!(
+                    d1.removed.contains("file1.txt"),
+                    "file1.txt must be retained in removed because it exists in flushing[0]"
+                );
+                // existing.txt was removed in Batch 0. Normalizing Batch 1 against Batch 0 MUST retain existing.txt in added!
+                assert!(
+                    d1.added.contains_key("existing.txt"),
+                    "existing.txt must be retained in added because it was removed in flushing[0]"
+                );
+            } else {
+                panic!("expected directory delta in batch 1");
+            }
+
+            // Verify that if we incorrectly normalized Batch 1 against index 0 (only base):
+            // It would have wrongly dropped file1.txt from removed (since base didn't have it)
+            // and wrongly dropped existing.txt from added (since base already had it with the same inode)!
+            let mut entries1_buggy = inner.flushing[1].entries.clone();
+            inner.normalize_directory_deltas(&mut entries1_buggy, 0);
+            if let Some(EntryDelta::Node(NodeDelta::Directory(d1_buggy))) = entries1_buggy.get(&1) {
+                assert!(
+                    !d1_buggy.removed.contains("file1.txt"),
+                    "demonstrating that index 0 would wrongly prune file1.txt"
+                );
+                assert!(
+                    !d1_buggy.added.contains_key("existing.txt"),
+                    "demonstrating that index 0 would wrongly prune existing.txt"
+                );
             }
         });
     }

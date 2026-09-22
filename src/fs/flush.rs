@@ -341,14 +341,40 @@ impl InMemoryFS {
         };
         self.flusher.run_locked(|| {
             loop {
-                // If there are no pending batches, break out of the loop without rolling.
-                let has_pending = {
+                // Inspect candidates in the flush queue upfront in a single lock acquisition:
+                // decide right here and then how many to coalesce without re-locking while writing to disk.
+                let candidates = {
                     let mut inner = self.inner.lock(OpTag::Flush).unwrap();
                     self.freeze_if_due_locked(&mut inner);
-                    !inner.flushing.is_empty()
+                    if inner.flushing.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut list = Vec::new();
+                        let mut cumulative_bytes: usize = 0;
+                        let mut cumulative_ops: usize = 0;
+
+                        for (idx, b) in inner.flushing.iter().enumerate() {
+                            assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
+                            if !list.is_empty()
+                                && (list.len() >= self.max_coalesce_batches
+                                    || b.bytes > self.small_batch_max_bytes
+                                    || cumulative_bytes.saturating_add(b.bytes) > self.max_coalesce_bytes
+                                    || cumulative_ops.saturating_add(b.ops) > self.max_coalesce_ops)
+                            {
+                                break;
+                            }
+                            cumulative_bytes = cumulative_bytes.saturating_add(b.bytes);
+                            cumulative_ops = cumulative_ops.saturating_add(b.ops);
+
+                            let mut entries = b.entries.clone();
+                            inner.normalize_directory_deltas(&mut entries, idx);
+                            list.push((Arc::clone(b), entries));
+                        }
+                        list
+                    }
                 };
 
-                if !has_pending {
+                if candidates.is_empty() {
                     break;
                 }
 
@@ -356,9 +382,7 @@ impl InMemoryFS {
                 let rolled = writer.roll_if_needed(&*self.clock)?;
                 self.apply_roll(rolled, writer);
 
-                if !self.flush_coalesced_group(writer)? {
-                    break;
-                }
+                self.flush_coalesced_group(writer, candidates)?;
             }
 
             // Age-based rolling. The size check only ever ran ahead of a batch, so on an idle
@@ -372,57 +396,21 @@ impl InMemoryFS {
         })
     }
 
-    /// Collects and commits one group of candidate batches to the log file.
-    ///
-    /// Returns `Ok(true)` if at least one batch was flushed, or `Ok(false)` if the queue was empty.
-    fn flush_coalesced_group(&self, writer: &LogWriter) -> std::io::Result<bool> {
-        let mut coalesced: Vec<PendingBatch> = Vec::new();
-        let mut cumulative_bytes: usize = 0;
-        let mut cumulative_ops: usize = 0;
-
+    /// Commits one group of coalesced candidate batches to the log file in FIFO order
+    /// followed by a single physical sync (`writer.flush()`), then folds them into `base`.
+    fn flush_coalesced_group(
+        &self,
+        writer: &LogWriter,
+        candidates: Vec<(Arc<super::FlushBatch>, HashMap<u64, EntryDelta>)>,
+    ) -> std::io::Result<()> {
         let group_start_gen = writer.generation();
         let group_start_offset = writer.current_offset();
         writer.checkpoint_batch_start();
 
-        loop {
-            let candidate = {
-                let mut inner = self.inner.lock(OpTag::Flush).unwrap();
-                self.freeze_if_due_locked(&mut inner);
-
-                match inner.flushing.get(coalesced.len()) {
-                    Some(b) => {
-                        assert!(!b.entries.is_empty(), "flushing batch must contain at least one entry");
-                        if !coalesced.is_empty() {
-                            if coalesced.len() >= self.max_coalesce_batches
-                                || b.bytes > self.small_batch_max_bytes
-                                || cumulative_bytes.saturating_add(b.bytes) > self.max_coalesce_bytes
-                                || cumulative_ops.saturating_add(b.ops) > self.max_coalesce_ops
-                            {
-                                None
-                            } else {
-                                let mut entries = b.entries.clone();
-                                inner.normalize_directory_deltas(&mut entries);
-                                Some((Arc::clone(b), entries))
-                            }
-                        } else {
-                            let mut entries = b.entries.clone();
-                            inner.normalize_directory_deltas(&mut entries);
-                            Some((Arc::clone(b), entries))
-                        }
-                    }
-                    None => None,
-                }
-            };
-
-            let Some((batch, mut entries)) = candidate else {
-                break;
-            };
-
+        let mut coalesced: Vec<PendingBatch> = Vec::with_capacity(candidates.len());
+        for (batch, mut entries) in candidates {
             let started_at = self.clock.now();
             let started_monotonic = self.clock.monotonic();
-            cumulative_bytes = cumulative_bytes.saturating_add(batch.bytes);
-            cumulative_ops = cumulative_ops.saturating_add(batch.ops);
-
             let disk_bytes = match self.synthesize_and_write_flushing_layer(&mut entries, writer) {
                 Ok(db) => db,
                 Err(e) => {
@@ -430,7 +418,6 @@ impl InMemoryFS {
                     return Err(e);
                 }
             };
-
             coalesced.push(PendingBatch {
                 batch,
                 entries,
@@ -438,10 +425,6 @@ impl InMemoryFS {
                 started_at,
                 started_monotonic,
             });
-        }
-
-        if coalesced.is_empty() {
-            return Ok(false);
         }
 
         let persist_start = self.clock.monotonic();
@@ -453,7 +436,7 @@ impl InMemoryFS {
         let persist_duration = fold_start.saturating_sub(persist_start);
 
         self.complete_coalesced_group(coalesced, persist_duration, fold_start);
-        Ok(true)
+        Ok(())
     }
 
     /// Folds a durable group of batches into `base` and completes pending batch promises.
