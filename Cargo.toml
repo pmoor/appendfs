@@ -35,7 +35,13 @@ testing = []
 
 [dev-dependencies]
 appendfs = { path = ".", features = ["testing"] }
+iai-callgrind = "0.16.1"
+
+[[bench]]
+name = "in_memory_workload"
+harness = false
 
 [build-dependencies]
 cc = "1.0"
 pkg-config = "0.3"
+

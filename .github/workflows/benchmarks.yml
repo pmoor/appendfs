@@ -1,0 +1,124 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'benches/**'
+      - 'scripts/profile_callgrind.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/benchmarks.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: in-memory benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Valgrind and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind libfuse3-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install iai-callgrind-runner
+        uses: taiki-e/install-action@v2
+        with:
+          tool: iai-callgrind-runner@0.16.1
+
+      - name: Run benchmark comparison (Base vs PR)
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+            PR_REF="${{ github.event.pull_request.head.sha }}"
+
+            echo "Evaluating PR benchmark against base ($BASE_REF)..."
+            if git show "$BASE_REF:benches/in_memory_workload.rs" >/dev/null 2>&1; then
+              echo "::group::Benchmarking base branch ($BASE_REF)..."
+              git checkout --force "$BASE_REF"
+              cargo bench --bench in_memory_workload -- --save-baseline=base
+              echo "::endgroup::"
+
+              echo "::group::Benchmarking PR branch ($PR_REF)..."
+              git checkout --force "$PR_REF"
+              cargo bench --bench in_memory_workload -- --baseline=base
+              echo "::endgroup::"
+
+              echo "::group::Generating comparison report..."
+              python3 scripts/profile_callgrind.py --baseline base --output benchmark-report.md --step-summary
+              echo "::endgroup::"
+            else
+              echo "Benchmark suite not present on base branch ($BASE_REF); running standalone on PR..."
+              cargo bench --bench in_memory_workload
+              python3 scripts/profile_callgrind.py --output benchmark-report.md --step-summary
+            fi
+          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            BEFORE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+
+            if git show "$BEFORE_SHA:benches/in_memory_workload.rs" >/dev/null 2>&1; then
+              echo "::group::Benchmarking previous commit ($BEFORE_SHA)..."
+              git checkout --force "$BEFORE_SHA"
+              cargo bench --bench in_memory_workload -- --save-baseline=base
+              echo "::endgroup::"
+
+              echo "::group::Benchmarking current commit ($HEAD_SHA)..."
+              git checkout --force "$HEAD_SHA"
+              cargo bench --bench in_memory_workload -- --baseline=base
+              echo "::endgroup::"
+
+              echo "::group::Generating comparison report..."
+              python3 scripts/profile_callgrind.py --baseline base --output benchmark-report.md --step-summary
+              echo "::endgroup::"
+            else
+              echo "Benchmark suite not present on prior commit; running standalone..."
+              cargo bench --bench in_memory_workload
+              python3 scripts/profile_callgrind.py --output benchmark-report.md --step-summary
+            fi
+          else
+            echo "::group::Running benchmark suite..."
+            cargo bench --bench in_memory_workload
+            python3 scripts/profile_callgrind.py --output benchmark-report.md --step-summary
+            echo "::endgroup::"
+          fi
+
+      - name: Upload benchmark report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: benchmark-report.md
+
+      - name: Comment on PR with benchmark results
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --body-file benchmark-report.md \
+            --edit-last \
+            --create-if-none
