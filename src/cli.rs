@@ -30,6 +30,19 @@ pub const DEFAULT_MAX_FLUSH_QUEUE_BYTES: usize = 2 * DEFAULT_MAX_BUFFER_SIZE;
 /// Default maximum total mutating operations across all frozen flush batches queued in memory (32,768 ops).
 pub const DEFAULT_MAX_FLUSH_QUEUE_OPS: usize = 2 * DEFAULT_MAX_BUFFER_OPS;
 
+/// Default maximum number of small flush batches to coalesce into a single on-disk flush cycle (16 batches).
+pub const DEFAULT_MAX_COALESCE_BATCHES: usize = 16;
+
+/// Default maximum cumulative staged data bytes across coalesced flush batches before forcing a disk flush (128 KiB).
+pub const DEFAULT_MAX_COALESCE_BYTES: usize = 128 * 1024;
+
+/// Default maximum cumulative mutation operations across coalesced flush batches before forcing a disk flush (128 ops).
+pub const DEFAULT_MAX_COALESCE_OPS: usize = 128;
+
+/// Default maximum data bytes for an individual flush batch to be eligible for coalescing (32 KiB).
+/// Batches larger than this are flushed independently to avoid delaying bulk writes.
+pub const DEFAULT_SMALL_BATCH_MAX_BYTES: usize = 32 * 1024;
+
 pub use crate::remote::block_cache::DEFAULT_DECRYPTED_CACHE_SIZE;
 
 /// Default interval in bytes of committed log data before generating a new .summary snapshot file during log rolls (10 GiB).
@@ -418,6 +431,22 @@ pub struct MountArgs {
     /// Track access time (atime) on reads (default: false, like noatime)
     #[arg(long = "track-atime", default_value_t = false)]
     pub track_atime: bool,
+
+    /// Maximum number of small flush batches to coalesce into a single on-disk flush cycle (default: 16)
+    #[arg(long = "max-coalesce-batches", default_value_t = DEFAULT_MAX_COALESCE_BATCHES)]
+    pub max_coalesce_batches: usize,
+
+    /// Maximum cumulative staged data bytes across coalesced flush batches before forcing a disk flush (default: 128 KiB)
+    #[arg(long = "max-coalesce-bytes", default_value_t = DEFAULT_MAX_COALESCE_BYTES)]
+    pub max_coalesce_bytes: usize,
+
+    /// Maximum cumulative mutation operations across coalesced flush batches before forcing a disk flush (default: 128)
+    #[arg(long = "max-coalesce-ops", default_value_t = DEFAULT_MAX_COALESCE_OPS)]
+    pub max_coalesce_ops: usize,
+
+    /// Maximum data bytes for an individual flush batch to be eligible for coalescing (default: 32 KiB)
+    #[arg(long = "small-batch-max-bytes", default_value_t = DEFAULT_SMALL_BATCH_MAX_BYTES)]
+    pub small_batch_max_bytes: usize,
 }
 
 impl std::ops::Deref for MountArgs {

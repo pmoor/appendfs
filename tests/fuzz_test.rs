@@ -1216,7 +1216,8 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     }));
     let bytes = appendfs::wire::serialize(&dir_delta).unwrap();
     writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
-    writer.emit_flush_commit_and_flush(2, 0, &clock).unwrap();
+    writer.emit_flush_commit(2, 0, &clock).unwrap();
+    writer.flush().unwrap();
 
     // Batch 2: create "should_not_exist.txt" inside root, but WITHOUT ever writing its
     // FlushCommit trailer - simulates a crash exactly mid-flush, after the record was
@@ -1229,7 +1230,7 @@ fn test_crash_mid_flush_discards_uncommitted_trailing_batch() {
     }));
     let bytes = appendfs::wire::serialize(&uncommitted_delta).unwrap();
     writer.append_record(OpCode::InodeDelta, 1, &bytes).unwrap();
-    // Deliberately no emit_flush_commit_and_flush() call here - this is the crash point.
+    // Deliberately no emit_flush_commit() call here - this is the crash point.
 
     writer.flush().unwrap();
     drop(writer);
@@ -1294,7 +1295,8 @@ fn test_crash_mid_flush_with_record_count_mismatch_fails_recovery() {
     let bytes = appendfs::wire::serialize(&file_delta).unwrap();
     writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
     // Claim 2 records preceded this trailer, when only 1 actually did.
-    writer.emit_flush_commit_and_flush(2, 0, &clock).unwrap();
+    writer.emit_flush_commit(2, 0, &clock).unwrap();
+    writer.flush().unwrap();
     drop(writer);
 
     let result = recover_fs(
@@ -1338,7 +1340,8 @@ fn test_bitrot_in_committed_record_fails_recovery_hard() {
     }));
     let bytes = appendfs::wire::serialize(&file_delta).unwrap();
     writer.append_record(OpCode::InodeDelta, 2, &bytes).unwrap();
-    writer.emit_flush_commit_and_flush(1, 0, &clock).unwrap();
+    writer.emit_flush_commit(1, 0, &clock).unwrap();
+    writer.flush().unwrap();
     let filename = writer.filename();
     drop(writer);
 

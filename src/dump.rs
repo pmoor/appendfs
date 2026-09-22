@@ -1470,7 +1470,8 @@ mod tests {
         writer.append_record(OpCode::Data, 2, &data_bytes).unwrap();
 
         // Commit batch
-        writer.emit_flush_commit_and_flush(2, 100, &clock).unwrap();
+        writer.emit_flush_commit(2, 100, &clock).unwrap();
+        writer.flush().unwrap();
         drop(writer);
 
         assert!(storage.exists("000001.log"));
@@ -1845,9 +1846,8 @@ mod tests {
         let small_data = vec![0x42; 8];
         writer.append_record(OpCode::Data, 3, &small_data).unwrap();
 
-        writer
-            .emit_flush_commit_and_flush(2, uncompressed_len + 8, &clock)
-            .unwrap();
+        writer.emit_flush_commit(2, uncompressed_len + 8, &clock).unwrap();
+        writer.flush().unwrap();
         drop(writer);
 
         // Level 0: verify summary table and dedicated compression line
@@ -1900,8 +1900,9 @@ mod tests {
         let compressible_data = "Repeating encrypted log data line. ".repeat(300).into_bytes();
         writer.append_record(OpCode::Data, 2, &compressible_data).unwrap();
         writer
-            .emit_flush_commit_and_flush(1, compressible_data.len() as u64, &clock)
+            .emit_flush_commit(1, compressible_data.len() as u64, &clock)
             .unwrap();
+        writer.flush().unwrap();
         drop(writer);
 
         // Keyless dump: should recognize encrypted DataZstd and report key needed for savings

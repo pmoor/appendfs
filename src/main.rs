@@ -510,6 +510,10 @@ fn cmd_mount(args: MountArgs) {
     fs_instance.max_flush_queue_depth = args.max_flush_queue_depth;
     fs_instance.max_flush_queue_bytes = args.max_flush_queue_bytes;
     fs_instance.max_flush_queue_ops = args.max_flush_queue_ops;
+    fs_instance.max_coalesce_batches = args.max_coalesce_batches;
+    fs_instance.max_coalesce_bytes = args.max_coalesce_bytes;
+    fs_instance.max_coalesce_ops = args.max_coalesce_ops;
+    fs_instance.small_batch_max_bytes = args.small_batch_max_bytes;
     fs_instance.flush_interval.store(args.flush_interval, Ordering::SeqCst);
     fs_instance.set_summary_intervals(args.summary_interval_bytes, args.summary_interval_generations);
     fs_instance.track_atime = args.track_atime;

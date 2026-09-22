@@ -791,6 +791,14 @@ pub struct InMemoryFS {
     pub max_flush_queue_bytes: usize,
     /// Maximum total mutating operations across all frozen flush batches allowed to queue up before auto-freezing is bounded.
     pub max_flush_queue_ops: usize,
+    /// Maximum number of small flush batches to coalesce into a single on-disk flush cycle.
+    pub max_coalesce_batches: usize,
+    /// Maximum cumulative staged data bytes across coalesced flush batches before forcing a disk flush.
+    pub max_coalesce_bytes: usize,
+    /// Maximum cumulative mutation operations across coalesced flush batches before forcing a disk flush.
+    pub max_coalesce_ops: usize,
+    /// Maximum data bytes for an individual flush batch to be eligible for coalescing.
+    pub small_batch_max_bytes: usize,
     pub flush_interval: AtomicU64,
     pub(crate) flusher: flusher::Flusher,
     /// When false, `read()` never touches atime (like a `noatime` mount) - defaults to false.
@@ -916,6 +924,10 @@ impl InMemoryFS {
             max_flush_queue_depth: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_DEPTH,
             max_flush_queue_bytes: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_BYTES,
             max_flush_queue_ops: crate::cli::DEFAULT_MAX_FLUSH_QUEUE_OPS,
+            max_coalesce_batches: crate::cli::DEFAULT_MAX_COALESCE_BATCHES,
+            max_coalesce_bytes: crate::cli::DEFAULT_MAX_COALESCE_BYTES,
+            max_coalesce_ops: crate::cli::DEFAULT_MAX_COALESCE_OPS,
+            small_batch_max_bytes: crate::cli::DEFAULT_SMALL_BATCH_MAX_BYTES,
             flush_interval: AtomicU64::new(0),
             flusher: flusher::Flusher::new(),
             track_atime: false,

@@ -335,7 +335,8 @@ impl LogWriter {
             ActiveLogState::Unopened { .. } => {}
             ActiveLogState::Open(active) => {
                 let size_exceeded = active.current_offset > FILE_HEADER_SIZE as u64
-                    && active.current_offset + estimated_additional_bytes > self.max_log_size;
+                    && (active.current_offset >= self.max_log_size
+                        || active.current_offset + estimated_additional_bytes > self.max_log_size);
 
                 let age_exceeded = if let Some(max_age) = self.max_log_age {
                     active.current_offset > FILE_HEADER_SIZE as u64
@@ -601,15 +602,12 @@ impl LogWriter {
         Ok(())
     }
 
-    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records, flushes
-    /// to persistent media, and updates active log record and data byte counters.
+    /// Emits the `OpCode::FlushCommit` trailer confirming `record_count` records,
+    /// and updates active log record and data byte counters.
     /// Assigns and returns the next monotonic `batch_id`.
-    pub fn emit_flush_commit_and_flush(
-        &self,
-        record_count: u32,
-        data_bytes: u64,
-        clock: &dyn Clock,
-    ) -> io::Result<u64> {
+    ///
+    /// Note: To physically sync records through to durable media, call [`LogWriter::flush`].
+    pub fn emit_flush_commit(&self, record_count: u32, data_bytes: u64, clock: &dyn Clock) -> io::Result<u64> {
         let batch_id = self.batch_id.fetch_add(1, Ordering::SeqCst);
         let now = clock.now();
         let commit_payload = FlushCommitPayload {
@@ -625,8 +623,6 @@ impl LogWriter {
             self.batch_id.store(batch_id, Ordering::SeqCst);
             return Err(e);
         }
-
-        self.flush()?;
 
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
@@ -821,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_flush_commit_and_flush_round_trip() {
+    fn test_emit_flush_commit_round_trip() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let writer = LogWriter::create(
@@ -836,7 +832,8 @@ mod tests {
 
         writer.append_record(OpCode::InodeDelta, 1, b"payload").unwrap();
         writer.append_record(OpCode::Data, 1, b"more").unwrap();
-        let committed_batch_id = writer.emit_flush_commit_and_flush(2, 4, &clock).unwrap();
+        let committed_batch_id = writer.emit_flush_commit(2, 4, &clock).unwrap();
+        writer.flush().unwrap();
         assert_eq!(committed_batch_id, 1);
 
         let records: Vec<_> = LogReader::open(storage.as_ref(), &writer.filename(), VolumeKey::plaintext_arc())
@@ -880,7 +877,8 @@ mod tests {
         writer
             .append_record(OpCode::InodeDelta, 1, b"second record payload")
             .unwrap();
-        writer.emit_flush_commit_and_flush(2, 20, &clock).unwrap();
+        writer.emit_flush_commit(2, 20, &clock).unwrap();
+        writer.flush().unwrap();
 
         // Roll to generation 2 -> returns sealed LogFileInfo
         let roll_res = writer.roll_if_needed(1000, &clock).unwrap();
@@ -999,7 +997,8 @@ mod tests {
 
         // Write some records and emit flush commit
         writer.append_record(OpCode::Data, 1, b"batch data").unwrap();
-        let committed_id = writer.emit_flush_commit_and_flush(1, 10, &clock).unwrap();
+        let committed_id = writer.emit_flush_commit(1, 10, &clock).unwrap();
+        writer.flush().unwrap();
         assert_eq!(committed_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
 
@@ -1010,7 +1009,8 @@ mod tests {
         // Retrying the batch should re-use batch_id 1
         writer.checkpoint_batch_start();
         writer.append_record(OpCode::Data, 1, b"batch data retry").unwrap();
-        let retried_id = writer.emit_flush_commit_and_flush(1, 16, &clock).unwrap();
+        let retried_id = writer.emit_flush_commit(1, 16, &clock).unwrap();
+        writer.flush().unwrap();
         assert_eq!(retried_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
     }
