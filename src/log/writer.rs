@@ -321,11 +321,7 @@ impl LogWriter {
 
     /// Rolls to a new generation log file (or opens the initial lazy log file) if needed.
     /// Returns the sealed `LogFileInfo` if a rollover occurred.
-    pub fn roll_if_needed(
-        &self,
-        estimated_additional_bytes: u64,
-        clock: &dyn Clock,
-    ) -> io::Result<Option<super::manifest::LogFileInfo>> {
+    pub fn roll_if_needed(&self, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -334,9 +330,8 @@ impl LogWriter {
         match &*state {
             ActiveLogState::Unopened { .. } => {}
             ActiveLogState::Open(active) => {
-                let size_exceeded = active.current_offset > FILE_HEADER_SIZE as u64
-                    && (active.current_offset >= self.max_log_size
-                        || active.current_offset + estimated_additional_bytes > self.max_log_size);
+                let size_exceeded =
+                    active.current_offset > FILE_HEADER_SIZE as u64 && active.current_offset >= self.max_log_size;
 
                 let age_exceeded = if let Some(max_age) = self.max_log_age {
                     active.current_offset > FILE_HEADER_SIZE as u64
@@ -804,12 +799,12 @@ mod tests {
     fn test_roll_if_needed_rolls_between_batches() {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
-        let writer = LogWriter::create(storage.clone(), 1, &clock, 60, 1, VolumeKey::plaintext_arc()).unwrap();
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 40, 1, VolumeKey::plaintext_arc()).unwrap();
 
         writer.append_record(OpCode::Data, 1, b"0123456789").unwrap();
         assert_eq!(writer.generation(), 1);
 
-        writer.roll_if_needed(1000, &clock).unwrap();
+        writer.roll_if_needed(&clock).unwrap();
         assert_eq!(writer.generation(), 2);
 
         let (gen_num, _, _) = writer.append_record(OpCode::Data, 2, b"0123456789").unwrap();
@@ -858,12 +853,12 @@ mod tests {
         assert_eq!(writer.generation(), 1);
         assert!(!storage.exists("000001.log"));
 
-        let opened_gen = writer.roll_if_needed(100, &clock).unwrap();
+        let opened_gen = writer.roll_if_needed(&clock).unwrap();
         assert_eq!(opened_gen, None);
         assert!(writer.is_open());
         assert!(storage.exists("000001.log"));
 
-        let no_roll = writer.roll_if_needed(100, &clock).unwrap();
+        let no_roll = writer.roll_if_needed(&clock).unwrap();
         assert_eq!(no_roll, None);
     }
 
@@ -881,7 +876,7 @@ mod tests {
         writer.flush().unwrap();
 
         // Roll to generation 2 -> returns sealed LogFileInfo
-        let roll_res = writer.roll_if_needed(1000, &clock).unwrap();
+        let roll_res = writer.roll_if_needed(&clock).unwrap();
         let sealed_info = roll_res.unwrap();
         assert_eq!(sealed_info.generation, 1);
         assert_eq!(sealed_info.record_count, 3);

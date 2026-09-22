@@ -8,7 +8,7 @@
 use super::{FlushReason, FsInner, InMemoryFS, ShutdownState};
 use crate::error::FsError;
 use crate::extent_map::Extent;
-use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode, RECORD_HEADER_SIZE};
+use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode};
 use crate::node::{EntryDelta, NodeDelta};
 use crate::operations::locks::LockManager;
 use crate::storage::Storage;
@@ -18,38 +18,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
-
-/// Upper bound on the bytes a frozen batch will occupy, used only to decide whether it fits
-/// in the current generation before any of it is written.
-fn estimate_batch_bytes(frozen: &HashMap<u64, EntryDelta>, max_extent_size: usize) -> u64 {
-    let mut estimated_bytes: u64 = RECORD_HEADER_SIZE as u64 + 64; // FlushCommit
-    for entry in frozen.values() {
-        match entry {
-            EntryDelta::Node(NodeDelta::File(f)) => {
-                for (_, entry) in f.extents.iter() {
-                    if let Extent::Staged { length, .. } = &entry.extent {
-                        let chunks = (*length as u64).div_ceil(max_extent_size as u64).max(1);
-                        estimated_bytes += chunks * RECORD_HEADER_SIZE as u64 + *length as u64;
-                    }
-                }
-                estimated_bytes += RECORD_HEADER_SIZE as u64 + 256 + f.extents.len() as u64 * 24;
-            }
-            EntryDelta::Node(NodeDelta::Directory(d)) => {
-                estimated_bytes += RECORD_HEADER_SIZE as u64 + 256 + (d.added.len() + d.removed.len()) as u64 * 64;
-            }
-            EntryDelta::Node(NodeDelta::Symlink(s)) => {
-                estimated_bytes += RECORD_HEADER_SIZE as u64 + 256 + s.target.as_ref().map_or(0, |t| t.len() as u64);
-            }
-            EntryDelta::Node(_) => {
-                estimated_bytes += RECORD_HEADER_SIZE as u64 + 256;
-            }
-            EntryDelta::Tombstone => {
-                estimated_bytes += RECORD_HEADER_SIZE as u64 + 64;
-            }
-        }
-    }
-    estimated_bytes
-}
 
 struct PendingBatch {
     batch: Arc<super::FlushBatch>,
@@ -373,23 +341,19 @@ impl InMemoryFS {
         };
         self.flusher.run_locked(|| {
             loop {
-                // Check if there are any batches due to be flushed.
-                // If the queue is empty, break out of the loop without rolling.
-                let first_candidate = {
+                // If there are no pending batches, break out of the loop without rolling.
+                let has_pending = {
                     let mut inner = self.inner.lock(OpTag::Flush).unwrap();
                     self.freeze_if_due_locked(&mut inner);
-                    inner.flushing.front().map(|b| b.entries.clone())
+                    !inner.flushing.is_empty()
                 };
 
-                let Some(entries) = first_candidate else {
+                if !has_pending {
                     break;
-                };
+                }
 
-                // Check if the active log needs to roll (size limit reached or aged).
-                // Executed only between complete flush groups when base is 100% up-to-date.
-                let max_extent_size = self.max_extent_size.clamp(1, u32::MAX as usize);
-                let est = estimate_batch_bytes(&entries, max_extent_size);
-                let rolled = writer.roll_if_needed(est, &*self.clock)?;
+                // If the active log already exceeded max_log_size from prior flushes, roll now.
+                let rolled = writer.roll_if_needed(&*self.clock)?;
                 self.apply_roll(rolled, writer);
 
                 if !self.flush_coalesced_group(writer)? {

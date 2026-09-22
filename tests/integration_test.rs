@@ -692,9 +692,9 @@ fn test_manifest_and_live_stats_across_fuse_mount_and_recovery() {
     let log_path = log_dir.path().to_path_buf();
     let storage: Arc<dyn Storage> = Arc::new(OsStorage::new(&log_path));
 
-    // 2KB max log size to trigger rolling across writes
+    // 1KB max log size to trigger rolling across writes
     let writer = Arc::new(
-        appendfs::LogWriter::create(storage, 1, &*clock, 2048, 1, appendfs::VolumeKey::plaintext_arc()).unwrap(),
+        appendfs::LogWriter::create(storage, 1, &*clock, 1000, 1, appendfs::VolumeKey::plaintext_arc()).unwrap(),
     );
     let fs = appendfs::InMemoryFS::with_clock_and_log(clock.clone(), Some(writer));
 
@@ -2950,7 +2950,7 @@ fn test_periodic_summary_generation_on_log_rolls() {
     assert!(!storage.exists("000001.summary"));
     assert!(!storage.exists("000002.summary"));
 
-    // 2. Open filesystem with small max_log_size (1500 bytes) and summary_interval_generations = 2
+    // 2. Open filesystem with small max_log_size (1000 bytes) and summary_interval_generations = 2
     {
         let mut fs = appendfs::recover_fs(
             storage.clone(),
@@ -2964,7 +2964,7 @@ fn test_periodic_summary_generation_on_log_rolls() {
             appendfs::LogWriter::create_lazy(
                 storage.clone(),
                 1,
-                1500, // 1500 bytes max log size forces rapid rolling
+                1000, // 1000 bytes max log size forces rapid rolling
                 0,
                 key.clone(),
             )
@@ -2975,13 +2975,13 @@ fn test_periodic_summary_generation_on_log_rolls() {
         // Configure to emit summary every 2 rolled generations (and 0 byte trigger)
         fs.set_summary_intervals(0, 2);
 
-        // Generation 1: write file1 (1000 bytes). Total log size becomes ~1100 bytes.
+        // Generation 1: write file1 (1000 bytes). Total log size becomes ~1100 bytes (>= 1000).
         let file1_data = vec![0x11u8; 1000];
         let a1 = appendfs::operations::read_write::create_core(&fs, 1, "file1.bin", 0o644, 0, 1000, 1000).unwrap();
         appendfs::operations::read_write::write_core(&fs, a1.ino, &file1_data, 0).unwrap();
         fs.quiesce().unwrap();
 
-        // Generation 2: write file2 (1000 bytes). This will exceed 1500 bytes, causing roll to gen 2!
+        // Generation 2: write file2 (1000 bytes). Gen 1 reached limit, causing roll to gen 2!
         // Roll 1: gen 1 is sealed. generations_since_last_summary becomes 1 (< 2). No summary yet.
         let file2_data = vec![0x22u8; 1000];
         let a2 = appendfs::operations::read_write::create_core(&fs, 1, "file2.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -2993,7 +2993,7 @@ fn test_periodic_summary_generation_on_log_rolls() {
             "Gen 1 roll should not emit summary yet (threshold is 2)"
         );
 
-        // Generation 3: write file3 (1000 bytes). Exceeds 1500 bytes, causing roll to gen 3!
+        // Generation 3: write file3 (1000 bytes). Gen 2 reached limit, causing roll to gen 3!
         // Roll 2: gen 2 is sealed. generations_since_last_summary becomes 2 (>= 2).
         // 000002.summary MUST be emitted!
         let file3_data = vec![0x33u8; 1000];
@@ -3065,7 +3065,7 @@ fn test_periodic_summary_generation_by_bytes() {
     )
     .unwrap();
 
-    // Configure 2500 bytes threshold and 1500 max log size
+    // Configure 2500 bytes threshold and 1000 max log size
     {
         let mut fs = appendfs::recover_fs(
             storage.clone(),
@@ -3075,7 +3075,7 @@ fn test_periodic_summary_generation_by_bytes() {
         )
         .unwrap();
 
-        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1500, 0, key.clone()).unwrap());
+        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1000, 0, key.clone()).unwrap());
 
         fs.log_writer = Some(writer);
         // Byte threshold = 2500, generations threshold = 0 (disabled)
@@ -3139,7 +3139,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
     )
     .unwrap();
 
-    // 1. Session 1: configure max_log_size = 1500 bytes.
+    // 1. Session 1: configure max_log_size = 1000 bytes.
     // Write 1000 bytes in gen 1, export 000001.summary.
     // Then write 1000 bytes in gen 2 and 1000 bytes in gen 3 without exporting a summary.
     {
@@ -3151,7 +3151,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
         )
         .unwrap();
 
-        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1500, 0, key.clone()).unwrap());
+        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1000, 0, key.clone()).unwrap());
         fs.log_writer = Some(writer);
 
         let a1 = appendfs::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -3218,7 +3218,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
 
     let start_batch_id = recovered_fs.last_batch_id.load(Ordering::SeqCst) + 1;
     let writer2 = Arc::new(
-        appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1500, start_batch_id, key.clone()).unwrap(),
+        appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1000, start_batch_id, key.clone()).unwrap(),
     );
     recovered_fs.log_writer = Some(writer2);
     recovered_fs.set_summary_intervals(2500, 0);
@@ -3228,7 +3228,7 @@ fn test_recovered_fs_restores_summary_counters_and_emits_early_summary() {
     appendfs::operations::read_write::write_core(&recovered_fs, a4.ino, &vec![4u8; 1000], 0).unwrap();
     recovered_fs.quiesce().unwrap();
 
-    // Now write file5 in gen 5 (1000 bytes), which forces gen 4 to roll (1000 + 1000 > 1500).
+    // Now write file5 in gen 5 (1000 bytes), which forces gen 4 to roll (gen 4 reached limit 1000).
     // On gen 4 roll:
     // bytes_since was 2000 (recovered) + 1000 (gen 4) = 3000 >= 2500!
     // 000004.summary MUST be emitted!
@@ -3269,7 +3269,7 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
         )
         .unwrap();
 
-        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1500, 0, key.clone()).unwrap());
+        let writer = Arc::new(appendfs::LogWriter::create_lazy(storage.clone(), 1, 1000, 0, key.clone()).unwrap());
         fs.log_writer = Some(writer);
 
         let a1 = appendfs::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
@@ -3316,7 +3316,7 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
 
     let start_batch_id = recovered_fs.last_batch_id.load(Ordering::SeqCst) + 1;
     let writer2 = Arc::new(
-        appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1500, start_batch_id, key.clone()).unwrap(),
+        appendfs::LogWriter::create_lazy(storage.clone(), next_gen, 1000, start_batch_id, key.clone()).unwrap(),
     );
     recovered_fs.log_writer = Some(writer2);
     recovered_fs.set_summary_intervals(0, 3);
