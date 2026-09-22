@@ -431,8 +431,10 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
         flush.total_ops
     ));
     out.push_str(&format!(
-        "  Time Flushing:      {} to disk, {} folding into base\n",
-        format_duration(flush.total_persist),
+        "  Time Flushing:      {} serialize, {} wait, {} flush, {} folding into base\n",
+        format_duration(flush.total_serialize),
+        format_duration(flush.total_wait),
+        format_duration(flush.total_flush),
         format_duration(flush.total_fold)
     ));
     let reasons: Vec<String> = crate::fs::FlushReason::ALL
@@ -453,20 +455,22 @@ pub fn format_runtime_status(fs: &InMemoryFS) -> String {
     } else {
         out.push_str("  Recent Flushes:\n");
         out.push_str(&format!(
-            "    {:<7} {:<11} {:>10} {:>10} {:>7}  {:>10} {:>10} {:>10}  {}\n",
-            "batch", "reason", "bytes", "on-disk", "ops", "disk", "fold", "total", "age"
+            "    {:<7} {:<11} {:>10} {:>10} {:>7}  {:>10} {:>10} {:>10} {:>10} {:>10}  {}\n",
+            "batch", "reason", "bytes", "on-disk", "ops", "serialize", "wait", "flush", "fold", "total", "age"
         ));
         let now = fs.clock.now();
         for record in flush.recent.iter().rev() {
             let age = now.duration_since(record.started_at).unwrap_or_default().as_secs();
             out.push_str(&format!(
-                "    #{:<6} {:<11} {:>10} {:>10} {:>7}  {:>10} {:>10} {:>10}  {}s ago\n",
+                "    #{:<6} {:<11} {:>10} {:>10} {:>7}  {:>10} {:>10} {:>10} {:>10} {:>10}  {}s ago\n",
                 record.id,
                 record.reason,
                 format_bytes(record.bytes as u64),
                 format_bytes(record.disk_bytes),
                 record.ops,
-                format_duration(record.persist),
+                format_duration(record.serialize),
+                format_duration(record.wait),
+                format_duration(record.flush),
                 format_duration(record.fold),
                 format_duration(record.duration),
                 age

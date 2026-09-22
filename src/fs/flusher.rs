@@ -28,7 +28,9 @@ struct Telemetry {
     total_bytes: u64,
     total_disk_bytes: u64,
     total_ops: u64,
-    total_persist: Duration,
+    total_serialize: Duration,
+    total_wait: Duration,
+    total_flush: Duration,
     total_fold: Duration,
     by_reason: [u64; 5],
     recent: VecDeque<FlushRecord>,
@@ -156,7 +158,9 @@ impl Flusher {
         telemetry.total_bytes += record.bytes as u64;
         telemetry.total_disk_bytes += record.disk_bytes;
         telemetry.total_ops += record.ops as u64;
-        telemetry.total_persist += record.persist;
+        telemetry.total_serialize += record.serialize;
+        telemetry.total_wait += record.wait;
+        telemetry.total_flush += record.flush;
         telemetry.total_fold += record.fold;
         telemetry.by_reason[record.reason.index()] += 1;
         if telemetry.recent.len() == FLUSH_HISTORY_CAPACITY {
@@ -175,7 +179,9 @@ impl Flusher {
             total_bytes: telemetry.total_bytes,
             total_disk_bytes: telemetry.total_disk_bytes,
             total_ops: telemetry.total_ops,
-            total_persist: telemetry.total_persist,
+            total_serialize: telemetry.total_serialize,
+            total_wait: telemetry.total_wait,
+            total_flush: telemetry.total_flush,
             total_fold: telemetry.total_fold,
             by_reason: telemetry.by_reason,
             recent: telemetry.recent.iter().cloned().collect(),
@@ -498,7 +504,9 @@ mod tests {
         // reproducible zero, where an `Instant` would report whatever the wall clock did.
         for (label, measured) in [
             ("total", record.duration),
-            ("disk", record.persist),
+            ("serialize", record.serialize),
+            ("wait", record.wait),
+            ("flush", record.flush),
             ("fold", record.fold),
         ] {
             assert_eq!(
@@ -523,14 +531,22 @@ mod tests {
         for record in &stats.recent {
             assert!(record.disk_bytes > 0, "disk_bytes must be non-zero");
             assert!(
-                record.persist > Duration::ZERO,
-                "writing and syncing the batch must be measured"
+                record.serialize > Duration::ZERO,
+                "serializing the batch must be measured"
             );
+            assert_eq!(
+                record.wait,
+                Duration::ZERO,
+                "wait time must be zero for non-coalesced batch"
+            );
+            assert!(record.flush > Duration::ZERO, "flushing the batch must be measured");
             assert!(
-                record.duration >= record.persist + record.fold,
-                "the total must cover both phases: {:?} < {:?} + {:?}",
+                record.duration >= record.serialize + record.wait + record.flush + record.fold,
+                "the total must cover all phases: {:?} < {:?} + {:?} + {:?} + {:?}",
                 record.duration,
-                record.persist,
+                record.serialize,
+                record.wait,
+                record.flush,
                 record.fold
             );
         }
@@ -541,9 +557,19 @@ mod tests {
             "cumulative disk bytes must agree with the history"
         );
         assert_eq!(
-            stats.total_persist,
-            stats.recent.iter().map(|r| r.persist).sum::<Duration>(),
-            "cumulative disk time must agree with the history"
+            stats.total_serialize,
+            stats.recent.iter().map(|r| r.serialize).sum::<Duration>(),
+            "cumulative serialize time must agree with the history"
+        );
+        assert_eq!(
+            stats.total_wait,
+            stats.recent.iter().map(|r| r.wait).sum::<Duration>(),
+            "cumulative wait time must agree with the history"
+        );
+        assert_eq!(
+            stats.total_flush,
+            stats.recent.iter().map(|r| r.flush).sum::<Duration>(),
+            "cumulative flush time must agree with the history"
         );
         assert_eq!(
             stats.total_fold,
@@ -663,8 +689,8 @@ mod tests {
             status
         );
         assert!(
-            status.contains("disk") && status.contains("fold"),
-            "recent flushes must break out disk and fold time: {}",
+            status.contains("serialize") && status.contains("flush") && status.contains("fold"),
+            "recent flushes must break out serialize, flush and fold time: {}",
             status
         );
         assert!(
@@ -676,6 +702,88 @@ mod tests {
             status.contains("inline (runs on the calling thread)"),
             "mode must be reported: {}",
             status
+        );
+    }
+
+    #[test]
+    fn test_coalesce_flush_records_breakdown_serialize_wait_flush_fold() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), storage);
+        fs.log_writer = Some(writer);
+        fs.max_coalesce_batches = 3;
+
+        // Stage batch 1
+        let f1 = crate::operations::read_write::create_core(&fs, 1, "f1.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f1.ino, b"batch 1", 0).unwrap();
+        fs.freeze_now();
+
+        // Stage batch 2
+        let f2 = crate::operations::read_write::create_core(&fs, 1, "f2.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f2.ino, b"batch 2", 0).unwrap();
+        fs.freeze_now();
+
+        // Stage batch 3
+        let f3 = crate::operations::read_write::create_core(&fs, 1, "f3.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f3.ino, b"batch 3", 0).unwrap();
+        fs.freeze_now();
+
+        fs.run_flush_cycle().unwrap();
+
+        let stats = fs.flush_stats();
+        assert_eq!(stats.recent.len(), 3);
+        let b1 = &stats.recent[0];
+        let b2 = &stats.recent[1];
+        let b3 = &stats.recent[2];
+
+        // Every batch has serialize measured
+        assert!(b1.serialize >= Duration::ZERO);
+        assert!(b2.serialize >= Duration::ZERO);
+        assert!(b3.serialize >= Duration::ZERO);
+
+        // Batch 1 and 2 waited while subsequent batches were serialized
+        assert!(b1.wait >= b2.wait);
+        assert!(b2.wait >= b3.wait);
+
+        // Every batch in the coalesced group shares the exact same flush (physical sync) duration
+        assert_eq!(b1.flush, b2.flush);
+        assert_eq!(b2.flush, b3.flush);
+
+        // Totals match sums
+        assert_eq!(
+            stats.total_serialize,
+            stats.recent.iter().map(|r| r.serialize).sum::<Duration>()
+        );
+        assert_eq!(stats.total_wait, stats.recent.iter().map(|r| r.wait).sum::<Duration>());
+        assert_eq!(
+            stats.total_flush,
+            stats.recent.iter().map(|r| r.flush).sum::<Duration>()
+        );
+        assert_eq!(stats.total_fold, stats.recent.iter().map(|r| r.fold).sum::<Duration>());
+
+        // In the non-coalescing case (1 batch), wait time must be strictly Duration::ZERO
+        let f4 = crate::operations::read_write::create_core(&fs, 1, "f4.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f4.ino, b"batch 4", 0).unwrap();
+        fs.freeze_now();
+        fs.run_flush_cycle().unwrap();
+
+        let stats2 = fs.flush_stats();
+        let b4 = stats2.recent.last().unwrap();
+        assert_eq!(
+            b4.wait,
+            Duration::ZERO,
+            "wait time must be strictly zero in the non-coalescing case"
         );
     }
 

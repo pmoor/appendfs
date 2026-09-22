@@ -26,6 +26,8 @@ struct PendingBatch {
     disk_bytes: u64,
     started_at: SystemTime,
     started_monotonic: Duration,
+    serialize_duration: Duration,
+    serialize_end: Duration,
 }
 
 impl InMemoryFS {
@@ -412,11 +414,11 @@ impl InMemoryFS {
                     // If any prior batches in this coalesced group succeeded, attempt to flush and
                     // complete them so work already durably staged is not lost or duplicated.
                     if !coalesced.is_empty() {
-                        let persist_start = self.clock.monotonic();
+                        let sync_start = self.clock.monotonic();
                         if writer.flush().is_ok() {
                             let fold_start = self.clock.monotonic();
-                            let persist_duration = fold_start.saturating_sub(persist_start);
-                            self.complete_coalesced_group(coalesced, persist_duration, fold_start);
+                            let flush_duration = fold_start.saturating_sub(sync_start);
+                            self.complete_coalesced_group(coalesced, sync_start, flush_duration, fold_start);
                         } else {
                             // Syncing the successful prefix also failed; roll back everything to the group start.
                             let _ = writer.rollback_to(&group_checkpoint);
@@ -427,6 +429,8 @@ impl InMemoryFS {
                     return Err(err);
                 }
             };
+            let serialize_end = self.clock.monotonic();
+            let serialize_duration = serialize_end.saturating_sub(started_monotonic);
             coalesced.push(PendingBatch {
                 batch,
                 entries,
@@ -434,28 +438,37 @@ impl InMemoryFS {
                 disk_bytes,
                 started_at,
                 started_monotonic,
+                serialize_duration,
+                serialize_end,
             });
         }
 
-        let persist_start = self.clock.monotonic();
+        let sync_start = self.clock.monotonic();
         if let Err(e) = writer.flush() {
             let _ = writer.rollback_to(&group_checkpoint);
             return Err(e);
         }
         let fold_start = self.clock.monotonic();
-        let persist_duration = fold_start.saturating_sub(persist_start);
+        let flush_duration = fold_start.saturating_sub(sync_start);
 
-        self.complete_coalesced_group(coalesced, persist_duration, fold_start);
+        self.complete_coalesced_group(coalesced, sync_start, flush_duration, fold_start);
         Ok(())
     }
 
     /// Folds a durable group of batches into `base` and completes pending batch promises.
-    fn complete_coalesced_group(&self, coalesced: Vec<PendingBatch>, persist_duration: Duration, fold_start: Duration) {
-        if coalesced.len() > 1 {
+    fn complete_coalesced_group(
+        &self,
+        coalesced: Vec<PendingBatch>,
+        sync_start: Duration,
+        flush_duration: Duration,
+        fold_start: Duration,
+    ) {
+        let is_coalesced = coalesced.len() > 1;
+        if is_coalesced {
             log::debug!(
                 "Coalesced {} flush batches into single on-disk sync ({:?})",
                 coalesced.len(),
-                persist_duration
+                flush_duration
             );
         }
         let fold_records = {
@@ -466,7 +479,19 @@ impl InMemoryFS {
                     .fetch_add(p.flushed_data_bytes, Ordering::SeqCst);
                 let popped = inner.pop_flushed_batch(p.batch.id);
                 inner.fold_entries(p.entries);
-                records.push((popped, p.disk_bytes, p.started_at, p.started_monotonic));
+                let wait_duration = if is_coalesced {
+                    sync_start.saturating_sub(p.serialize_end)
+                } else {
+                    Duration::ZERO
+                };
+                records.push((
+                    popped,
+                    p.disk_bytes,
+                    p.started_at,
+                    p.started_monotonic,
+                    p.serialize_duration,
+                    wait_duration,
+                ));
             }
             self.sync_pushback_saturation(&inner);
             records
@@ -475,7 +500,7 @@ impl InMemoryFS {
         let finished = self.clock.monotonic();
         let fold_duration = finished.saturating_sub(fold_start);
 
-        for (popped, disk_bytes, started_at, started_monotonic) in fold_records {
+        for (popped, disk_bytes, started_at, started_monotonic, serialize, wait) in fold_records {
             self.delayed_queue.notify_capacity();
             let record = super::FlushRecord {
                 id: popped.id,
@@ -484,19 +509,23 @@ impl InMemoryFS {
                 disk_bytes,
                 ops: popped.ops,
                 started_at,
-                persist: persist_duration,
+                serialize,
+                wait,
+                flush: flush_duration,
                 fold: fold_duration,
                 duration: finished.saturating_sub(started_monotonic),
             };
             log::debug!(
-                "Flushed batch {} ({}): {} staged bytes ({} on disk), {} ops in {:?} ({:?} disk, {:?} fold)",
+                "Flushed batch {} ({}): {} staged bytes ({} on disk), {} ops in {:?} ({:?} serialize, {:?} wait, {:?} flush, {:?} fold)",
                 record.id,
                 record.reason,
                 record.bytes,
                 record.disk_bytes,
                 record.ops,
                 record.duration,
-                record.persist,
+                record.serialize,
+                record.wait,
+                record.flush,
                 record.fold
             );
             self.flusher.record_flush(record);

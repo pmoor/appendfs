@@ -351,16 +351,17 @@ pub struct FlushRecord {
     pub ops: usize,
     /// When the flusher picked the batch up.
     pub started_at: SystemTime,
-    /// Time spent writing the batch's records to the log and syncing the file.
-    ///
-    /// Separated from `fold` because the two say different things when the flusher falls
-    /// behind: this one is the storage device, `fold` is contention on the inner lock and
-    /// the cost of applying deltas to `base`.
-    pub persist: Duration,
+    /// Time spent synthesizing and appending the batch's records to the log writer.
+    pub serialize: Duration,
+    /// Time from the end of serializing this batch to the beginning of physical disk sync.
+    /// In the non-coalescing case, this is `Duration::ZERO`.
+    pub wait: Duration,
+    /// Time spent physically syncing the log file to disk (`writer.flush()`).
+    /// Identical for every batch within a coalesced group.
+    pub flush: Duration,
     /// Time spent popping the batch and applying its deltas to `base`.
     pub fold: Duration,
-    /// Total, end to end. Exceeds `persist + fold` by whatever the freeze and queue check
-    /// at the head of the cycle cost.
+    /// Total, end to end.
     pub duration: Duration,
 }
 
@@ -379,9 +380,13 @@ pub struct FlushStats {
     pub total_disk_bytes: u64,
     /// Mutating operations flushed since mount.
     pub total_ops: u64,
-    /// Cumulative time spent writing and syncing batches since mount.
-    pub total_persist: Duration,
-    /// Cumulative time spent folding batches into `base` since mount.
+    /// Cumulative duration spent serializing records into the log writer since mount.
+    pub total_serialize: Duration,
+    /// Cumulative duration spent waiting for coalesced batches to sync since mount.
+    pub total_wait: Duration,
+    /// Cumulative duration spent physically syncing the log file to disk since mount.
+    pub total_flush: Duration,
+    /// Cumulative duration of the delta folding phase since mount.
     pub total_fold: Duration,
     /// Batches completed per reason, indexed by [`FlushReason::index`].
     pub by_reason: [u64; 5],
