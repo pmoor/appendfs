@@ -723,7 +723,7 @@ mod tests {
                 storage.clone(),
                 1,
                 &*clock,
-                100, // Small max_log_size to trigger roll
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
                 1,
                 VolumeKey::plaintext_arc(),
             )

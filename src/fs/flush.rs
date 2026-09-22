@@ -354,13 +354,13 @@ impl InMemoryFS {
                             if !list.is_empty()
                                 && (list.len() >= self.max_coalesce_batches
                                     || b.bytes > self.small_batch_max_bytes
-                                    || cumulative_bytes.saturating_add(b.bytes) > self.max_coalesce_bytes
-                                    || cumulative_ops.saturating_add(b.ops) > self.max_coalesce_ops)
+                                    || cumulative_bytes + b.bytes > self.max_coalesce_bytes
+                                    || cumulative_ops + b.ops > self.max_coalesce_ops)
                             {
                                 break;
                             }
-                            cumulative_bytes = cumulative_bytes.saturating_add(b.bytes);
-                            cumulative_ops = cumulative_ops.saturating_add(b.ops);
+                            cumulative_bytes += b.bytes;
+                            cumulative_ops += b.ops;
 
                             let mut entries = b.entries.clone();
                             inner.normalize_directory_deltas(&mut entries, idx);
@@ -374,11 +374,19 @@ impl InMemoryFS {
                     break;
                 }
 
-                // If the active log already exceeded max_log_size from prior flushes, roll now.
-                let rolled = writer.roll_if_needed(&*self.clock)?;
-                self.apply_roll(rolled, writer);
+                // Lazily open the active log file using the injected clock if unopened.
+                writer.open_if_unopened(&*self.clock)?;
 
                 self.flush_coalesced_group(writer, candidates)?;
+
+                // If the active log exceeded max_log_size, roll after flushing (unless shutting down).
+                // Doing this after the flush ensures batch waiters do not pay the latency of
+                // log rolling and summary generation before their writes are committed and unblocked.
+                let is_running = self.with_inner(OpTag::Other, |inner| inner.shutdown_state == ShutdownState::Running);
+                if is_running {
+                    let rolled = writer.roll_if_needed(&*self.clock)?;
+                    self.apply_roll(rolled, writer);
+                }
             }
 
             // Age-based rolling. The size check only ever ran ahead of a batch, so on an idle
@@ -386,8 +394,11 @@ impl InMemoryFS {
             // means the inactivity tick seals the generation with nothing left to write.
             // On rollover, `roll_if_aged` leaves the successor generation lazy (unopened) so
             // that an idle filesystem does not waste empty log files during prolonged inactivity.
-            let rolled = writer.roll_if_aged(&*self.clock)?;
-            self.apply_roll(rolled, writer);
+            let is_running = self.with_inner(OpTag::Other, |inner| inner.shutdown_state == ShutdownState::Running);
+            if is_running {
+                let rolled = writer.roll_if_aged(&*self.clock)?;
+                self.apply_roll(rolled, writer);
+            }
             Ok(())
         })
     }
@@ -402,67 +413,61 @@ impl InMemoryFS {
         let group_checkpoint = writer.checkpoint();
 
         let mut coalesced: Vec<PendingBatch> = Vec::with_capacity(candidates.len());
+        let mut serialize_err = None;
+
         for (batch, mut entries) in candidates {
             let started_at = self.clock.now();
             let started_monotonic = self.clock.monotonic();
-            let (flushed_data_bytes, disk_bytes) = match self.synthesize_and_write_flushing_layer(&mut entries, writer)
-            {
-                Ok(res) => res,
-                Err(err) => {
-                    // One batch failed during synthesis/append. Its partial write was already
-                    // rolled back to its batch start checkpoint by synthesize_and_write_flushing_layer.
-                    // If any prior batches in this coalesced group succeeded, attempt to flush and
-                    // complete them so work already durably staged is not lost or duplicated.
-                    if !coalesced.is_empty() {
-                        let sync_start = self.clock.monotonic();
-                        if writer.flush().is_ok() {
-                            let fold_start = self.clock.monotonic();
-                            let flush_duration = fold_start.saturating_sub(sync_start);
-                            self.complete_coalesced_group(coalesced, sync_start, flush_duration, fold_start);
-                        } else {
-                            // Syncing the successful prefix also failed; roll back everything to the group start.
-                            let _ = writer.rollback_to(&group_checkpoint);
-                        }
-                    } else {
-                        let _ = writer.rollback_to(&group_checkpoint);
-                    }
-                    return Err(err);
+            match self.synthesize_and_write_flushing_layer(&mut entries, writer) {
+                Ok((flushed_data_bytes, disk_bytes)) => {
+                    let serialize_end = self.clock.monotonic();
+                    let serialize_duration = serialize_end.saturating_sub(started_monotonic);
+                    coalesced.push(PendingBatch {
+                        batch,
+                        entries,
+                        flushed_data_bytes,
+                        disk_bytes,
+                        started_at,
+                        started_monotonic,
+                        serialize_duration,
+                        serialize_end,
+                    });
                 }
-            };
-            let serialize_end = self.clock.monotonic();
-            let serialize_duration = serialize_end.saturating_sub(started_monotonic);
-            coalesced.push(PendingBatch {
-                batch,
-                entries,
-                flushed_data_bytes,
-                disk_bytes,
-                started_at,
-                started_monotonic,
-                serialize_duration,
-                serialize_end,
-            });
+                Err(err) => {
+                    // Batch write failed; its partial write was already rolled back to its
+                    // batch start checkpoint by synthesize_and_write_flushing_layer.
+                    // Break out so any preceding successfully serialized batches can be synced
+                    // and completed as a durable prefix without duplicating records on retry.
+                    serialize_err = Some(err);
+                    break;
+                }
+            }
+        }
+
+        if coalesced.is_empty() {
+            let _ = writer.rollback_to(&group_checkpoint);
+            return Err(serialize_err.unwrap());
         }
 
         let sync_start = self.clock.monotonic();
         if let Err(e) = writer.flush() {
+            // Physical sync failed; roll back everything to the group start.
             let _ = writer.rollback_to(&group_checkpoint);
-            return Err(e);
+            return Err(serialize_err.unwrap_or(e));
         }
         let fold_start = self.clock.monotonic();
         let flush_duration = fold_start.saturating_sub(sync_start);
 
-        self.complete_coalesced_group(coalesced, sync_start, flush_duration, fold_start);
+        self.complete_coalesced_group(coalesced, sync_start, flush_duration);
+
+        if let Some(err) = serialize_err {
+            return Err(err);
+        }
         Ok(())
     }
 
     /// Folds a durable group of batches into `base` and completes pending batch promises.
-    fn complete_coalesced_group(
-        &self,
-        coalesced: Vec<PendingBatch>,
-        sync_start: Duration,
-        flush_duration: Duration,
-        fold_start: Duration,
-    ) {
+    fn complete_coalesced_group(&self, coalesced: Vec<PendingBatch>, sync_start: Duration, flush_duration: Duration) {
         let is_coalesced = coalesced.len() > 1;
         if is_coalesced {
             log::debug!(
@@ -471,14 +476,25 @@ impl InMemoryFS {
                 flush_duration
             );
         }
+
+        // Notify batch waiters immediately once physical disk sync succeeds.
+        // Waiters do not need to wait for folding into base to unblock.
+        for p in &coalesced {
+            p.batch.completion.complete(Ok(()));
+        }
+
         let fold_records = {
             let mut inner = self.inner.lock(OpTag::Fold).unwrap();
             let mut records = Vec::with_capacity(coalesced.len());
             for p in coalesced {
                 self.bytes_since_last_summary
                     .fetch_add(p.flushed_data_bytes, Ordering::SeqCst);
+                let batch_fold_start = self.clock.monotonic();
                 let popped = inner.pop_flushed_batch(p.batch.id);
                 inner.fold_entries(p.entries);
+                let batch_fold_end = self.clock.monotonic();
+                let fold_duration = batch_fold_end.saturating_sub(batch_fold_start);
+
                 let wait_duration = if is_coalesced {
                     sync_start.saturating_sub(p.serialize_end)
                 } else {
@@ -491,6 +507,7 @@ impl InMemoryFS {
                     p.started_monotonic,
                     p.serialize_duration,
                     wait_duration,
+                    fold_duration,
                 ));
             }
             self.sync_pushback_saturation(&inner);
@@ -498,9 +515,8 @@ impl InMemoryFS {
         };
 
         let finished = self.clock.monotonic();
-        let fold_duration = finished.saturating_sub(fold_start);
 
-        for (popped, disk_bytes, started_at, started_monotonic, serialize, wait) in fold_records {
+        for (popped, disk_bytes, started_at, started_monotonic, serialize, wait, fold) in fold_records {
             self.delayed_queue.notify_capacity();
             let record = super::FlushRecord {
                 id: popped.id,
@@ -512,7 +528,7 @@ impl InMemoryFS {
                 serialize,
                 wait,
                 flush: flush_duration,
-                fold: fold_duration,
+                fold,
                 duration: finished.saturating_sub(started_monotonic),
             };
             log::debug!(
@@ -529,7 +545,6 @@ impl InMemoryFS {
                 record.fold
             );
             self.flusher.record_flush(record);
-            popped.completion.complete(Ok(()));
         }
     }
 
@@ -1744,16 +1759,15 @@ mod tests {
         // 1. First batch: write data to file1 and flush (populates gen 1 past header size)
         let f1 = crate::operations::read_write::create_core(&fs, 1, "file1.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f1.ino, b"initial payload", 0).unwrap();
-        fs.quiesce().unwrap();
+        // Inject permission error on opening 000002.log to simulate I/O failure when rolling
+        fault_storage.fail_on_file("000002.log", std::io::ErrorKind::PermissionDenied);
+        let _ = fs.quiesce();
 
         // 2. Second batch: write data to file2
         let f2 = crate::operations::read_write::create_core(&fs, 1, "file2.txt", 0o644, 0, 1000, 1000).unwrap();
         crate::operations::read_write::write_core(&fs, f2.ino, b"second payload", 0).unwrap();
 
-        // 3. Inject permission error on opening 000002.log to simulate I/O failure when rolling
-        fault_storage.fail_on_file("000002.log", std::io::ErrorKind::PermissionDenied);
-
-        // 4. Attempt flush - should fail with I/O error on roll creation
+        // 3. Attempt flush - should fail with I/O error on roll creation
         let flush_res = fs.quiesce();
         assert!(flush_res.is_err(), "Expected flush_log to fail on simulated I/O error");
 
@@ -3014,5 +3028,67 @@ mod tests {
         assert!(recovered.lookup_child(1, "f1.txt").is_some());
         assert!(recovered.lookup_child(1, "f2.txt").is_some());
         assert!(recovered.lookup_child(1, "f3.txt").is_some());
+    }
+
+    #[test]
+    fn test_coalesce_batch_waiters_notified_on_sync_before_fold() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::MemoryStorage::new());
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_storage(clock, storage);
+        fs.log_writer = Some(writer);
+        fs.max_coalesce_batches = 2;
+        let fs = Arc::new(fs);
+
+        let f1 = crate::operations::read_write::create_core(&fs, 1, "test.bin", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f1.ino, b"hello world", 0).unwrap();
+        fs.freeze_now();
+
+        // Retrieve the frozen batch's completion handle
+        let completion = {
+            let inner = fs.inner.lock_for_tests().unwrap();
+            inner.flushing.front().unwrap().completion.clone()
+        };
+
+        // Attach callback that verifies batch is still in flushing and not yet folded into base
+        let callback_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_ran_clone = callback_ran.clone();
+        let fs_clone = fs.clone();
+        let test_ino = f1.ino;
+        completion.add_callback(Box::new(move |res| {
+            assert!(res.is_ok());
+            callback_ran_clone.store(true, Ordering::SeqCst);
+            let inner = fs_clone.inner.lock_for_tests().unwrap();
+            // Waiter is notified right after physical disk sync:
+            // 1. The batch has NOT yet been popped from flushing
+            assert_eq!(inner.flushing.len(), 1);
+            // 2. The new file has NOT yet been folded into base
+            assert!(
+                !inner.base.contains_key(&test_ino),
+                "base must not have folded the inode yet"
+            );
+        }));
+
+        assert!(!callback_ran.load(Ordering::SeqCst));
+        fs.run_flush_cycle().unwrap();
+        assert!(callback_ran.load(Ordering::SeqCst));
+
+        // After run_flush_cycle completes, base has the folded file and flushing is empty
+        let inner = fs.inner.lock_for_tests().unwrap();
+        assert_eq!(inner.flushing.len(), 0);
+        assert!(
+            inner.base.contains_key(&f1.ino),
+            "base must now contain the folded inode"
+        );
     }
 }

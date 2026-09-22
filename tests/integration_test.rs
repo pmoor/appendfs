@@ -3336,7 +3336,7 @@ fn test_recovered_fs_restores_generation_counter_and_emits_early_summary() {
         "000004.summary must be emitted because recovered gens (2) + gen 4 (1) = 3 >= 3"
     );
     assert_eq!(recovered_fs.last_summary_generation.load(Ordering::SeqCst), 4);
-    assert_eq!(recovered_fs.generations_since_last_summary.load(Ordering::SeqCst), 0);
+    assert_eq!(recovered_fs.generations_since_last_summary.load(Ordering::SeqCst), 1); // 1 from f5.bin rolling gen 5
 
     drop(recovered_fs);
 }

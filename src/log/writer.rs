@@ -405,6 +405,23 @@ impl LogWriter {
         }
     }
 
+    /// Ensures that the active log file is open. If it is currently lazy/unopened,
+    /// opens it using the provided clock.
+    pub fn open_if_unopened(&self, clock: &dyn Clock) -> io::Result<()> {
+        let mut state = match self.active_state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+
+        if let ActiveLogState::Unopened { generation, created_at } = *state {
+            let c_time = created_at.unwrap_or_else(|| clock.now());
+            let active_file = open_generation_file(&self.storage, generation, c_time)?;
+            *state = ActiveLogState::Open(active_file);
+            log::info!("Lazily opened log file for generation {}", generation);
+        }
+        Ok(())
+    }
+
     /// Rolls the active generation if it has been open longer than `max_log_age`, ignoring
     /// its size, putting the writer into lazy mode so the new generation file is not opened
     /// until the next write.
