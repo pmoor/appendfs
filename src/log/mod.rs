@@ -26,4 +26,4 @@ pub use summary::{
     SummaryFooter, SummaryHeader, SummaryReader, SummarySnapshot, export_summary, init_volume, init_volume_with_clock,
     init_volume_with_clock_and_uids, summary_filename, summary_filename_with_revision,
 };
-pub use writer::LogWriter;
+pub use writer::{LogCheckpoint, LogWriter};

@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime};
 struct PendingBatch {
     batch: Arc<super::FlushBatch>,
     entries: HashMap<u64, EntryDelta>,
+    flushed_data_bytes: u64,
     disk_bytes: u64,
     started_at: SystemTime,
     started_monotonic: Duration,
@@ -215,15 +216,13 @@ impl InMemoryFS {
         &self,
         frozen: &mut HashMap<u64, EntryDelta>,
         writer: &LogWriter,
-    ) -> std::io::Result<u64> {
+    ) -> std::io::Result<(u64, u64)> {
         debug_assert!(self.flusher.in_cycle(), "only the flusher may write batches to the log");
         // Clamped because extent lengths are u32, and because a zero would make the
         // chunking loop below never advance.
         let max_extent_size = self.max_extent_size.clamp(1, u32::MAX as usize);
 
-        let batch_gen = writer.generation();
-        let batch_start_offset = writer.current_offset();
-        writer.checkpoint_batch_start();
+        let batch_checkpoint = writer.checkpoint();
 
         let write_res = (|| -> std::io::Result<(u64, u64)> {
             let mut written_count = 0u32;
@@ -312,22 +311,17 @@ impl InMemoryFS {
             writer.emit_flush_commit(written_count, flushed_data_bytes, &*self.clock)?;
 
             let active_offset = writer.current_offset();
-            let disk_bytes = active_offset.saturating_sub(batch_start_offset);
+            let disk_bytes = active_offset.saturating_sub(batch_checkpoint.offset);
             Ok((flushed_data_bytes, disk_bytes))
         })();
 
-        let (flushed_data_bytes, disk_bytes) = match write_res {
-            Ok(res) => res,
+        match write_res {
+            Ok(res) => Ok(res),
             Err(e) => {
-                let _ = writer.rollback_to(batch_gen, batch_start_offset);
-                return Err(e);
+                let _ = writer.rollback_to(&batch_checkpoint);
+                Err(e)
             }
-        };
-
-        self.bytes_since_last_summary
-            .fetch_add(flushed_data_bytes, Ordering::SeqCst);
-
-        Ok(disk_bytes)
+        }
     }
 
     /// Writes every queued flush batch to the log and folds it into `base`.
@@ -403,24 +397,40 @@ impl InMemoryFS {
         writer: &LogWriter,
         candidates: Vec<(Arc<super::FlushBatch>, HashMap<u64, EntryDelta>)>,
     ) -> std::io::Result<()> {
-        let group_start_gen = writer.generation();
-        let group_start_offset = writer.current_offset();
-        writer.checkpoint_batch_start();
+        let group_checkpoint = writer.checkpoint();
 
         let mut coalesced: Vec<PendingBatch> = Vec::with_capacity(candidates.len());
         for (batch, mut entries) in candidates {
             let started_at = self.clock.now();
             let started_monotonic = self.clock.monotonic();
-            let disk_bytes = match self.synthesize_and_write_flushing_layer(&mut entries, writer) {
-                Ok(db) => db,
-                Err(e) => {
-                    let _ = writer.rollback_to(group_start_gen, group_start_offset);
-                    return Err(e);
+            let (flushed_data_bytes, disk_bytes) = match self.synthesize_and_write_flushing_layer(&mut entries, writer)
+            {
+                Ok(res) => res,
+                Err(err) => {
+                    // One batch failed during synthesis/append. Its partial write was already
+                    // rolled back to its batch start checkpoint by synthesize_and_write_flushing_layer.
+                    // If any prior batches in this coalesced group succeeded, attempt to flush and
+                    // complete them so work already durably staged is not lost or duplicated.
+                    if !coalesced.is_empty() {
+                        let persist_start = self.clock.monotonic();
+                        if writer.flush().is_ok() {
+                            let fold_start = self.clock.monotonic();
+                            let persist_duration = fold_start.saturating_sub(persist_start);
+                            self.complete_coalesced_group(coalesced, persist_duration, fold_start);
+                        } else {
+                            // Syncing the successful prefix also failed; roll back everything to the group start.
+                            let _ = writer.rollback_to(&group_checkpoint);
+                        }
+                    } else {
+                        let _ = writer.rollback_to(&group_checkpoint);
+                    }
+                    return Err(err);
                 }
             };
             coalesced.push(PendingBatch {
                 batch,
                 entries,
+                flushed_data_bytes,
                 disk_bytes,
                 started_at,
                 started_monotonic,
@@ -429,7 +439,7 @@ impl InMemoryFS {
 
         let persist_start = self.clock.monotonic();
         if let Err(e) = writer.flush() {
-            let _ = writer.rollback_to(group_start_gen, group_start_offset);
+            let _ = writer.rollback_to(&group_checkpoint);
             return Err(e);
         }
         let fold_start = self.clock.monotonic();
@@ -452,6 +462,8 @@ impl InMemoryFS {
             let mut inner = self.inner.lock(OpTag::Fold).unwrap();
             let mut records = Vec::with_capacity(coalesced.len());
             for p in coalesced {
+                self.bytes_since_last_summary
+                    .fetch_add(p.flushed_data_bytes, Ordering::SeqCst);
                 let popped = inner.pop_flushed_batch(p.batch.id);
                 inner.fold_entries(p.entries);
                 records.push((popped, p.disk_bytes, p.started_at, p.started_monotonic));
@@ -2790,6 +2802,180 @@ mod tests {
         // Recovery check
         let recovered = crate::log::recovery::recover_fs(
             storage,
+            crate::log::recovery::RecoveryTarget::Latest,
+            clock,
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        assert!(recovered.lookup_child(1, "f1.txt").is_some());
+        assert!(recovered.lookup_child(1, "f2.txt").is_some());
+        assert!(recovered.lookup_child(1, "f3.txt").is_some());
+    }
+
+    #[test]
+    fn test_coalesce_flush_batches_group_sync_failure_full_rollback() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let fault_storage = Arc::new(crate::storage::FaultStorage::new(mem_storage.clone()));
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                fault_storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let initial_offset = writer.current_offset();
+        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), fault_storage.clone());
+        fs.log_writer = Some(writer);
+        fs.max_coalesce_batches = 3;
+
+        // Stage 3 batches manually
+        let f1 = crate::operations::read_write::create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f1.ino, b"batch 1 data", 0).unwrap();
+        fs.freeze_now();
+
+        let f2 = crate::operations::read_write::create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f2.ino, b"batch 2 data", 0).unwrap();
+        fs.freeze_now();
+
+        let f3 = crate::operations::read_write::create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f3.ino, b"batch 3 data", 0).unwrap();
+        fs.freeze_now();
+
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 3);
+
+        // Fail writer.flush() on group sync
+        fault_storage.fail_syncs(true);
+        let err = fs.run_flush_cycle().unwrap_err();
+        assert_eq!(err.to_string(), "simulated sync failure");
+
+        // The entire coalesced group must be rolled back:
+        // 1. All 3 batches must still remain in the flushing queue
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 3);
+        // 2. Active log file must be truncated back to initial_offset
+        assert_eq!(fs.log_writer.as_ref().unwrap().current_offset(), initial_offset);
+        // 3. Batch ID counter must be restored
+        assert_eq!(fs.log_writer.as_ref().unwrap().last_batch_id(), 0);
+
+        // Clear fault and retry flush
+        fault_storage.fail_syncs(false);
+        fs.run_flush_cycle().unwrap();
+
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 0);
+        assert_eq!(fs.log_writer.as_ref().unwrap().last_batch_id(), 3);
+
+        // Verify log contains exactly 3 FlushCommit markers without duplicates
+        let records: Vec<_> = crate::log::LogReader::open(
+            mem_storage.as_ref(),
+            "000001.log",
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+        let flush_commits: Vec<_> = records
+            .iter()
+            .filter(|r| r.header.op_code == OpCode::FlushCommit)
+            .collect();
+        assert_eq!(flush_commits.len(), 3);
+
+        // Verify recovery restores all 3 files
+        let recovered = crate::log::recovery::recover_fs(
+            mem_storage,
+            crate::log::recovery::RecoveryTarget::Latest,
+            clock,
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap();
+
+        assert!(recovered.lookup_child(1, "f1.txt").is_some());
+        assert!(recovered.lookup_child(1, "f2.txt").is_some());
+        assert!(recovered.lookup_child(1, "f3.txt").is_some());
+    }
+
+    #[test]
+    fn test_coalesce_flush_batches_partial_failure_prefix_commit_and_retry() {
+        let mem_storage = Arc::new(crate::storage::MemoryStorage::new());
+        let fault_storage = Arc::new(crate::storage::FaultStorage::new(mem_storage.clone()));
+        let clock = Arc::new(SystemClock);
+        let writer = Arc::new(
+            LogWriter::create(
+                fault_storage.clone(),
+                1,
+                &*clock,
+                crate::cli::DEFAULT_MAX_LOG_SIZE,
+                1,
+                crate::crypto::VolumeKey::plaintext_arc(),
+            )
+            .unwrap(),
+        );
+        let mut fs = InMemoryFS::with_clock_and_storage(clock.clone(), fault_storage.clone());
+        fs.log_writer = Some(writer);
+        fs.max_coalesce_batches = 3;
+
+        // Stage 3 batches manually
+        let f1 = crate::operations::read_write::create_core(&fs, 1, "f1.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f1.ino, b"batch 1 data", 0).unwrap();
+        fs.freeze_now();
+
+        let f2 = crate::operations::read_write::create_core(&fs, 1, "f2.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f2.ino, b"batch 2 data", 0).unwrap();
+        fs.freeze_now();
+
+        let f3 = crate::operations::read_write::create_core(&fs, 1, "f3.txt", 0o644, 0, 1000, 1000).unwrap();
+        crate::operations::read_write::write_core(&fs, f3.ino, &vec![0x42; 70 * 1024], 0).unwrap();
+        fs.freeze_now();
+
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 3);
+
+        // Batches 1 and 2 write small records (~600 bytes total), which fits easily under 5000 bytes.
+        // Batch 3 writes 70 KiB, exceeding the 64 KiB buffered writer capacity and pushing total
+        // bytes well beyond the 5000 byte limit. This triggers an append failure specifically in batch 3.
+        fault_storage.fail_writes_after_bytes(5000, false);
+
+        let res = fs.run_flush_cycle();
+        assert!(res.is_err(), "cycle should report error from failed batch 3");
+
+        // Batches 1 and 2 should have been committed as a durable prefix, popped from flushing,
+        // and folded into base. Only batch 3 remains in flushing.
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 1);
+        assert_eq!(fs.log_writer.as_ref().unwrap().last_batch_id(), 2);
+        assert!(fs.lookup_child(1, "f1.txt").is_some());
+        assert!(fs.lookup_child(1, "f2.txt").is_some());
+
+        // Clear faults and retry flush cycle
+        fault_storage.clear_write_limit();
+        fs.run_flush_cycle().unwrap();
+
+        assert_eq!(fs.inner.lock_for_tests().unwrap().flushing.len(), 0);
+        assert_eq!(fs.log_writer.as_ref().unwrap().last_batch_id(), 3);
+        assert!(fs.lookup_child(1, "f3.txt").is_some());
+
+        // Verify log contains exactly 3 FlushCommit markers with sequential IDs 1, 2, 3
+        let records: Vec<_> = crate::log::LogReader::open(
+            mem_storage.as_ref(),
+            "000001.log",
+            crate::crypto::VolumeKey::plaintext_arc(),
+        )
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+        let flush_commits: Vec<_> = records
+            .iter()
+            .filter(|r| r.header.op_code == OpCode::FlushCommit)
+            .collect();
+        assert_eq!(flush_commits.len(), 3);
+
+        // Verify recovery restores all 3 files
+        let recovered = crate::log::recovery::recover_fs(
+            mem_storage,
             crate::log::recovery::RecoveryTarget::Latest,
             clock,
             crate::crypto::VolumeKey::plaintext_arc(),

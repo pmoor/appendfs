@@ -10,6 +10,7 @@ pub struct FaultStorage {
     inner: Arc<dyn Storage>,
     max_append_bytes: Arc<AtomicU64>,
     write_partial_on_fail: Arc<AtomicBool>,
+    fail_sync: Arc<AtomicBool>,
     fail_on_open: Arc<RwLock<HashMap<String, io::ErrorKind>>>,
     bitflips: Arc<RwLock<Vec<(String, u64, u8)>>>,
 }
@@ -20,9 +21,15 @@ impl FaultStorage {
             inner,
             max_append_bytes: Arc::new(AtomicU64::new(0)),
             write_partial_on_fail: Arc::new(AtomicBool::new(false)),
+            fail_sync: Arc::new(AtomicBool::new(false)),
             fail_on_open: Arc::new(RwLock::new(HashMap::new())),
             bitflips: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Sets whether `sync` should fail with simulated I/O error.
+    pub fn fail_syncs(&self, fail: bool) {
+        self.fail_sync.store(fail, Ordering::SeqCst);
     }
 
     /// Sets a byte threshold after which `append` will fail with simulated ENOSPC / EFBIG.
@@ -53,6 +60,7 @@ impl FaultStorage {
     /// Clears all injected faults (write limits, open errors, bitflips).
     pub fn clear_all_faults(&self) {
         self.clear_write_limit();
+        self.fail_sync.store(false, Ordering::SeqCst);
         self.fail_on_open.write().unwrap().clear();
         self.bitflips.write().unwrap().clear();
     }
@@ -99,6 +107,7 @@ pub struct FaultStorageWriter {
     inner: Box<dyn StorageWriter>,
     max_append_bytes: Arc<AtomicU64>,
     write_partial_on_fail: Arc<AtomicBool>,
+    fail_sync: Arc<AtomicBool>,
 }
 
 impl StorageWriter for FaultStorageWriter {
@@ -122,6 +131,9 @@ impl StorageWriter for FaultStorageWriter {
     }
 
     fn sync(&mut self) -> io::Result<()> {
+        if self.fail_sync.load(Ordering::SeqCst) {
+            return Err(io::Error::other("simulated sync failure"));
+        }
         self.inner.sync()
     }
 
@@ -168,6 +180,7 @@ impl Storage for FaultStorage {
             inner: writer,
             max_append_bytes: Arc::clone(&self.max_append_bytes),
             write_partial_on_fail: Arc::clone(&self.write_partial_on_fail),
+            fail_sync: Arc::clone(&self.fail_sync),
         }))
     }
 

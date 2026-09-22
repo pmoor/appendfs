@@ -17,9 +17,6 @@ struct ActiveLogFile {
     record_count: u32,
     total_data_bytes: u64,
     md5_hasher: md5::Context,
-    batch_checkpoint_hasher: Option<md5::Context>,
-    batch_checkpoint_record_count: u32,
-    batch_checkpoint_data_bytes: u64,
 }
 
 impl ActiveLogFile {
@@ -176,19 +173,38 @@ fn open_generation_file(
         record_count: 0,
         total_data_bytes: 0,
         md5_hasher,
-        batch_checkpoint_hasher: None,
-        batch_checkpoint_record_count: 0,
-        batch_checkpoint_data_bytes: 0,
     })
 }
 
 use crate::crypto::VolumeKey;
 
+/// Point-in-time snapshot of [`LogWriter`] state for atomic rollback on write failures.
+#[derive(Clone)]
+pub struct LogCheckpoint {
+    pub generation: u64,
+    pub offset: u64,
+    pub batch_id: u64,
+    hasher: Option<md5::Context>,
+    record_count: u32,
+    total_data_bytes: u64,
+}
+
+impl std::fmt::Debug for LogCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogCheckpoint")
+            .field("generation", &self.generation)
+            .field("offset", &self.offset)
+            .field("batch_id", &self.batch_id)
+            .field("record_count", &self.record_count)
+            .field("total_data_bytes", &self.total_data_bytes)
+            .finish()
+    }
+}
+
 /// Active log writer managing append-only writes to generation log files with automatic rolling.
 pub struct LogWriter {
     active_state: Mutex<ActiveLogState>,
     batch_id: AtomicU64,
-    batch_checkpoint_batch_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
     max_log_age: Option<std::time::Duration>,
@@ -225,7 +241,6 @@ impl LogWriter {
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Open(active_file)),
             batch_id: AtomicU64::new(start_batch_id),
-            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -251,7 +266,6 @@ impl LogWriter {
                 created_at: None,
             }),
             batch_id: AtomicU64::new(start_batch_id),
-            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -278,7 +292,6 @@ impl LogWriter {
                 created_at: Some(clock.now()),
             }),
             batch_id: AtomicU64::new(start_batch_id),
-            batch_checkpoint_batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
             max_log_age: None,
@@ -532,18 +545,31 @@ impl LogWriter {
         Ok(Some(sealed_info))
     }
 
-    /// Checkpoints the running MD5 hasher, counters, and batch_id at the beginning of a flush batch for rollback safety.
-    pub fn checkpoint_batch_start(&self) {
-        self.batch_checkpoint_batch_id
-            .store(self.batch_id.load(Ordering::SeqCst), Ordering::SeqCst);
-        let mut state = match self.active_state.lock() {
+    /// Captures a point-in-time snapshot of the log writer state (generation, offset,
+    /// batch_id, record counters, and MD5 hasher) that can be restored via [`LogWriter::rollback_to`].
+    pub fn checkpoint(&self) -> LogCheckpoint {
+        let batch_id = self.batch_id.load(Ordering::SeqCst);
+        let state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        if let ActiveLogState::Open(active) = &mut *state {
-            active.batch_checkpoint_hasher = Some(active.md5_hasher.clone());
-            active.batch_checkpoint_record_count = active.record_count;
-            active.batch_checkpoint_data_bytes = active.total_data_bytes;
+        match &*state {
+            ActiveLogState::Unopened { generation, .. } => LogCheckpoint {
+                generation: *generation,
+                offset: 0,
+                batch_id,
+                hasher: None,
+                record_count: 0,
+                total_data_bytes: 0,
+            },
+            ActiveLogState::Open(active) => LogCheckpoint {
+                generation: active.generation,
+                offset: active.current_offset,
+                batch_id,
+                hasher: Some(active.md5_hasher.clone()),
+                record_count: active.record_count,
+                total_data_bytes: active.total_data_bytes,
+            },
         }
     }
 
@@ -573,27 +599,29 @@ impl LogWriter {
         active.append_record(&self.volume_key, self.compression, op_code, inode, payload)
     }
 
-    /// Rolls back the active log file to `offset` if it is currently in `generation`
-    /// and its offset is past `offset`. Truncates the underlying file on disk and seeks back.
-    pub fn rollback_to(&self, generation: u64, offset: u64) -> io::Result<()> {
+    /// Rolls back the active log file to the given `checkpoint`.
+    ///
+    /// Truncates the underlying file on disk back to `checkpoint.offset`, restoring
+    /// the running MD5 hasher, counters, and next `batch_id`.
+    pub fn rollback_to(&self, checkpoint: &LogCheckpoint) -> io::Result<()> {
+        self.batch_id.store(checkpoint.batch_id, Ordering::SeqCst);
         let mut state = match self.active_state.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         if let ActiveLogState::Open(active) = &mut *state
-            && active.generation == generation
-            && active.current_offset > offset
+            && active.generation == checkpoint.generation
+            && active.current_offset > checkpoint.offset
         {
-            let _ = active.writer.truncate(offset);
-            active.current_offset = offset;
-            if let Some(ref checkpoint) = active.batch_checkpoint_hasher {
-                active.md5_hasher = checkpoint.clone();
+            let res = active.writer.truncate(checkpoint.offset);
+            active.current_offset = checkpoint.offset;
+            if let Some(ref h) = checkpoint.hasher {
+                active.md5_hasher = h.clone();
             }
-            active.record_count = active.batch_checkpoint_record_count;
-            active.total_data_bytes = active.batch_checkpoint_data_bytes;
+            active.record_count = checkpoint.record_count;
+            active.total_data_bytes = checkpoint.total_data_bytes;
+            res?;
         }
-        self.batch_id
-            .store(self.batch_checkpoint_batch_id.load(Ordering::SeqCst), Ordering::SeqCst);
         Ok(())
     }
 
@@ -985,10 +1013,9 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let clock = SystemClock;
         let writer = LogWriter::create(storage.clone(), 1, &clock, 1000, 1, VolumeKey::plaintext_arc()).unwrap();
-        let initial_offset = writer.current_offset();
 
         // Checkpoint before batch starts at batch_id = 1
-        writer.checkpoint_batch_start();
+        let checkpoint1 = writer.checkpoint();
 
         // Write some records and emit flush commit
         writer.append_record(OpCode::Data, 1, b"batch data").unwrap();
@@ -997,16 +1024,58 @@ mod tests {
         assert_eq!(committed_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
 
-        // Simulate flush failure: rollback to initial_offset
-        writer.rollback_to(1, initial_offset).unwrap();
+        // Simulate flush failure: rollback to checkpoint1
+        writer.rollback_to(&checkpoint1).unwrap();
         assert_eq!(writer.last_batch_id(), 0);
 
         // Retrying the batch should re-use batch_id 1
-        writer.checkpoint_batch_start();
+        let checkpoint2 = writer.checkpoint();
+        assert_eq!(checkpoint2.offset, checkpoint1.offset);
+        assert_eq!(checkpoint2.batch_id, 1);
         writer.append_record(OpCode::Data, 1, b"batch data retry").unwrap();
         let retried_id = writer.emit_flush_commit(1, 16, &clock).unwrap();
         writer.flush().unwrap();
         assert_eq!(retried_id, 1);
         assert_eq!(writer.last_batch_id(), 1);
+    }
+
+    #[test]
+    fn test_multiple_independent_checkpoints() {
+        let storage = Arc::new(MemoryStorage::new());
+        let clock = SystemClock;
+        let writer = LogWriter::create(storage.clone(), 1, &clock, 10000, 1, VolumeKey::plaintext_arc()).unwrap();
+
+        // Checkpoint A (before batch 1)
+        let cp_a = writer.checkpoint();
+
+        writer.append_record(OpCode::Data, 1, b"batch 1 data").unwrap();
+        let b1 = writer.emit_flush_commit(1, 12, &clock).unwrap();
+        assert_eq!(b1, 1);
+
+        // Checkpoint B (after batch 1, before batch 2)
+        let cp_b = writer.checkpoint();
+        assert_eq!(cp_b.batch_id, 2);
+        assert!(cp_b.offset > cp_a.offset);
+
+        writer.append_record(OpCode::Data, 2, b"batch 2 data").unwrap();
+        let b2 = writer.emit_flush_commit(1, 12, &clock).unwrap();
+        assert_eq!(b2, 2);
+
+        // Checkpoint C (after batch 2, before batch 3)
+        let cp_c = writer.checkpoint();
+        assert_eq!(cp_c.batch_id, 3);
+        assert!(cp_c.offset > cp_b.offset);
+
+        writer.append_record(OpCode::Data, 3, b"batch 3 partial").unwrap();
+
+        // Roll back to CP B: should restore to end of batch 1
+        writer.rollback_to(&cp_b).unwrap();
+        assert_eq!(writer.current_offset(), cp_b.offset);
+        assert_eq!(writer.last_batch_id(), 1);
+
+        // Further roll back to CP A: should restore to before batch 1
+        writer.rollback_to(&cp_a).unwrap();
+        assert_eq!(writer.current_offset(), cp_a.offset);
+        assert_eq!(writer.last_batch_id(), 0);
     }
 }
