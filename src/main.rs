@@ -266,15 +266,20 @@ fn main() {
     }
 }
 
-/// Points logging at a file, and says where, since a backgrounded mount leaves no other
-/// trace of it.
+/// Points logging at a file: `--log-file`, or else a per-run file in the volume.
 fn init_logging(cli: &Cli) {
-    let Some(path) = cli.log_file.clone().or_else(|| default_volume_log(&cli.command)) else {
+    if let Some(ref path) = cli.log_file {
+        appendfs::logging::init(path, &cli.log_level);
+    } else if let Some(volume_dir) = default_log_volume(&cli.command) {
+        // A backgrounded mount's run log is named for the daemon it is about to fork, so it
+        // is only opened from there - see `logging::init_deferred`.
+        if daemonizes(&cli.command) {
+            appendfs::logging::init_deferred(&volume_dir, &cli.log_level);
+        } else {
+            appendfs::logging::init(&appendfs::logging::run_log_path(&volume_dir), &cli.log_level);
+        }
+    } else {
         return;
-    };
-
-    if let Some(path) = appendfs::logging::init(&path, &cli.log_level) {
-        println!("Logging to '{}' (level: {})", path.display(), cli.log_level);
     }
 
     // First record of every run: what this invocation was, credentials redacted. Makes a log
@@ -282,8 +287,17 @@ fn init_logging(cli: &Cli) {
     log::info!("{}", appendfs::logging::redacted_command_line());
 }
 
-/// Where a command logs by default: a per-run file in the volume it is operating on.
-fn default_volume_log(command: &Commands) -> Option<PathBuf> {
+/// Whether `command` is a mount that `fuse_daemonize` will fork into the background.
+fn daemonizes(command: &Commands) -> bool {
+    match command {
+        Commands::Mount(args) => !args.foreground,
+        Commands::MountRo(args) => !args.foreground,
+        _ => false,
+    }
+}
+
+/// The volume a command logs into by default, as a per-run file under its `logs/`.
+fn default_log_volume(command: &Commands) -> Option<PathBuf> {
     let (volume_dir, may_create) = match command {
         // `init` is the one command entitled to create the directory it was handed.
         Commands::Init(args) => (args.log_dir.clone(), true),
@@ -304,7 +318,7 @@ fn default_volume_log(command: &Commands) -> Option<PathBuf> {
     if !may_create && !volume_dir.exists() {
         return None;
     }
-    Some(appendfs::logging::run_log_path(&volume_dir))
+    Some(volume_dir)
 }
 
 // TODO(too-many-lines): split the --from-remote bootstrap path out of this handler.

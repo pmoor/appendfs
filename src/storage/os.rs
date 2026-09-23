@@ -164,19 +164,25 @@ impl Storage for OsStorage {
             return Err(err);
         }
 
-        // Write our own PID into the lock file for diagnostics
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        let _ = writeln!(file, "{}", std::process::id());
-        let _ = file.flush();
-
-        Ok(Box::new(OsLock { _file: file }))
+        let lock = OsLock { file };
+        // The pid is only there to name the holder in the error above, so failing to write
+        // it is no reason to refuse a lock that is already held.
+        let _ = crate::storage::StorageLock::record_holder(&lock);
+        Ok(Box::new(lock))
     }
 }
 
 #[derive(Debug)]
 pub struct OsLock {
-    _file: File,
+    file: File,
 }
 
-impl crate::storage::StorageLock for OsLock {}
+impl crate::storage::StorageLock for OsLock {
+    fn record_holder(&self) -> io::Result<()> {
+        let mut file = &self.file;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        writeln!(file, "{}", std::process::id())?;
+        file.flush()
+    }
+}

@@ -522,26 +522,22 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     let before = log_file_count(log_dir.path());
 
     // No `-f`: the process daemonizes and the parent exits straight away.
-    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+    let parent = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .args([
             "mount",
             log_dir.path().to_str().unwrap(),
             mount_dir.path().to_str().unwrap(),
         ])
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("failed to spawn appendfs mount");
+    let parent_pid = parent.id();
+    let out = parent.wait_with_output().unwrap();
     assert!(
         out.status.success(),
         "mount failed: {}",
         String::from_utf8_lossy(&out.stderr)
-    );
-
-    // The operator is told where the logs went, since a daemonized mount leaves no other clue.
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Logging to") && stdout.contains("logs/appendfs-"),
-        "startup must report the log location, got: {}",
-        stdout
     );
 
     let mut mounted = false;
@@ -557,6 +553,21 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     assert!(mounted, "timed out waiting for FUSE filesystem to mount");
 
     std::fs::write(mount_dir.path().join("payload.txt"), b"logged activity").unwrap();
+
+    // The volume lock names the daemon serving the mount, not the parent that forked it and
+    // exited - otherwise a second mount's "already locked by PID" points nowhere.
+    let lock_pid: u32 = std::fs::read_to_string(log_dir.path().join(".lock"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(lock_pid, parent_pid, "the lock must not name the exited parent");
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", lock_pid)).unwrap_or_default();
+    assert!(
+        String::from_utf8_lossy(&cmdline).contains("mount"),
+        "the lock must name the running mount daemon, PID {}",
+        lock_pid
+    );
 
     let unmounted = appendfs::wait_until(
         || {
@@ -590,6 +601,19 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
         log_file_count(log_dir.path()),
         before + 1,
         "the mount must leave exactly one log file of its own"
+    );
+    // Named for the daemon too, and holding what was logged before it forked.
+    let log_file = std::fs::read_dir(&logs_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with(&format!("-{}.log", lock_pid)))
+        .expect("the log file must be named for the daemon's PID");
+    let contents = std::fs::read_to_string(log_file).unwrap();
+    assert!(
+        contents.contains("appendfs mount"),
+        "records from before the fork must reach the file, got: {}",
+        contents
     );
 
     // The volume itself is unaffected: the log lives in a subdirectory, so nothing that

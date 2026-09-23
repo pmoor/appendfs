@@ -8,7 +8,9 @@
 //! Each run gets its own file, named for the time it started and its pid. There is no
 //! rotation to reason about, two mounts of the same volume cannot interleave their records,
 //! and a crashed run's log stays exactly as it was left rather than being overwritten by the
-//! restart.
+//! restart. For a backgrounded mount that is the daemon's pid, not the parent's: the file is
+//! only opened once `fuse_daemonize` has forked, and records logged before then are held in
+//! memory until it is.
 //!
 //! A file is the only destination. Anything a user is meant to read is printed directly, so
 //! logging has no reason to compete for the terminal - and `--log-file` reaches the terminal
@@ -30,6 +32,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 /// Subdirectory of the volume log directory holding diagnostic logs.
@@ -56,21 +59,29 @@ pub fn log_file_path(log_dir: &Path, started: SystemTime, pid: u32) -> PathBuf {
     log_directory(log_dir).join(log_file_name(started, pid))
 }
 
-/// A log file that drops records rather than failing.
-struct LogSink {
-    /// `None` once writing has failed; records are dropped rather than propagated.
-    file: Option<File>,
+/// A log file that holds records until it is opened, and drops them rather than failing.
+enum LogSink {
+    /// No file yet. Records wait here, so nothing logged before the file is chosen is lost.
+    Pending(Vec<u8>),
+    Open(File),
+    /// Opening or writing failed; records are dropped rather than propagated.
+    Failed,
 }
 
 impl LogSink {
-    fn create(path: &Path) -> io::Result<Self> {
+    /// Opens `path`, writing out whatever was recorded while pending.
+    fn open(&mut self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         // `append` rather than truncate: an explicit `--log-file` may name an existing file
         // - or a character device like `/dev/stderr` - and truncating would be wrong for both.
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file: Some(file) })
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        if let LogSink::Pending(pending) = self {
+            file.write_all(pending)?;
+        }
+        *self = LogSink::Open(file);
+        Ok(())
     }
 }
 
@@ -78,54 +89,105 @@ impl Write for LogSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // A logging failure must not surface as a filesystem error, so this reports success
         // either way and simply stops writing.
-        match self.file {
-            Some(ref mut file) => {
+        match self {
+            LogSink::Pending(pending) => pending.extend_from_slice(buf),
+            LogSink::Open(file) => {
                 if file.write_all(buf).is_err() {
-                    self.file = None;
+                    *self = LogSink::Failed;
                 }
-                Ok(buf.len())
             }
-            None => Ok(buf.len()),
+            LogSink::Failed => {}
         }
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(ref mut file) = self.file {
+        if let LogSink::Open(file) = self {
             let _ = file.flush();
         }
         Ok(())
     }
 }
 
-/// Starts logging to `path`, or reports why it could not.
-///
-/// Returns the path in use, or `None` if it could not be opened - in which case records are
-/// discarded and the command proceeds regardless, since a volume on read-only media is still
-/// worth mounting.
-pub fn init(path: &Path, level: &str) -> Option<PathBuf> {
-    let builder = &mut env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level));
-    match LogSink::create(path) {
-        Ok(sink) => {
-            builder.target(env_logger::Target::Pipe(Box::new(sink))).init();
-            Some(path.to_path_buf())
-        }
-        Err(e) => {
-            eprintln!(
-                "Warning: could not open log file {}: {}; logging disabled",
-                path.display(),
-                e
-            );
-            None
-        }
+/// The sink behind the installed logger. Global because `open_deferred` has to reach it
+/// from the FUSE `init` callback, long after `main` handed the logger its target.
+static SINK: Mutex<LogSink> = Mutex::new(LogSink::Pending(Vec::new()));
+
+/// The run log `init_deferred` set aside for `open_deferred`: its directory and start time.
+static DEFERRED: Mutex<Option<(PathBuf, SystemTime)>> = Mutex::new(None);
+
+fn sink() -> MutexGuard<'static, LogSink> {
+    SINK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The logger's target, writing through to `SINK`.
+struct GlobalSink;
+
+impl Write for GlobalSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        sink().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        sink().flush()
     }
 }
 
-/// The log file for this run under `log_dir`.
+fn install(level: &str) {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+        .target(env_logger::Target::Pipe(Box::new(GlobalSink)))
+        .init();
+}
+
+/// Points the sink at `path`, or reports why it could not - in which case records are
+/// discarded and the command proceeds regardless, since a volume on read-only media is still
+/// worth mounting.
+fn open(path: &Path) {
+    let mut sink = sink();
+    if let Err(e) = sink.open(path) {
+        *sink = LogSink::Failed;
+        eprintln!(
+            "Warning: could not open log file {}: {}; logging disabled",
+            path.display(),
+            e
+        );
+    }
+}
+
+/// Starts logging to `path`.
+pub fn init(path: &Path, level: &str) {
+    install(level);
+    open(path);
+}
+
+/// Starts logging for a mount about to daemonize, into a run log under `log_dir` that is
+/// only opened by `open_deferred`. Records until then are held in memory.
 ///
-/// Canonicalized because `fuse_daemonize` chdirs to `/` shortly after a mount sets this up.
+/// A run log is named for its process, and a backgrounded mount's process is the daemon
+/// `fuse_daemonize` forks - which does not exist yet while recovery is already logging.
+pub fn init_deferred(log_dir: &Path, level: &str) {
+    *DEFERRED.lock().unwrap_or_else(PoisonError::into_inner) = Some((canonical_dir(log_dir), SystemTime::now()));
+    install(level);
+}
+
+/// Opens the run log `init_deferred` set aside, named for the calling process. No-op
+/// otherwise, including on every call after the first.
+pub fn open_deferred() {
+    let deferred = DEFERRED.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some((log_dir, started)) = deferred {
+        open(&log_file_path(&log_dir, started, std::process::id()));
+    }
+}
+
+/// Canonicalized because `fuse_daemonize` chdirs to `/`, and a backgrounded mount opens its
+/// log only afterwards.
+fn canonical_dir(log_dir: &Path) -> PathBuf {
+    fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf())
+}
+
+/// The log file for this run under `log_dir`.
 pub fn run_log_path(log_dir: &Path) -> PathBuf {
-    let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
-    log_file_path(&root, SystemTime::now(), std::process::id())
+    log_file_path(&canonical_dir(log_dir), SystemTime::now(), std::process::id())
 }
 
 /// Whether a flag's value is a credential that must not reach a log file.
@@ -255,7 +317,8 @@ mod tests {
         let storage = crate::storage::OsStorage::new(dir.path());
         let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
 
-        let mut sink = LogSink::create(&path).unwrap();
+        let mut sink = LogSink::Pending(Vec::new());
+        sink.open(&path).unwrap();
         sink.write_all(b"a log record\n").unwrap();
         sink.flush().unwrap();
 
@@ -275,13 +338,15 @@ mod tests {
         let started = UNIX_EPOCH + Duration::from_secs(1_766_000_000);
 
         let first = log_file_path(dir.path(), started, 1);
-        let mut sink = LogSink::create(&first).unwrap();
+        let mut sink = LogSink::Pending(Vec::new());
+        sink.open(&first).unwrap();
         sink.write_all(b"from the first run\n").unwrap();
         sink.flush().unwrap();
         drop(sink);
 
         let second = log_file_path(dir.path(), started + Duration::from_secs(5), 2);
-        let mut sink = LogSink::create(&second).unwrap();
+        let mut sink = LogSink::Pending(Vec::new());
+        sink.open(&second).unwrap();
         sink.write_all(b"from the second run\n").unwrap();
         sink.flush().unwrap();
 
@@ -294,10 +359,28 @@ mod tests {
         // A filesystem must not fail because its log file did.
         let dir = tempfile::tempdir().unwrap();
         let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
-        let mut sink = LogSink::create(&path).unwrap();
+        let mut sink = LogSink::Pending(Vec::new());
+        sink.open(&path).unwrap();
         sink.write_all(b"before\n").unwrap();
-        sink.file = None;
+        sink = LogSink::Failed;
         assert!(sink.write_all(b"after\n").is_ok(), "a lost log file must be survivable");
         assert!(sink.flush().is_ok());
+    }
+
+    #[test]
+    fn test_records_before_the_file_opens_are_kept() {
+        // A backgrounded mount logs all through recovery before it knows its file's name.
+        let dir = tempfile::tempdir().unwrap();
+        let path = log_file_path(dir.path(), SystemTime::now(), std::process::id());
+        let mut sink = LogSink::Pending(Vec::new());
+        sink.write_all(b"during recovery\n").unwrap();
+        sink.open(&path).unwrap();
+        sink.write_all(b"after daemonizing\n").unwrap();
+        sink.flush().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "during recovery\nafter daemonizing\n"
+        );
     }
 }

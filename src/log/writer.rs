@@ -266,7 +266,7 @@ pub struct LogWriter {
     /// [`LogWriter::with_compression`] rather than passed to every constructor, which would
     /// reintroduce the telescoping shape this module deliberately avoids.
     compression: crate::compress::Compression,
-    _lock: Option<Box<dyn crate::storage::StorageLock>>,
+    lock: Option<Box<dyn crate::storage::StorageLock>>,
 }
 
 impl std::fmt::Debug for LogWriter {
@@ -299,7 +299,7 @@ impl LogWriter {
             max_log_age: None,
             volume_key,
             compression: crate::compress::Compression::None,
-            _lock: Some(lock),
+            lock: Some(lock),
         })
     }
 
@@ -324,7 +324,7 @@ impl LogWriter {
             max_log_age: None,
             volume_key,
             compression: crate::compress::Compression::None,
-            _lock: Some(lock),
+            lock: Some(lock),
         })
     }
 
@@ -350,7 +350,7 @@ impl LogWriter {
             max_log_age: None,
             volume_key,
             compression: crate::compress::Compression::None,
-            _lock: Some(lock),
+            lock: Some(lock),
         })
     }
 
@@ -374,6 +374,12 @@ impl LogWriter {
     /// Returns the underlying storage instance.
     pub fn storage(&self) -> &Arc<dyn Storage> {
         &self.storage
+    }
+
+    /// Records the calling process as the holder of the volume lock - see
+    /// [`crate::storage::StorageLock::record_holder`].
+    pub fn record_lock_holder(&self) -> io::Result<()> {
+        self.lock.as_ref().map_or(Ok(()), |lock| lock.record_holder())
     }
 
     /// Returns `true` if a physical `.log` file has been created on disk.

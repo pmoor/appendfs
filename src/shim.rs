@@ -1331,6 +1331,15 @@ extern "C" fn removexattr_bridge(req: Request, ino: u64, name: *const c_char) {
 
 extern "C" fn init_bridge(userdata: *mut c_void) {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::InMemoryFS>) };
+    // FUSE_INIT arrives after `fuse_daemonize`, so this is the process that will serve the
+    // mount: for a backgrounded mount, the daemon rather than the parent that forked it and
+    // exited. The run log and the volume lock name their process, so both claim this one.
+    crate::logging::open_deferred();
+    if let Some(ref writer) = fs.log_writer
+        && let Err(e) = writer.record_lock_holder()
+    {
+        log::warn!("Failed to record this process as the volume lock holder: {}", e);
+    }
     fs.init();
 }
 

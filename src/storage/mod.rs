@@ -90,7 +90,16 @@ pub enum WriteMode {
 /// RAII guard representing an active exclusive lock on the storage volume.
 ///
 /// Releasing or dropping this guard unlocks the storage volume.
-pub trait StorageLock: Send + Sync + std::fmt::Debug {}
+pub trait StorageLock: Send + Sync + std::fmt::Debug {
+    /// Records the calling process as the lock's holder, for the error a second mount gets.
+    ///
+    /// Done on acquiring the lock, and again once a backgrounded mount has forked: the lock
+    /// passes to the daemon along with the open file, but the pid recorded is still that of
+    /// the parent, which exits.
+    fn record_holder(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Volume log storage container interface.
 pub trait Storage: Send + Sync {
