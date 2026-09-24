@@ -9,8 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <mutex>
 #include <sys/stat.h>
+#include <unistd.h>
 
 struct shim_req_t {
   fuse_req_t req;
@@ -505,9 +507,29 @@ static void ll_destroy(void *userdata) {
   }
 }
 
+// The second half of what `fuse_daemonize` does, for a mount that already forked: leave the
+// terminal, then tell the parent waiting on `ready_fd` that the mount is up. The fork itself
+// happens in Rust (`daemon::daemonize`) before anything else, so that the volume lock and the
+// run log are taken by the daemon rather than by a parent about to exit.
+static void detach_from_terminal(int ready_fd) {
+  (void)setsid();
+  int nullfd = open("/dev/null", O_RDWR, 0);
+  if (nullfd != -1) {
+    (void)dup2(nullfd, 0);
+    (void)dup2(nullfd, 1);
+    (void)dup2(nullfd, 2);
+    if (nullfd > 2) {
+      close(nullfd);
+    }
+  }
+  char mounted = 1;
+  (void)write(ready_fd, &mounted, sizeof(mounted));
+  close(ready_fd);
+}
+
 extern "C" {
 
-int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, void *userdata) {
+int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, void *userdata, int ready_fd) {
   std::unique_lock<std::mutex> mount_lock(global_mount_lock);
 
   struct fuse_args args = FUSE_ARGS_INIT(argc, const_cast<char **>(argv));
@@ -604,7 +626,11 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
     goto err_out2;
   }
 
-  fuse_daemonize(opts.foreground);
+  if (ready_fd >= 0) {
+    detach_from_terminal(ready_fd);
+    ready_fd = -1;
+  }
+  (void)chdir("/");
 
   ret = fuse_session_loop(se);
   if (signals_installed && (ret == SIGINT || ret == SIGTERM || ret == SIGHUP)) {
@@ -623,6 +649,10 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
 err_out2:
   fuse_session_destroy(se);
 err_out1:
+  // Still open only if the mount failed: closing it without a byte tells the parent so.
+  if (ready_fd >= 0) {
+    close(ready_fd);
+  }
   free(opts.mountpoint);
   fuse_opt_free_args(&args);
 

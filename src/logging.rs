@@ -1,9 +1,10 @@
 //! Where diagnostic logs go.
 //!
-//! A backgrounded mount has no stderr: libfuse's `fuse_daemonize` redirects stdout and
-//! stderr to `/dev/null`, so every `log::` record from a normal (non-`--foreground`) mount
-//! was being discarded. Long-running mounts are exactly the ones worth having logs for, so
-//! they write to a file inside the volume's own log directory instead.
+//! A backgrounded mount has no stderr: once mounted, it detaches from the terminal and
+//! redirects stdout and stderr to `/dev/null`, so every `log::` record from a normal
+//! (non-`--foreground`) mount was being discarded. Long-running mounts are exactly the ones
+//! worth having logs for, so they write to a file inside the volume's own log directory
+//! instead.
 //!
 //! Each run gets its own file, named for the time it started and its pid. There is no
 //! rotation to reason about, two mounts of the same volume cannot interleave their records,
@@ -122,7 +123,7 @@ pub fn init(path: &Path, level: &str) -> Option<PathBuf> {
 
 /// The log file for this run under `log_dir`.
 ///
-/// Canonicalized because `fuse_daemonize` chdirs to `/` shortly after a mount sets this up.
+/// Canonicalized because a mount chdirs to `/` shortly after setting this up.
 pub fn run_log_path(log_dir: &Path) -> PathBuf {
     let root = fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
     log_file_path(&root, SystemTime::now(), std::process::id())

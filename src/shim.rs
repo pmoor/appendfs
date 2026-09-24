@@ -162,6 +162,7 @@ unsafe extern "C" {
         argv: *const *const c_char,
         ops: *const RustLowlevelOps,
         userdata: *mut c_void,
+        ready_fd: c_int,
     ) -> c_int;
 
     fn shim_reply_err(req: FuseReqT, err: c_int) -> c_int;
@@ -1340,22 +1341,32 @@ extern "C" fn destroy_bridge(userdata: *mut c_void) {
 }
 
 pub fn mount(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), FsError> {
-    mount_arc(args, std::sync::Arc::new(fs))
+    mount_arc(args, std::sync::Arc::new(fs), None)
 }
 
 pub fn mount_ro(args: Vec<String>, fs: crate::fs::InMemoryFS) -> Result<(), FsError> {
-    mount_ro_arc(args, std::sync::Arc::new(fs))
+    mount_ro_arc(args, std::sync::Arc::new(fs), None)
 }
 
-pub fn mount_ro_arc(mut args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), FsError> {
+pub fn mount_ro_arc(
+    mut args: Vec<String>,
+    fs: std::sync::Arc<crate::fs::InMemoryFS>,
+    ready: Option<crate::daemon::Ready>,
+) -> Result<(), FsError> {
     fs.set_read_only();
     // Injects kernel-level read-only mount option
     args.push("-o".to_string());
     args.push("ro".to_string());
-    mount_arc(args, fs)
+    mount_arc(args, fs, ready)
 }
 
-pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -> Result<(), FsError> {
+/// Mounts `fs` and serves it until unmounted. `ready`, from a mount that
+/// [daemonized](crate::daemon), is how the waiting parent learns the mount is up.
+pub fn mount_arc(
+    args: Vec<String>,
+    fs: std::sync::Arc<crate::fs::InMemoryFS>,
+    ready: Option<crate::daemon::Ready>,
+) -> Result<(), FsError> {
     let c_args_owners: Vec<CString> = args.into_iter().map(|arg| CString::new(arg).unwrap()).collect();
 
     let c_args: Vec<*const c_char> = c_args_owners.iter().map(|arg| arg.as_ptr()).collect();
@@ -1398,7 +1409,8 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::InMemoryFS>) -
 
     let raw_userdata = Box::into_raw(Box::new(fs)) as *mut c_void;
 
-    let code = unsafe { run_fuse_ll(c_args.len() as c_int, c_args.as_ptr(), &ops, raw_userdata) };
+    let ready_fd = ready.map_or(-1, crate::daemon::Ready::into_raw_fd);
+    let code = unsafe { run_fuse_ll(c_args.len() as c_int, c_args.as_ptr(), &ops, raw_userdata, ready_fd) };
 
     // Reclaims the heap allocation handed to the C bridge. The unmount flush/sync already
     // happened inside `destroy_bridge` (`fs.destroy()`), which fires from within

@@ -5,6 +5,7 @@ pub mod clock;
 pub mod compat;
 pub mod compress;
 pub mod crypto;
+pub mod daemon;
 pub mod dump;
 pub mod error;
 pub mod extent_map;
@@ -79,14 +80,22 @@ pub fn mount(args: Vec<String>, fs: InMemoryFS) -> Result<(), FsError> {
     shim::mount(args, fs)
 }
 
-pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), FsError> {
-    shim::mount_arc(args, fs)
+pub fn mount_arc(
+    args: Vec<String>,
+    fs: std::sync::Arc<InMemoryFS>,
+    ready: Option<daemon::Ready>,
+) -> Result<(), FsError> {
+    shim::mount_arc(args, fs, ready)
 }
 
 pub fn mount_ro(args: Vec<String>, fs: InMemoryFS) -> Result<(), FsError> {
     shim::mount_ro(args, fs)
 }
 
-pub fn mount_ro_arc(args: Vec<String>, fs: std::sync::Arc<InMemoryFS>) -> Result<(), FsError> {
-    shim::mount_ro_arc(args, fs)
+pub fn mount_ro_arc(
+    args: Vec<String>,
+    fs: std::sync::Arc<InMemoryFS>,
+    ready: Option<daemon::Ready>,
+) -> Result<(), FsError> {
+    shim::mount_ro_arc(args, fs, ready)
 }

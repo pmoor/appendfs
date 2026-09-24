@@ -500,8 +500,8 @@ fn test_cli_mount_foreground_unmounts_on_sigint_when_busy() {
     drop(open_file);
 }
 
-/// A backgrounded mount is the case that used to lose every log record: libfuse redirects
-/// stderr to /dev/null when it daemonizes, and stderr was the only place logs went.
+/// A backgrounded mount is the case that used to lose every log record: it redirects stderr
+/// to /dev/null when it detaches from the terminal, and stderr was the only place logs went.
 #[test]
 fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -521,26 +521,48 @@ fn test_cli_backgrounded_mount_writes_logs_into_the_volume_log_directory() {
     let initial_dev = std::fs::metadata(mount_dir.path()).unwrap().dev();
     let before = log_file_count(log_dir.path());
 
-    // No `-f`: the process daemonizes and the parent exits straight away.
-    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+    // No `-f`: the process forks, and the parent exits once the daemon has mounted.
+    let parent = Command::new(env!("CARGO_BIN_EXE_appendfs"))
         .args([
             "mount",
             log_dir.path().to_str().unwrap(),
             mount_dir.path().to_str().unwrap(),
         ])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("failed to spawn appendfs mount");
+    let parent_pid = parent.id();
+    let out = parent.wait_with_output().unwrap();
     assert!(
         out.status.success(),
         "mount failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // The operator is told where the logs went, since a daemonized mount leaves no other clue.
+    // The volume lock names the daemon serving the mount, not the parent that forked it and
+    // exited - otherwise a second mount's "already locked by PID" points nowhere.
+    let daemon_pid: u32 = std::fs::read_to_string(log_dir.path().join(".lock"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(daemon_pid, parent_pid, "the lock must not name the exited parent");
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", daemon_pid)).unwrap_or_default();
+    assert!(
+        String::from_utf8_lossy(&cmdline).contains("mount"),
+        "the lock must name the running mount daemon, PID {}",
+        daemon_pid
+    );
+
+    // The operator is told where the logs went, since a daemonized mount leaves no other clue -
+    // a file named for the daemon, too.
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Logging to") && stdout.contains("logs/appendfs-"),
-        "startup must report the log location, got: {}",
+        stdout.contains("Logging to")
+            && stdout.contains("logs/appendfs-")
+            && stdout.contains(&format!("-{}.log", daemon_pid)),
+        "startup must report the daemon's log location, got: {}",
         stdout
     );
 
@@ -835,8 +857,8 @@ fn kill_other_processes_holding(path: &std::path::Path) {
     }
 }
 
-/// A background mount (no `-f`) forks in `fuse_daemonize`, and `fork` carries only the
-/// calling thread into the daemon. Threads started before it - the delayed response queue's,
+/// A background mount (no `-f`) forks, and `fork` carries only the calling thread into the
+/// daemon. Threads started before it - the delayed response queue's,
 /// the replication worker's - used to vanish, so replication never ran and unmount hung
 /// forever joining them, right after writing the final summary.
 #[test]
@@ -902,4 +924,34 @@ fn test_cli_background_mount_exits_after_unmount_and_replicates() {
             name
         );
     }
+}
+
+/// A backgrounded mount forks before it mounts, so a mount that fails has to be reported by
+/// the daemon - on the terminal and in the exit status, as a foreground mount would.
+#[test]
+fn test_cli_backgrounded_mount_reports_failure_to_the_caller() {
+    let log_dir = TempDir::new().unwrap();
+    let missing_mount_point = log_dir.path().join("no-such-directory");
+
+    let init_out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args(["init", log_dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to init volume");
+    assert!(init_out.status.success());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_appendfs"))
+        .args([
+            "mount",
+            log_dir.path().to_str().unwrap(),
+            missing_mount_point.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn appendfs mount");
+    assert_eq!(out.status.code(), Some(1), "a failed mount must exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Failed to mount"),
+        "the failure must reach the caller's terminal, got: {}",
+        stderr
+    );
 }

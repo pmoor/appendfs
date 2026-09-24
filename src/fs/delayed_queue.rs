@@ -125,8 +125,8 @@ impl DelayedResponseQueue {
     /// Idempotent. Until it runs, delayed responses only go out through `notify_capacity`,
     /// `drain`, or (in tests) `wake_expired`.
     ///
-    /// Deliberately not done in the constructor: the queue is built during recovery, before
-    /// a background mount forks, and a thread started then would not exist in the daemon.
+    /// Not done in the constructor, so that only a mounted filesystem runs the thread:
+    /// `InMemoryFS::init` starts it and `drain` stops it.
     pub fn start(&self) {
         let mut thread = self.thread.lock().unwrap();
         if thread.is_some() {

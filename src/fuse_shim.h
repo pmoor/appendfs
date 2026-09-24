@@ -90,7 +90,7 @@ struct rust_lowlevel_ops {
 };
 
 // Entrypoint to mount and run FUSE low-level loop
-int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *userdata);
+int run_fuse_ll(int argc, char *argv[], const rust_lowlevel_ops *ops, void *userdata, int ready_fd);
 
 // FUSE reply wrappers exposed to Rust
 int shim_reply_err(fuse_req_t req, int err);

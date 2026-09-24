@@ -253,12 +253,22 @@ fn prompt_master_key(source: KeySource, key_file: Option<&Path>) -> Result<(Mast
 
 fn main() {
     let cli = Cli::parse();
+
+    // Before anything else, so that the log, the volume lock and every thread belong to the
+    // daemon rather than to a parent about to exit - see `appendfs::daemon`.
+    let ready = daemonizes(&cli.command).then(|| {
+        appendfs::daemon::daemonize().unwrap_or_else(|e| {
+            eprintln!("Error: failed to fork into the background: {}", e);
+            std::process::exit(1);
+        })
+    });
+
     init_logging(&cli);
 
     match cli.command {
         Commands::Init(args) => cmd_init(args),
-        Commands::Mount(args) => cmd_mount(args),
-        Commands::MountRo(args) => cmd_mount_ro(args),
+        Commands::Mount(args) => cmd_mount(args, ready),
+        Commands::MountRo(args) => cmd_mount_ro(args, ready),
         Commands::Stats(args) => cmd_stats(args),
         Commands::Dump(args) => cmd_dump(args),
         Commands::Fsck(args) => cmd_fsck(args),
@@ -280,6 +290,15 @@ fn init_logging(cli: &Cli) {
     // First record of every run: what this invocation was, credentials redacted. Makes a log
     // self-identifying without having to correlate it against shell history.
     log::info!("{}", appendfs::logging::redacted_command_line());
+}
+
+/// Whether `command` is a mount that runs in the background.
+fn daemonizes(command: &Commands) -> bool {
+    match command {
+        Commands::Mount(args) => !args.foreground,
+        Commands::MountRo(args) => !args.foreground,
+        _ => false,
+    }
 }
 
 /// Where a command logs by default: a per-run file in the volume it is operating on.
@@ -464,7 +483,7 @@ fn build_log_cache(
     Arc::new(log_cache)
 }
 
-fn cmd_mount(args: MountArgs) {
+fn cmd_mount(args: MountArgs, ready: Option<appendfs::daemon::Ready>) {
     let log_dir = &args.log_dir;
     println!(
         "Recovering appendfs state from log directory '{}'...",
@@ -533,8 +552,8 @@ fn cmd_mount(args: MountArgs) {
         &fs_instance.manifest,
     ));
 
-    // Only configured here: `init()` starts the worker once FUSE is up, since a thread started
-    // now would not survive `fuse_daemonize` forking a background mount.
+    // Only configured here: `init()` starts the worker once FUSE is up, and `destroy()` stops
+    // it after the final summary.
     if !args.no_sync && !registry.remotes.is_empty() {
         fs_instance.replication_log_dir = Some(log_dir.clone());
     }
@@ -556,13 +575,13 @@ fn cmd_mount(args: MountArgs) {
     );
 
     let fuse_args = args.to_fuse_args();
-    if let Err(err) = appendfs::mount_arc(fuse_args, fs_instance) {
+    if let Err(err) = appendfs::mount_arc(fuse_args, fs_instance, ready) {
         eprintln!("Failed to mount appendfs FUSE filesystem: {}", err);
         std::process::exit(1);
     }
 }
 
-fn cmd_mount_ro(args: MountRoArgs) {
+fn cmd_mount_ro(args: MountRoArgs, ready: Option<appendfs::daemon::Ready>) {
     let log_dir = &args.log_dir;
     let target = if let Some(batch_id) = args.batch_id {
         appendfs::RecoveryTarget::BatchId(batch_id)
@@ -644,7 +663,7 @@ fn cmd_mount_ro(args: MountRoArgs) {
 
     let fs_instance = Arc::new(fs_instance);
     let fuse_args = args.to_fuse_args();
-    if let Err(err) = appendfs::mount_ro_arc(fuse_args, fs_instance) {
+    if let Err(err) = appendfs::mount_ro_arc(fuse_args, fs_instance, ready) {
         eprintln!("Failed to mount read-only appendfs FUSE filesystem: {}", err);
         std::process::exit(1);
     }

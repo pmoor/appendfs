@@ -376,12 +376,10 @@ pub struct MountCommonArgs {
 }
 
 impl MountCommonArgs {
-    /// Formats CLI arguments into libfuse-compatible C-style argv.
+    /// Formats CLI arguments into libfuse-compatible C-style argv. `--foreground` is not
+    /// among them: backgrounding is `appendfs::daemon`'s job, not libfuse's.
     pub fn to_fuse_args(&self) -> Vec<String> {
         let mut fuse_args = vec!["appendfs".to_string(), self.mount_point.to_str().unwrap().to_string()];
-        if self.foreground {
-            fuse_args.push("-f".to_string());
-        }
         for opt in &self.fuse_options {
             fuse_args.push("-o".to_string());
             fuse_args.push(opt.clone());

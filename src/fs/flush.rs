@@ -612,12 +612,8 @@ impl InMemoryFS {
         self.inner.lock(OpTag::Stats).unwrap().flushing.len()
     }
 
-    /// Starts the filesystem's background threads upon FUSE mount.
-    ///
-    /// This is the earliest safe point for them: FUSE calls it from the session loop, after
-    /// a background mount's `fuse_daemonize` has forked. `fork` carries only the calling
-    /// thread into the daemon, so a thread started any earlier silently stops existing, and
-    /// joining it at unmount hangs forever.
+    /// Starts the filesystem's background threads upon FUSE mount, so that only a mounted
+    /// filesystem runs them; `destroy()` stops them.
     pub fn init(self: &Arc<Self>) {
         self.delayed_queue.start();
         if self.is_read_only() {
