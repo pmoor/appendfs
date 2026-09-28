@@ -112,7 +112,7 @@ jobs:
           path: benchmark-report.md
 
       - name: Comment on PR with benchmark results
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,3 +122,9 @@ jobs:
             --body-file benchmark-report.md \
             --edit-last \
             --create-if-none
+
+      - name: Note on fork PR benchmark results
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Benchmark report generated for fork PR #${{ github.event.pull_request.number }}."
+          echo "GitHub Actions restricts write access for fork workflows; results are published in the Job Summary and workflow artifacts."
