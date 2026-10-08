@@ -211,3 +211,116 @@ fn test_runtime_status_fuse_operations_throttled_formatting() {
     // Verify 15.00 ms is in the formatted output for the throttled write
     assert!(status.contains("15.00 ms"));
 }
+
+#[test]
+fn test_format_runtime_status_not_blocked_by_log_flush() {
+    use appendfs::crypto::VolumeKey;
+    use appendfs::log::LogWriter;
+    use appendfs::storage::{MemoryStorage, Storage, StorageLock, StorageReader, StorageWriter, WriteMode};
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default, Clone)]
+    struct IoBlocker {
+        block_sync: Arc<AtomicBool>,
+        in_sync: Arc<AtomicBool>,
+        release_sync: Arc<AtomicBool>,
+    }
+
+    struct BlockingWriter {
+        inner: Box<dyn StorageWriter>,
+        blocker: IoBlocker,
+    }
+
+    impl StorageWriter for BlockingWriter {
+        fn append(&mut self, data: &[u8]) -> io::Result<()> {
+            self.inner.append(data)
+        }
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            self.inner.truncate(len)
+        }
+        fn sync(&mut self) -> io::Result<()> {
+            if self.blocker.block_sync.load(Ordering::SeqCst) {
+                self.blocker.in_sync.store(true, Ordering::SeqCst);
+                while !self.blocker.release_sync.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            self.inner.sync()
+        }
+        fn len(&self) -> io::Result<u64> {
+            self.inner.len()
+        }
+    }
+
+    struct BlockingStorage {
+        base: MemoryStorage,
+        blocker: IoBlocker,
+    }
+
+    impl Storage for BlockingStorage {
+        fn open_reader(&self, name: &str) -> io::Result<Arc<dyn StorageReader>> {
+            self.base.open_reader(name)
+        }
+        fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
+            let inner = self.base.open_writer(name, mode)?;
+            Ok(Box::new(BlockingWriter {
+                inner,
+                blocker: self.blocker.clone(),
+            }))
+        }
+        fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+            self.base.rename(from, to)
+        }
+        fn remove_file(&self, name: &str) -> io::Result<()> {
+            self.base.remove_file(name)
+        }
+        fn list_files(&self) -> io::Result<Vec<String>> {
+            self.base.list_files()
+        }
+        fn exists(&self, name: &str) -> bool {
+            self.base.exists(name)
+        }
+        fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn StorageLock>> {
+            self.base.acquire_exclusive_lock()
+        }
+    }
+
+    let blocker = IoBlocker::default();
+    let storage = Arc::new(BlockingStorage {
+        base: MemoryStorage::new(),
+        blocker: blocker.clone(),
+    });
+    let clock = Arc::new(MockClock(mock_time()));
+    let writer =
+        Arc::new(LogWriter::create(storage, 1, clock.as_ref(), 100_000, 1, VolumeKey::plaintext_arc()).unwrap());
+    let fs = InMemoryFS::with_clock_and_log(clock, Some(writer.clone()));
+
+    // Block physical disk sync during flush
+    blocker.block_sync.store(true, Ordering::SeqCst);
+    let writer_clone = writer.clone();
+    let flush_handle = std::thread::spawn(move || {
+        writer_clone.flush().unwrap();
+    });
+
+    // Wait until background thread is blocked in physical sync()
+    while !blocker.in_sync.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // format_runtime_status must NOT hang or block on active_state while disk sync is running
+    let start = std::time::Instant::now();
+    let status = format_runtime_status(&fs);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "format_runtime_status took {:?} which exceeds non-blocking threshold",
+        elapsed
+    );
+    assert!(status.contains("Active Generation:  1 (000001.log)"));
+    assert!(status.contains("=== appendfs Runtime Status ==="));
+
+    // Release sync
+    blocker.release_sync.store(true, Ordering::SeqCst);
+    flush_handle.join().unwrap();
+}

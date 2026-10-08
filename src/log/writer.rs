@@ -4,8 +4,8 @@ use crate::log::record::{FILE_HEADER_SIZE, FileHeader, FlushCommitPayload, OpCod
 use crate::storage::{BufferedStorageWriter, Storage, StorageWriter, WriteMode};
 use std::io;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 /// Initial capacity for the reusable per-record staging buffer (4.25 MiB).
 /// Accommodates max 4 MiB payload + zstd compression expansion bound + header.
@@ -318,7 +318,11 @@ fn seal_and_open_next(
 /// lazy (unopened) so no file exists for it until something is written.
 ///
 /// On failure the writer is left lazy on the successor, as [`seal_and_open_next`] does.
-fn seal_into_lazy(state: &mut ActiveLogState, clock: &dyn Clock) -> io::Result<Option<super::manifest::LogFileInfo>> {
+fn seal_into_lazy(
+    state: &mut ActiveLogState,
+    clock: &dyn Clock,
+    meta: &RwLock<ActiveLogMeta>,
+) -> io::Result<Option<super::manifest::LogFileInfo>> {
     let ActiveLogState::Open(active) = &*state else {
         return Ok(None);
     };
@@ -335,6 +339,19 @@ fn seal_into_lazy(state: &mut ActiveLogState, clock: &dyn Clock) -> io::Result<O
     ) else {
         unreachable!();
     };
+    {
+        let mut m = match meta.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        m.generation = next_gen;
+        m.filename = super::log_filename(next_gen);
+        m.created_at = None;
+        m.current_offset = 0;
+        m.record_count = 0;
+        m.total_data_bytes = 0;
+        m.is_open = false;
+    }
     let sealed_info = active.seal(clock.now())?;
     log::info!(
         "Sealed log generation {}, next generation {} is lazy (unopened)",
@@ -440,9 +457,26 @@ impl std::fmt::Debug for LogCheckpoint {
     }
 }
 
+/// Point-in-time in-memory metadata for the active log file.
+///
+/// Kept separate from [`ActiveLogState`] so inspection queries ([`LogWriter::generation`],
+/// [`LogWriter::is_open`], [`LogWriter::current_offset`], etc.) never contend with
+/// slow physical I/O writes or fsyncs on [`ActiveLogState`].
+#[derive(Debug, Clone)]
+struct ActiveLogMeta {
+    generation: u32,
+    filename: String,
+    created_at: Option<std::time::SystemTime>,
+    current_offset: u64,
+    record_count: u32,
+    total_data_bytes: u64,
+    is_open: bool,
+}
+
 /// Active log writer managing append-only writes to generation log files with automatic rolling.
 pub struct LogWriter {
     active_state: Mutex<ActiveLogState>,
+    meta: RwLock<ActiveLogMeta>,
     batch_id: AtomicU64,
     storage: Arc<dyn Storage>,
     max_log_size: u64,
@@ -466,6 +500,34 @@ impl std::fmt::Debug for LogWriter {
 }
 
 impl LogWriter {
+    fn update_meta_from_open(&self, active: &ActiveLogFile) {
+        let mut meta = match self.meta.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        meta.generation = active.generation;
+        meta.filename = active.filename.clone();
+        meta.created_at = Some(active.created_at);
+        meta.current_offset = active.current_offset;
+        meta.record_count = active.record_count;
+        meta.total_data_bytes = active.total_data_bytes;
+        meta.is_open = true;
+    }
+
+    fn update_meta_from_unopened(&self, generation: u32, created_at: Option<std::time::SystemTime>) {
+        let mut meta = match self.meta.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        meta.generation = generation;
+        meta.filename = super::log_filename(generation);
+        meta.created_at = created_at;
+        meta.current_offset = 0;
+        meta.record_count = 0;
+        meta.total_data_bytes = 0;
+        meta.is_open = false;
+    }
+
     /// Creates a new generation log file backed by a custom `Storage` instance.
     pub fn create(
         storage: Arc<dyn Storage>,
@@ -478,8 +540,18 @@ impl LogWriter {
         let lock = storage.acquire_exclusive_lock()?;
         let keying = FileKeying::random(volume_key);
         let active_file = open_generation_file(&storage, &keying, generation, clock.now())?;
+        let meta = ActiveLogMeta {
+            generation,
+            filename: active_file.filename.clone(),
+            created_at: Some(active_file.created_at),
+            current_offset: active_file.current_offset,
+            record_count: 0,
+            total_data_bytes: 0,
+            is_open: true,
+        };
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Open(active_file)),
+            meta: RwLock::new(meta),
             batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
@@ -500,11 +572,21 @@ impl LogWriter {
         volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
+        let meta = ActiveLogMeta {
+            generation,
+            filename: super::log_filename(generation),
+            created_at: None,
+            current_offset: 0,
+            record_count: 0,
+            total_data_bytes: 0,
+            is_open: false,
+        };
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Unopened {
                 generation,
                 created_at: None,
             }),
+            meta: RwLock::new(meta),
             batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
@@ -526,11 +608,21 @@ impl LogWriter {
         volume_key: Arc<VolumeKey>,
     ) -> io::Result<Self> {
         let lock = storage.acquire_exclusive_lock()?;
+        let meta = ActiveLogMeta {
+            generation,
+            filename: super::log_filename(generation),
+            created_at: Some(clock.now()),
+            current_offset: 0,
+            record_count: 0,
+            total_data_bytes: 0,
+            is_open: false,
+        };
         Ok(Self {
             active_state: Mutex::new(ActiveLogState::Unopened {
                 generation,
                 created_at: Some(clock.now()),
             }),
+            meta: RwLock::new(meta),
             batch_id: AtomicU64::new(start_batch_id),
             storage,
             max_log_size,
@@ -584,11 +676,11 @@ impl LogWriter {
 
     /// Returns `true` if a physical `.log` file has been created on disk.
     pub fn is_open(&self) -> bool {
-        let state = match self.active_state.lock() {
+        let meta = match self.meta.read() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        matches!(*state, ActiveLogState::Open(_))
+        meta.is_open
     }
 
     /// Seals the active generation if it has reached `max_log_size` or `max_log_age`, leaving
@@ -609,7 +701,7 @@ impl LogWriter {
         if !size_exceeded && !age_exceeded {
             return Ok(None);
         }
-        seal_into_lazy(&mut state, clock)
+        seal_into_lazy(&mut state, clock, &self.meta)
     }
 
     /// Ensures that the active log file is open. If it is currently lazy/unopened,
@@ -623,6 +715,7 @@ impl LogWriter {
         if let ActiveLogState::Unopened { generation, created_at } = *state {
             let c_time = created_at.unwrap_or_else(|| clock.now());
             let active_file = open_generation_file(&self.storage, &self.keying, generation, c_time)?;
+            self.update_meta_from_open(&active_file);
             *state = ActiveLogState::Open(active_file);
             log::info!("Lazily opened log file for generation {}", generation);
         }
@@ -660,10 +753,12 @@ impl LogWriter {
         let next_gen = next_generation(active.generation)?;
         match seal_and_open_next(active, &self.storage, &self.keying, clock, "Force-rolled") {
             Ok((next_active, sealed_info)) => {
+                self.update_meta_from_open(&next_active);
                 *state = ActiveLogState::Open(next_active);
                 Ok(Some(sealed_info))
             }
             Err(e) => {
+                self.update_meta_from_unopened(next_gen, None);
                 *state = ActiveLogState::Unopened {
                     generation: next_gen,
                     created_at: None,
@@ -681,7 +776,7 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        seal_into_lazy(&mut state, clock)
+        seal_into_lazy(&mut state, clock, &self.meta)
     }
 
     /// Captures a point-in-time snapshot of the log writer state (generation, offset,
@@ -726,8 +821,14 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
+        let was_unopened = matches!(*state, ActiveLogState::Unopened { .. });
         let active = state.get_or_open(&self.storage, &self.keying)?;
-        active.append_serialized(op_code, inode, value)
+        if was_unopened {
+            self.update_meta_from_open(active);
+        }
+        let res = active.append_serialized(op_code, inode, value)?;
+        self.update_meta_from_open(active);
+        Ok(res)
     }
 
     /// Appends a raw file data record from one or more contiguous slices, compressing
@@ -744,8 +845,14 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
+        let was_unopened = matches!(*state, ActiveLogState::Unopened { .. });
         let active = state.get_or_open(&self.storage, &self.keying)?;
-        active.append_data_slices(self.compression, inode, slices, total_uncompressed_len)
+        if was_unopened {
+            self.update_meta_from_open(active);
+        }
+        let res = active.append_data_slices(self.compression, inode, slices, total_uncompressed_len)?;
+        self.update_meta_from_open(active);
+        Ok(res)
     }
 
     /// Appends a data record from a single payload slice to the active log file,
@@ -765,8 +872,14 @@ impl LogWriter {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
+        let was_unopened = matches!(*state, ActiveLogState::Unopened { .. });
         let active = state.get_or_open(&self.storage, &self.keying)?;
-        active.append_raw_payload(op_code, inode, payload)
+        if was_unopened {
+            self.update_meta_from_open(active);
+        }
+        let res = active.append_raw_payload(op_code, inode, payload)?;
+        self.update_meta_from_open(active);
+        Ok(res)
     }
 
     /// Rolls back the active log file to the given `checkpoint`.
@@ -793,6 +906,7 @@ impl LogWriter {
             }
             active.record_count = checkpoint.record_count;
             active.total_data_bytes = checkpoint.total_data_bytes;
+            self.update_meta_from_open(active);
             res?;
         }
         Ok(())
@@ -832,6 +946,7 @@ impl LogWriter {
         if let ActiveLogState::Open(active) = &mut *state {
             active.record_count += record_count + 1;
             active.total_data_bytes += data_bytes;
+            self.update_meta_from_open(active);
         }
 
         Ok(batch_id)
@@ -851,40 +966,31 @@ impl LogWriter {
 
     /// Returns the current active generation number.
     pub fn generation(&self) -> u32 {
-        let state = match self.active_state.lock() {
+        let meta = match self.meta.read() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        match &*state {
-            ActiveLogState::Unopened { generation, .. } => *generation,
-            ActiveLogState::Open(active) => active.generation,
-        }
+        meta.generation
     }
 
     /// Returns the active log file name.
     pub fn filename(&self) -> String {
-        let state = match self.active_state.lock() {
+        let meta = match self.meta.read() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        match &*state {
-            ActiveLogState::Unopened { generation, .. } => super::log_filename(*generation),
-            ActiveLogState::Open(active) => active.filename.clone(),
-        }
+        meta.filename.clone()
     }
 
     /// Returns the current byte offset in the active generation log file.
     ///
     /// For unopened writers, returns `0` (before the initial `FileHeader`).
     pub fn current_offset(&self) -> u64 {
-        let state = match self.active_state.lock() {
+        let meta = match self.meta.read() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        match &*state {
-            ActiveLogState::Unopened { .. } => 0,
-            ActiveLogState::Open(active) => active.current_offset,
-        }
+        meta.current_offset
     }
 
     /// Returns the ID of the last committed flush batch, or 0 if none has been committed yet.
@@ -894,26 +1000,20 @@ impl LogWriter {
 
     /// Returns the number of user and flush records written to the active log file.
     pub fn record_count(&self) -> u32 {
-        let state = match self.active_state.lock() {
+        let meta = match self.meta.read() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        match &*state {
-            ActiveLogState::Unopened { .. } => 0,
-            ActiveLogState::Open(active) => active.record_count,
-        }
+        meta.record_count
     }
 
     /// Returns the total uncompressed data bytes written to the active log file.
     pub fn total_data_bytes(&self) -> u64 {
-        let state = match self.active_state.lock() {
+        let meta = match self.meta.read() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        match &*state {
-            ActiveLogState::Unopened { .. } => 0,
-            ActiveLogState::Open(active) => active.total_data_bytes,
-        }
+        meta.total_data_bytes
     }
 }
 
@@ -1329,5 +1429,158 @@ mod tests {
         assert_eq!(records2.len(), 2);
         assert_eq!(records2[1].header.op_code, OpCode::Data);
         assert_eq!(records2[1].payload, incompressible);
+    }
+
+    #[test]
+    fn test_metadata_queries_not_blocked_by_sync_or_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Default, Clone)]
+        struct IoBlocker {
+            block_sync: Arc<AtomicBool>,
+            in_sync: Arc<AtomicBool>,
+            release_sync: Arc<AtomicBool>,
+            block_append: Arc<AtomicBool>,
+            in_append: Arc<AtomicBool>,
+            release_append: Arc<AtomicBool>,
+        }
+
+        struct BlockingWriter {
+            inner: Box<dyn StorageWriter>,
+            blocker: IoBlocker,
+        }
+
+        impl StorageWriter for BlockingWriter {
+            fn append(&mut self, data: &[u8]) -> io::Result<()> {
+                if self.blocker.block_append.load(Ordering::SeqCst) {
+                    self.blocker.in_append.store(true, Ordering::SeqCst);
+                    while !self.blocker.release_append.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                self.inner.append(data)
+            }
+            fn truncate(&mut self, len: u64) -> io::Result<()> {
+                self.inner.truncate(len)
+            }
+            fn sync(&mut self) -> io::Result<()> {
+                if self.blocker.block_sync.load(Ordering::SeqCst) {
+                    self.blocker.in_sync.store(true, Ordering::SeqCst);
+                    while !self.blocker.release_sync.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                self.inner.sync()
+            }
+            fn len(&self) -> io::Result<u64> {
+                self.inner.len()
+            }
+        }
+
+        struct BlockingStorage {
+            base: MemoryStorage,
+            blocker: IoBlocker,
+        }
+
+        impl Storage for BlockingStorage {
+            fn open_reader(&self, name: &str) -> io::Result<Arc<dyn crate::storage::StorageReader>> {
+                self.base.open_reader(name)
+            }
+            fn open_writer(&self, name: &str, mode: WriteMode) -> io::Result<Box<dyn StorageWriter>> {
+                let inner = self.base.open_writer(name, mode)?;
+                Ok(Box::new(BlockingWriter {
+                    inner,
+                    blocker: self.blocker.clone(),
+                }))
+            }
+            fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+                self.base.rename(from, to)
+            }
+            fn remove_file(&self, name: &str) -> io::Result<()> {
+                self.base.remove_file(name)
+            }
+            fn list_files(&self) -> io::Result<Vec<String>> {
+                self.base.list_files()
+            }
+            fn exists(&self, name: &str) -> bool {
+                self.base.exists(name)
+            }
+            fn acquire_exclusive_lock(&self) -> io::Result<Box<dyn crate::storage::StorageLock>> {
+                self.base.acquire_exclusive_lock()
+            }
+        }
+
+        let blocker = IoBlocker::default();
+        let storage = Arc::new(BlockingStorage {
+            base: MemoryStorage::new(),
+            blocker: blocker.clone(),
+        });
+        let clock = SystemClock;
+        let writer = Arc::new(LogWriter::create(storage, 1, &clock, 100000, 1, VolumeKey::plaintext_arc()).unwrap());
+
+        writer.append_data(10, b"initial payload").unwrap();
+        writer
+            .emit_flush_commit(1, b"initial payload".len() as u64, clock.now())
+            .unwrap();
+        let initial_offset = writer.current_offset();
+        assert!(initial_offset > 0);
+        assert_eq!(writer.generation(), 1);
+        assert!(writer.is_open());
+        assert_eq!(writer.record_count(), 2);
+        assert_eq!(writer.total_data_bytes(), b"initial payload".len() as u64);
+
+        // 1. Verify that while `writer.flush()` is blocked in physical `sync()`,
+        // metadata queries return immediately.
+        blocker.block_sync.store(true, Ordering::SeqCst);
+        let writer_clone = Arc::clone(&writer);
+        let sync_handle = std::thread::spawn(move || {
+            writer_clone.flush().unwrap();
+        });
+
+        // Wait until background thread is blocked in `sync()`
+        while !blocker.in_sync.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Queries must succeed immediately without blocking on `active_state`
+        let t0 = std::time::Instant::now();
+        assert!(writer.is_open());
+        assert_eq!(writer.generation(), 1);
+        assert_eq!(writer.filename(), "000001.log");
+        assert_eq!(writer.current_offset(), initial_offset);
+        assert_eq!(writer.record_count(), 2);
+        assert_eq!(writer.total_data_bytes(), b"initial payload".len() as u64);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(100));
+
+        // Release the sync
+        blocker.release_sync.store(true, Ordering::SeqCst);
+        sync_handle.join().unwrap();
+
+        // 2. Verify that while `writer.append_data()` is blocked in physical `append()`
+        // (e.g. kernel dirty page writeback throttling), metadata queries return immediately.
+        blocker.block_append.store(true, Ordering::SeqCst);
+        let writer_clone2 = Arc::clone(&writer);
+        let large_payload = vec![0x55u8; 128 * 1024];
+        let append_handle = std::thread::spawn(move || {
+            writer_clone2.append_data(11, &large_payload).unwrap();
+        });
+
+        // Wait until background thread is blocked in `append()`
+        while !blocker.in_append.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Queries must succeed immediately
+        let t1 = std::time::Instant::now();
+        assert!(writer.is_open());
+        assert_eq!(writer.generation(), 1);
+        assert_eq!(writer.filename(), "000001.log");
+        assert!(t1.elapsed() < std::time::Duration::from_millis(100));
+
+        // Release the append
+        blocker.release_append.store(true, Ordering::SeqCst);
+        append_handle.join().unwrap();
+
+        assert_eq!(writer.record_count(), 2);
     }
 }
