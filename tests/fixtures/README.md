@@ -4,6 +4,14 @@ This directory contains checked-in golden on-disk storage fixtures used by `test
 
 ## Fixture Versions
 
+- `v2/`: Plaintext uncompressed golden files for format version 2 (`FileHeader` version 2, `SummaryHeader` version 1) - the current format. The same tree as `v1`, plus `dir_b/cloned.bin`, assembled by `copy_file_range` from records of other files, so `000001.log` carries `Ref` extents.
+  - `000000.summary`, `000001.log`, `000001.summary`, `*-dump.txt`, `fsck-report.txt`: as for `v1`.
+
+- `v2_key_file_compressed/`: The `v2` tree, ChaCha20-Poly1305 encrypted under the key in `key.pem`, with Zstd record compression.
+  - `key.pem`, `000000.summary`, `000001.log`, `000001.summary`, `*-dump.txt`, `fsck-report.txt`: as for `v1_key_file_compressed`.
+
+The `v1*` fixtures below are frozen: they were written by format version 1, which the generator can no longer produce.
+
 - `v1/`: Plaintext uncompressed golden files for format version 1 (`RecordHeader` version 1, `SummaryHeader` version 1).
   - `000000.summary`: Initial volume summary snapshot.
   - `000001.log`: 3 flushed commit batches covering directories, files, symlinks, special files, and extended attributes.
@@ -37,20 +45,17 @@ This directory contains checked-in golden on-disk storage fixtures used by `test
 
 ## Generating or Updating Fixtures
 
-Fixtures are generated deterministically using a fixed mock timestamp and explicit IVs via `generate_compat_fixture`:
+Fixtures are generated deterministically using a fixed mock timestamp and explicit IVs via `generate_compat_fixture`, which writes the current format version only:
 
 ```bash
-# Regenerate all golden fixtures:
+# Regenerate all golden fixtures of the current format version:
 cargo run --bin generate_compat_fixture
 
 # Regenerate specific golden fixtures:
-cargo run --bin generate_compat_fixture tests/fixtures/v1
-cargo run --bin generate_compat_fixture tests/fixtures/v1_key_file_compressed
-
-# Generate fixtures for a new format version (e.g. v2):
 cargo run --bin generate_compat_fixture tests/fixtures/v2
 cargo run --bin generate_compat_fixture tests/fixtures/v2_key_file_compressed
 ```
 
-Any new version subdirectories added to `tests/fixtures/` are automatically discovered and tested by `tests/compat_test.rs`.
+When a format change bumps `CURRENT_VERSION`, generate the new version's directories alongside the existing ones, which then become frozen.
 
+Any new version subdirectories added to `tests/fixtures/` are automatically discovered and tested by `tests/compat_test.rs`.

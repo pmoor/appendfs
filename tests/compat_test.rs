@@ -2,12 +2,9 @@
 //! reliably recovered, loaded, and written to by the current codebase.
 //!
 //! # Generating Golden Fixtures
-//! To generate or regenerate golden fixtures for any version:
+//! The generator writes fixtures for the current format version only; those of older
+//! versions are frozen.
 //! ```bash
-//! # For v1:
-//! cargo run --bin generate_compat_fixture tests/fixtures/v1
-//!
-//! # For a new format version (e.g. v2):
 //! cargo run --bin generate_compat_fixture tests/fixtures/v2
 //! ```
 //!
@@ -17,7 +14,7 @@
 use appendfs::FsTestExt;
 use appendfs::compat::{
     COMPAT_FSCK_REPORT_FILENAME, COMPAT_KEY_FILENAME, CompatFixtureConfig, create_canonical_compat_volume,
-    verify_compat_tree,
+    fixture_format_version, verify_compat_tree,
 };
 use appendfs::storage::OsStorage;
 use appendfs::{AppendFs, RecoveryTarget, Storage, SummaryReader, recover_fs};
@@ -56,7 +53,7 @@ pub fn verify_recovery_with_latest_summary_missing(fixture_dir: &Path) {
     .expect("recovery from 000000.summary + 000001.log must succeed");
 
     // 1. Verify reconstructed filesystem tree, files, symlinks, special files, and xattrs
-    verify_compat_tree(&fs);
+    verify_compat_tree(&fs, fixture_format_version(fixture_dir));
 
     // 2. Verify forward mutability on top of the reconstructed volume
     let writer = fs
@@ -101,7 +98,7 @@ pub fn verify_recovery_from_latest_summary_snapshot(fixture_dir: &Path) {
     .expect("recovery from latest summary snapshot must succeed");
 
     // 1. Verify filesystem state loaded directly from the summary snapshot
-    verify_compat_tree(&fs);
+    verify_compat_tree(&fs, fixture_format_version(fixture_dir));
 
     // 2. Verify forward mutability
     let writer = fs
@@ -537,6 +534,11 @@ pub fn verify_python_restore_script(fixture_dir: &Path) {
 
     let regrown = fs::read(dest_path.join("dir_b/regrown.bin")).expect("read regrown.bin");
     assert_eq!(regrown, appendfs::compat::compat_regrown_full());
+
+    if fixture_format_version(fixture_dir) >= 2 {
+        let cloned = fs::read(dest_path.join("dir_b/cloned.bin")).expect("read cloned.bin");
+        assert_eq!(cloned, appendfs::compat::compat_cloned_full());
+    }
 
     assert!(dest_path.join("dir_empty").is_dir());
     assert!(dest_path.join("dir_a/subdir_1/deep").is_dir());

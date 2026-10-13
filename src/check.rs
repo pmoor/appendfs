@@ -588,16 +588,9 @@ fn verify_raw_record(
         ));
     }
 
-    if rec_header.inode != record.inode {
-        return Err((
-            "CORRUPT_LOG_RECORD",
-            format!(
-                "Record at offset 0x{:x} belongs to inode {}, expected {}",
-                record.record_log_offset, rec_header.inode, record.inode
-            ),
-        ));
-    }
-
+    // The header names the inode that wrote the record, which need not be the one referencing
+    // it: `copy_file_range` shares records between files. The tag still binds the record to
+    // the inode in its header, so a relabelled record fails authentication below.
     let payload = &raw_record[RECORD_HEADER_SIZE..];
     file_key
         .decrypt_record(
@@ -666,7 +659,9 @@ pub fn plan_sampled_verification(fs: &AppendFs, options: &CheckOptions) -> Verif
                         continue;
                     }
 
-                    unique_records
+                    // Several inodes can share a record; it is reported against the lowest, so
+                    // the report does not depend on the order `base` is walked in.
+                    let record = unique_records
                         .entry((*generation, *record_log_offset))
                         .or_insert(LiveRecord {
                             inode: ino,
@@ -674,6 +669,7 @@ pub fn plan_sampled_verification(fs: &AppendFs, options: &CheckOptions) -> Verif
                             record_log_offset: *record_log_offset,
                             record_size: *record_size,
                         });
+                    record.inode = record.inode.min(ino);
                 }
             }
         }

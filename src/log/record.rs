@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
 pub const FILE_MAGIC: [u8; 4] = *b"APPF";
-pub const CURRENT_VERSION: u32 = 1;
+/// Version written into every new `.log` file. Version 2 added [`LogExtent::Ref`]; a version 1
+/// file never holds one, so reading it needs nothing beyond what version 2 reads.
+pub const CURRENT_VERSION: u32 = 2;
 /// magic(4) + version(4) + generation(4) + revision(2) + created_at seconds(8) + nanoseconds(4)
 /// + key_salt(16).
 pub const FILE_HEADER_SIZE: usize = 42;
@@ -62,7 +64,7 @@ impl FileHeader {
             return Err("invalid magic bytes");
         }
         let version = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
-        if version != CURRENT_VERSION {
+        if version == 0 || version > CURRENT_VERSION {
             return Err("unsupported file version");
         }
         let generation = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
@@ -298,6 +300,10 @@ impl From<LogDirectoryDelta> for DirectoryDelta {
 pub enum LogExtent {
     /// `length` bytes held by the record at `record_log_offset` in the same `.log` file.
     /// `record_size` is that record's physical on-disk size (header + payload).
+    ///
+    /// Only ever names a data record written by the same flush batch for the same inode -
+    /// which is what lets a replay that keeps one batch in memory, like `scripts/restore.py`,
+    /// resolve it. Anything else is a [`LogExtent::Ref`].
     Disk {
         file_offset: u64,
         record_log_offset: u64,
@@ -306,6 +312,28 @@ pub enum LogExtent {
     },
     /// A hole: `length` bytes that read as zeros. `u64` because a hole may exceed 4 GiB.
     Zero { file_offset: u64, length: u64 },
+    /// `length` bytes starting `payload_offset` bytes into the payload of a data record
+    /// written by an earlier batch: the record at `record_log_offset` in `generation`'s
+    /// `.log` file, which is this file or an older one, and may belong to another inode.
+    /// This is how `copy_file_range` shares data instead of copying it. Format version 2.
+    Ref {
+        file_offset: u64,
+        generation: u32,
+        record_log_offset: u64,
+        record_size: u32,
+        payload_offset: u32,
+        length: u32,
+    },
+}
+
+/// Where the flush batch being encoded began writing to the log.
+///
+/// Data records at or past this position were written by the batch itself; everything a
+/// file delta references from before it is encoded as a [`LogExtent::Ref`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchStart {
+    pub generation: u32,
+    pub offset: u64,
 }
 
 /// Persisted on-disk representation of a regular file delta.
@@ -316,8 +344,8 @@ pub struct LogFileDelta {
     pub attr_delta: LogAttrDelta,
 }
 
-impl From<&FileDelta> for LogFileDelta {
-    fn from(f: &FileDelta) -> Self {
+impl LogFileDelta {
+    pub fn encode(f: &FileDelta, batch: BatchStart) -> Self {
         let mut extents = Vec::new();
         for (&start, entry) in f.extents.iter() {
             // Matched exhaustively on purpose: an `if let` here would silently drop any
@@ -325,16 +353,31 @@ impl From<&FileDelta> for LogFileDelta {
             // resurrecting the data it masked at the next recovery.
             let log_extent = match &entry.extent {
                 Extent::Disk {
+                    generation,
                     record_log_offset,
                     record_size,
+                    payload_offset,
                     length,
-                    ..
-                } => LogExtent::Disk {
-                    file_offset: start,
-                    record_log_offset: *record_log_offset,
-                    record_size: *record_size,
-                    length: *length,
-                },
+                } => {
+                    let written_by_batch = *generation == batch.generation && *record_log_offset >= batch.offset;
+                    if written_by_batch && *payload_offset == 0 {
+                        LogExtent::Disk {
+                            file_offset: start,
+                            record_log_offset: *record_log_offset,
+                            record_size: *record_size,
+                            length: *length,
+                        }
+                    } else {
+                        LogExtent::Ref {
+                            file_offset: start,
+                            generation: *generation,
+                            record_log_offset: *record_log_offset,
+                            record_size: *record_size,
+                            payload_offset: *payload_offset,
+                            length: *length,
+                        }
+                    }
+                }
                 Extent::Zero { length } => LogExtent::Zero {
                     file_offset: start,
                     length: *length,
@@ -352,9 +395,7 @@ impl From<&FileDelta> for LogFileDelta {
             attr_delta: LogAttrDelta::from(&f.attr_delta),
         }
     }
-}
 
-impl LogFileDelta {
     pub fn into_file_delta(self, generation: u32) -> FileDelta {
         let mut extents = ExtentMap::with_capacity(self.extents.len());
         for ext in self.extents {
@@ -369,6 +410,17 @@ impl LogFileDelta {
                     Extent::new_disk(generation, record_log_offset, record_size, 0, length),
                 ),
                 LogExtent::Zero { file_offset, length } => extents.insert(file_offset, Extent::new_zero(length)),
+                LogExtent::Ref {
+                    file_offset,
+                    generation,
+                    record_log_offset,
+                    record_size,
+                    payload_offset,
+                    length,
+                } => extents.insert(
+                    file_offset,
+                    Extent::new_disk(generation, record_log_offset, record_size, payload_offset, length),
+                ),
             }
         }
         FileDelta {
@@ -447,11 +499,11 @@ pub enum LogNodeDelta {
     Socket(LogSpecialDelta),
 }
 
-impl From<&NodeDelta> for LogNodeDelta {
-    fn from(n: &NodeDelta) -> Self {
+impl LogNodeDelta {
+    pub fn encode(n: &NodeDelta, batch: BatchStart) -> Self {
         match n {
             NodeDelta::Directory(d) => LogNodeDelta::Directory(LogDirectoryDelta::from(d)),
-            NodeDelta::File(f) => LogNodeDelta::File(LogFileDelta::from(f)),
+            NodeDelta::File(f) => LogNodeDelta::File(LogFileDelta::encode(f, batch)),
             NodeDelta::Symlink(s) => LogNodeDelta::Symlink(LogSymlinkDelta::from(s)),
             NodeDelta::Fifo(s) => LogNodeDelta::Fifo(LogSpecialDelta::from(s)),
             NodeDelta::CharDevice(s) => LogNodeDelta::CharDevice(LogSpecialDelta::from(s)),
@@ -604,10 +656,11 @@ impl std::fmt::Display for LogEntryDelta {
     }
 }
 
-impl From<&EntryDelta> for LogEntryDelta {
-    fn from(e: &EntryDelta) -> Self {
+impl LogEntryDelta {
+    /// Encodes `e` for a record of the batch that began writing at `batch`.
+    pub fn encode(e: &EntryDelta, batch: BatchStart) -> Self {
         match e {
-            EntryDelta::Node(n) => LogEntryDelta::Node(LogNodeDelta::from(n)),
+            EntryDelta::Node(n) => LogEntryDelta::Node(LogNodeDelta::encode(n, batch)),
             EntryDelta::Tombstone => LogEntryDelta::Tombstone,
         }
     }
@@ -780,9 +833,94 @@ mod tests {
         assert_eq!(bytes, expected);
         assert_eq!(crate::wire::deserialize::<LogExtent>(&bytes).unwrap(), hole);
 
+        let shared = LogExtent::Ref {
+            file_offset: 6,
+            generation: 7,
+            record_log_offset: 8,
+            record_size: 9,
+            payload_offset: 10,
+            length: 11,
+        };
+        let bytes = crate::wire::serialize(&shared).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_be_bytes());
+        expected.extend_from_slice(&6u64.to_be_bytes());
+        expected.extend_from_slice(&7u32.to_be_bytes());
+        expected.extend_from_slice(&8u64.to_be_bytes());
+        expected.extend_from_slice(&9u32.to_be_bytes());
+        expected.extend_from_slice(&10u32.to_be_bytes());
+        expected.extend_from_slice(&11u32.to_be_bytes());
+        assert_eq!(bytes, expected);
+        assert_eq!(crate::wire::deserialize::<LogExtent>(&bytes).unwrap(), shared);
+
         let mut unknown = bytes;
-        unknown[..4].copy_from_slice(&2u32.to_be_bytes());
+        unknown[..4].copy_from_slice(&3u32.to_be_bytes());
         assert!(crate::wire::deserialize::<LogExtent>(&unknown).is_err());
+    }
+
+    /// Only a whole record the batch wrote itself may use the compact same-file form; every
+    /// other extent must carry its own generation and payload offset, or replay would read it
+    /// from the wrong file or the wrong place in the record.
+    #[test]
+    fn test_file_delta_encodes_extents_not_written_by_the_batch_as_refs() {
+        let batch = BatchStart {
+            generation: 3,
+            offset: 1000,
+        };
+        let mut extents = ExtentMap::new();
+        // Written by this batch.
+        extents.insert(0, Extent::new_disk(3, 1000, 140, 0, 100));
+        // Same generation, but written before the batch began.
+        extents.insert(100, Extent::new_disk(3, 500, 140, 0, 100));
+        // An older generation.
+        extents.insert(200, Extent::new_disk(1, 2000, 140, 0, 100));
+        // Written by this batch, but only the tail of the record.
+        extents.insert(300, Extent::new_disk(3, 1200, 140, 40, 60));
+        let delta = FileDelta {
+            extents,
+            size: Some(360),
+            attr_delta: AttrDelta::default(),
+        };
+
+        let encoded = LogFileDelta::encode(&delta, batch);
+        assert_eq!(
+            encoded.extents,
+            vec![
+                LogExtent::Disk {
+                    file_offset: 0,
+                    record_log_offset: 1000,
+                    record_size: 140,
+                    length: 100,
+                },
+                LogExtent::Ref {
+                    file_offset: 100,
+                    generation: 3,
+                    record_log_offset: 500,
+                    record_size: 140,
+                    payload_offset: 0,
+                    length: 100,
+                },
+                LogExtent::Ref {
+                    file_offset: 200,
+                    generation: 1,
+                    record_log_offset: 2000,
+                    record_size: 140,
+                    payload_offset: 0,
+                    length: 100,
+                },
+                LogExtent::Ref {
+                    file_offset: 300,
+                    generation: 3,
+                    record_log_offset: 1200,
+                    record_size: 140,
+                    payload_offset: 40,
+                    length: 60,
+                },
+            ]
+        );
+
+        let decoded = encoded.into_file_delta(batch.generation);
+        assert_eq!(decoded.extents, delta.extents);
     }
 
     #[test]
@@ -804,7 +942,11 @@ mod tests {
             },
         }));
 
-        let log_delta = LogEntryDelta::from(&dir_delta);
+        let batch = BatchStart {
+            generation: 1,
+            offset: 0,
+        };
+        let log_delta = LogEntryDelta::encode(&dir_delta, batch);
         let serialized = crate::wire::serialize(&log_delta).unwrap();
         let deserialized: LogEntryDelta = crate::wire::deserialize(&serialized).unwrap();
         let reconstructed = EntryDelta::from(deserialized);

@@ -251,8 +251,6 @@ impl<'a> InodeLayerStack<'a> {
     /// references to [`Arc<Vec<u8>>`] are cloned with zero byte-copying.
     ///
     /// If all requested bytes are covered by in-memory slices or holes, `has_cold_slices` will be false.
-    // TODO(too-many-lines): extract this into smaller units.
-    #[allow(clippy::too_many_lines)]
     pub fn plan_read_file_data(
         &self,
         offset: u64,
@@ -270,14 +268,99 @@ impl<'a> InodeLayerStack<'a> {
         }
 
         let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
-        let mut unfilled = vec![(offset, offset + read_len as u64)];
         let mut raw_slices: Vec<ReadSlice> = Vec::with_capacity(4);
 
-        let add_extent = |unfilled: &mut Vec<(u64, u64)>,
-                          raw_slices: &mut Vec<ReadSlice>,
-                          ext_start: u64,
-                          ext_len: u64,
-                          extent: &Extent| {
+        let holes = self.visit_extents(offset, read_len as u64, |seg_start, seg_len, inner_offset, extent| {
+            let inner_offset = inner_offset as usize;
+            let source = match extent {
+                Extent::Zero { .. } => ReadSliceSource::Zero,
+                Extent::Staged {
+                    data, payload_offset, ..
+                } => ReadSliceSource::Memory {
+                    data: data.clone(),
+                    src_offset: *payload_offset as usize + inner_offset,
+                },
+                Extent::Disk {
+                    generation,
+                    record_log_offset,
+                    record_size,
+                    payload_offset,
+                    ..
+                } => {
+                    let cached = log_cache.and_then(|c| c.get_cached_record(*generation, *record_log_offset));
+                    if let Some(cached_data) = cached {
+                        ReadSliceSource::Cache {
+                            data: cached_data,
+                            src_offset: *payload_offset as usize + inner_offset,
+                        }
+                    } else {
+                        ReadSliceSource::Disk {
+                            generation: *generation,
+                            record_log_offset: *record_log_offset,
+                            record_size: *record_size,
+                            payload_offset: *payload_offset,
+                            slice_inner_offset: inner_offset as u32,
+                        }
+                    }
+                }
+            };
+
+            raw_slices.push(ReadSlice {
+                dst_offset: (seg_start - offset) as usize,
+                len: seg_len as usize,
+                source,
+            });
+        });
+
+        for (u_start, u_end) in holes {
+            raw_slices.push(ReadSlice {
+                dst_offset: (u_start - offset) as usize,
+                len: (u_end - u_start) as usize,
+                source: ReadSliceSource::Zero,
+            });
+        }
+
+        raw_slices.sort_by_key(|s| s.dst_offset);
+
+        let has_cold_slices = raw_slices
+            .iter()
+            .any(|s| matches!(s.source, ReadSliceSource::Disk { .. }));
+
+        Ok(ReadPlan {
+            total_len: read_len,
+            has_cold_slices,
+            slices: raw_slices,
+        })
+    }
+
+    /// The extents that make up `[offset, offset + len)` of this file, oldest layers masked
+    /// by newer ones, each trimmed to the part inside the range and keyed by file offset.
+    /// Ranges no layer covers come back as explicit holes, so the result covers the whole
+    /// range with no gaps.
+    pub fn resolve_extents(&self, offset: u64, len: u64) -> Vec<(u64, Extent)> {
+        let mut resolved = Vec::new();
+        let holes = self.visit_extents(offset, len, |seg_start, seg_len, inner_offset, extent| {
+            let mut extent = extent.clone();
+            extent.trim_left(inner_offset);
+            extent.trim_right(seg_len);
+            resolved.push((seg_start, extent));
+        });
+        for (start, end) in holes {
+            resolved.push((start, Extent::new_zero(end - start)));
+        }
+        resolved.sort_by_key(|(start, _)| *start);
+        resolved
+    }
+
+    /// Walks the layers newest to oldest over `[offset, offset + len)`, calling `visit` for
+    /// every segment of it that the newest layer with an opinion on it covers, as `(segment
+    /// start, segment length, how far into the extent the segment begins, extent)`.
+    ///
+    /// Returns the `[start, end)` ranges no layer covers. They read as zeros.
+    fn visit_extents(&self, offset: u64, len: u64, mut visit: impl FnMut(u64, u64, u64, &Extent)) -> Vec<(u64, u64)> {
+        let mut unfilled = vec![(offset, offset + len)];
+
+        let mut add_extent = |unfilled: &mut Vec<(u64, u64)>, ext_start: u64, ext_len: u64, extent: &Extent| {
             if unfilled.is_empty() || ext_len == 0 {
                 return;
             }
@@ -295,47 +378,7 @@ impl<'a> InodeLayerStack<'a> {
                     continue;
                 }
 
-                let seg_len = (seg_end - seg_start) as usize;
-                let inner_offset = (seg_start - ext_start) as usize;
-
-                let source = match extent {
-                    Extent::Zero { .. } => ReadSliceSource::Zero,
-                    Extent::Staged {
-                        data, payload_offset, ..
-                    } => ReadSliceSource::Memory {
-                        data: data.clone(),
-                        src_offset: *payload_offset as usize + inner_offset,
-                    },
-                    Extent::Disk {
-                        generation,
-                        record_log_offset,
-                        record_size,
-                        payload_offset,
-                        ..
-                    } => {
-                        let cached = log_cache.and_then(|c| c.get_cached_record(*generation, *record_log_offset));
-                        if let Some(cached_data) = cached {
-                            ReadSliceSource::Cache {
-                                data: cached_data,
-                                src_offset: *payload_offset as usize + inner_offset,
-                            }
-                        } else {
-                            ReadSliceSource::Disk {
-                                generation: *generation,
-                                record_log_offset: *record_log_offset,
-                                record_size: *record_size,
-                                payload_offset: *payload_offset,
-                                slice_inner_offset: inner_offset as u32,
-                            }
-                        }
-                    }
-                };
-
-                raw_slices.push(ReadSlice {
-                    dst_offset: (seg_start - offset) as usize,
-                    len: seg_len,
-                    source,
-                });
+                visit(seg_start, seg_end - seg_start, seg_start - ext_start, extent);
 
                 if seg_start > u_start && seg_end < u_end {
                     unfilled[i] = (u_start, seg_start);
@@ -364,8 +407,8 @@ impl<'a> InodeLayerStack<'a> {
                     break;
                 }
                 EntryDelta::Node(NodeDelta::File(f)) => {
-                    for (ext_start, ext_len, extent) in f.extents.query(offset, read_len as u64) {
-                        add_extent(&mut unfilled, &mut raw_slices, ext_start, ext_len, &extent);
+                    for (ext_start, ext_len, extent) in f.extents.query(offset, len) {
+                        add_extent(&mut unfilled, ext_start, ext_len, &extent);
                         if unfilled.is_empty() {
                             break;
                         }
@@ -381,8 +424,8 @@ impl<'a> InodeLayerStack<'a> {
         {
             let node = arc.as_ref();
             if let NodeKind::File { extent_map, .. } = &node.kind {
-                for (ext_start, ext_len, extent) in extent_map.query(offset, read_len as u64) {
-                    add_extent(&mut unfilled, &mut raw_slices, ext_start, ext_len, &extent);
+                for (ext_start, ext_len, extent) in extent_map.query(offset, len) {
+                    add_extent(&mut unfilled, ext_start, ext_len, &extent);
                     if unfilled.is_empty() {
                         break;
                     }
@@ -390,25 +433,7 @@ impl<'a> InodeLayerStack<'a> {
             }
         }
 
-        for (u_start, u_end) in unfilled {
-            raw_slices.push(ReadSlice {
-                dst_offset: (u_start - offset) as usize,
-                len: (u_end - u_start) as usize,
-                source: ReadSliceSource::Zero,
-            });
-        }
-
-        raw_slices.sort_by_key(|s| s.dst_offset);
-
-        let has_cold_slices = raw_slices
-            .iter()
-            .any(|s| matches!(s.source, ReadSliceSource::Disk { .. }));
-
-        Ok(ReadPlan {
-            total_len: read_len,
-            has_cold_slices,
-            slices: raw_slices,
-        })
+        unfilled
     }
 
     /// Reads file data resolving extents across layers.

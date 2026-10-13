@@ -8,7 +8,8 @@ use crate::operations::links::readlink_core;
 use crate::operations::links::{link_core, symlink_core};
 use crate::operations::read_write::{
     FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_SIZE,
-    FUSE_SET_ATTR_UID, create_core, open_core, punch_hole_core, release_core, setattr_core, write_handle_core,
+    FUSE_SET_ATTR_UID, copy_file_range_core, create_core, open_core, punch_hole_core, release_core, setattr_core,
+    write_handle_core,
 };
 use crate::operations::special::mknod_core;
 use crate::operations::xattr::setxattr_core;
@@ -26,6 +27,22 @@ fn compat_write(fs: &AppendFs, ino: u64, buf: &[u8], offset: i64) -> Result<usiz
     res
 }
 
+fn compat_copy(
+    fs: &AppendFs,
+    ino_in: u64,
+    off_in: i64,
+    ino_out: u64,
+    off_out: i64,
+    len: u64,
+) -> Result<usize, FsError> {
+    let fh_in = open_core(fs, ino_in, libc::O_RDONLY as u32)?;
+    let fh_out = open_core(fs, ino_out, libc::O_WRONLY as u32)?;
+    let res = copy_file_range_core(fs, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, 0);
+    let _ = release_core(fs, ino_out, fh_out);
+    let _ = release_core(fs, ino_in, fh_in);
+    res
+}
+
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -33,7 +50,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Fixed base timestamp used for all canonical v1 compatibility fixtures:
+/// Fixed base timestamp used for all canonical compatibility fixtures:
 /// 2023-11-14 22:13:20 UTC (1,700,000,000 seconds since UNIX epoch).
 pub const COMPAT_BASE_TIMESTAMP_SECS: u64 = 1_700_000_000;
 
@@ -75,18 +92,23 @@ pub enum CompatFixtureConfig {
 impl CompatFixtureConfig {
     pub const ALL: [Self; 2] = [Self::UnencryptedUncompressed, Self::KeyFileCompressed];
 
-    pub fn default_dir_name(self) -> &'static str {
+    /// The fixture directory for this configuration in the current format version, such as
+    /// `v2` or `v2_key_file_compressed`.
+    pub fn default_dir_name(self) -> String {
+        let version = crate::log::record::CURRENT_VERSION;
         match self {
-            Self::UnencryptedUncompressed => "v1",
-            Self::KeyFileCompressed => "v1_key_file_compressed",
+            Self::UnencryptedUncompressed => format!("v{}", version),
+            Self::KeyFileCompressed => format!("v{}_key_file_compressed", version),
         }
     }
 
-    /// Maps a fixture directory such as `v2` or `v2_key_file_compressed` to its
-    /// configuration. Any other name - including the frozen legacy fixtures - is `None`.
+    /// Maps a fixture directory of the current format version, such as `v2` or
+    /// `v2_key_file_compressed`, to its configuration. Any other name is `None` - including
+    /// every fixture of an older version, which is frozen: the generator only writes the
+    /// current format, so regenerating one would silently replace it with a newer one.
     pub fn from_dir_path(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_str()?;
-        let suffix = name.strip_prefix('v')?.trim_start_matches(|c: char| c.is_ascii_digit());
+        let suffix = name.strip_prefix(&format!("v{}", crate::log::record::CURRENT_VERSION))?;
         match suffix {
             "" => Some(Self::UnencryptedUncompressed),
             "_key_file_compressed" => Some(Self::KeyFileCompressed),
@@ -249,6 +271,14 @@ pub fn compat_multi_extent_full() -> Vec<u8> {
 }
 
 /// Final contents of `/dir_b/regrown.bin`.
+/// Expected contents of `/dir_b/cloned.bin`: bytes 256..768 of data.bin, then hello.txt's
+/// first 16 bytes.
+pub fn compat_cloned_full() -> Vec<u8> {
+    let mut v = compat_data_bin()[256..768].to_vec();
+    v.extend_from_slice(b"Hello, AppendFS ");
+    v
+}
+
 pub fn compat_regrown_full() -> Vec<u8> {
     let mut data = vec![0xBB; 4096];
     data.resize(8192, 0);
@@ -564,6 +594,25 @@ pub fn populate_compat_tree(fs: &AppendFs, clock: &CompatClock) -> Result<(), Fs
         FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID | FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME,
     )?;
 
+    // Format v2: a file assembled by `copy_file_range` from records flushed by earlier
+    // batches - the middle of data.bin, then the head of hello.txt - so the log carries `Ref`
+    // extents into other inodes' records, one of them starting partway into its record.
+    clock.set_offset(370);
+    let cloned = create_core(fs, dir_b.ino, "cloned.bin", 0o644, 0, 1003, 1003)?;
+    compat_copy(fs, data_bin.ino, 256, cloned.ino, 0, 512)?;
+    compat_copy(fs, hello_file.ino, 0, cloned.ino, 512, 16)?;
+    setattr_core(
+        fs,
+        cloned.ino,
+        0o644,
+        1003,
+        1003,
+        0,
+        compat_time(370),
+        compat_time(380),
+        FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID | FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME,
+    )?;
+
     // Set final explicit mtimes/atimes on directories now that all children have been added
     setattr_core(
         fs,
@@ -799,7 +848,7 @@ pub fn lookup_path(fs: &AppendFs, path: &str) -> Option<u64> {
 // TODO(too-many-lines): extract this into smaller units.
 #[allow(clippy::too_many_lines)]
 #[cfg(any(test, feature = "testing"))]
-pub fn verify_compat_tree(fs: &AppendFs) {
+pub fn verify_compat_tree(fs: &AppendFs, format_version: u32) {
     // 1. Root directory (Inode 1)
     let root_attr = fs.get_attr(1).expect("root directory must exist");
     assert_eq!(root_attr.file_type, FileType::Directory);
@@ -1010,4 +1059,32 @@ pub fn verify_compat_tree(fs: &AppendFs) {
         fs.read_at(ino_regrown, 0, 8292).expect("read compat file"),
         compat_regrown_full()
     );
+
+    // /dir_b/cloned.bin, assembled by copy_file_range from format v2 on
+    let cloned = lookup_path(fs, "/dir_b/cloned.bin");
+    if format_version < 2 {
+        assert_eq!(cloned, None, "copy_file_range arrived with format v2");
+        return;
+    }
+    let ino_cloned = cloned.expect("/dir_b/cloned.bin must exist");
+    let attr = fs.get_attr(ino_cloned).unwrap();
+    assert_eq!(attr.file_type, FileType::RegularFile);
+    assert_eq!(attr.size, 528);
+    assert_eq!(attr.perm & 0o777, 0o644);
+    assert_eq!(attr.uid, 1003);
+    assert_eq!(attr.gid, 1003);
+    assert_eq!(attr.atime, compat_time(370));
+    assert_eq!(attr.mtime, compat_time(380));
+    assert_eq!(fs.read_all(ino_cloned).expect("read compat file"), compat_cloned_full());
+}
+
+/// The log format version `fixture_dir` was written in, from its log file's header.
+pub fn fixture_format_version(fixture_dir: &Path) -> u32 {
+    let bytes = fs::read(fixture_dir.join("000001.log")).expect("read fixture log");
+    let header: &[u8; crate::log::FILE_HEADER_SIZE] = bytes[..crate::log::FILE_HEADER_SIZE]
+        .try_into()
+        .expect("fixture log shorter than its header");
+    crate::log::FileHeader::from_bytes(header)
+        .expect("parse fixture log header")
+        .version
 }

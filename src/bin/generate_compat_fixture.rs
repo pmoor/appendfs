@@ -7,16 +7,13 @@
 //! cargo run --bin generate_compat_fixture --all
 //!
 //! # Regenerate specific fixtures:
-//! cargo run --bin generate_compat_fixture tests/fixtures/v1
-//! cargo run --bin generate_compat_fixture tests/fixtures/v1_key_file_compressed
-//!
-//! # Generate fixtures for a new format version (e.g. v2):
 //! cargo run --bin generate_compat_fixture tests/fixtures/v2
 //! cargo run --bin generate_compat_fixture tests/fixtures/v2_key_file_compressed
 //! ```
 //!
-//! The legacy `v1_passphrase_compressed` and `v1_secret_key_passphrase_compressed` fixtures
-//! cannot be generated: the credential modes they were created under no longer exist.
+//! Only fixtures of the current format version (`CURRENT_VERSION`) can be generated. Those of
+//! older versions, such as `v1`, are frozen: they are what proves volumes written in those
+//! formats still recover.
 
 use appendfs::compat::{
     COMPAT_FIXTURE_DUMP_FILES, COMPAT_FIXTURE_FILES, COMPAT_FSCK_REPORT_FILENAME, COMPAT_KEY_FILENAME,

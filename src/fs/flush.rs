@@ -8,7 +8,7 @@
 use super::{AppendFs, FlushReason, FsInner, ShutdownState};
 use crate::error::FsError;
 use crate::extent_map::{Extent, ExtentMap, StagedBuffer};
-use crate::log::{GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode};
+use crate::log::{BatchStart, GenerationLiveStats, LogEntryDelta, LogFileInfo, LogWriter, OpCode};
 use crate::node::{EntryDelta, NodeDelta};
 use crate::operations::locks::LockManager;
 use crate::storage::Storage;
@@ -313,6 +313,10 @@ impl AppendFs {
         let max_extent_size = self.max_extent_size.clamp(1, u32::MAX as usize);
 
         let batch_checkpoint = writer.checkpoint();
+        let batch_start = BatchStart {
+            generation: batch_checkpoint.generation,
+            offset: batch_checkpoint.offset,
+        };
 
         let write_res = (|| -> std::io::Result<(u64, u64)> {
             let mut written_count = 0u32;
@@ -353,7 +357,7 @@ impl AppendFs {
             // 2. Flush Inode Delta records
             for &ino in &inos {
                 if let Some(entry_delta) = frozen.get(&ino) {
-                    let log_entry = LogEntryDelta::from(entry_delta);
+                    let log_entry = LogEntryDelta::encode(entry_delta, batch_start);
                     writer.append_serialized(OpCode::InodeDelta, ino, &log_entry)?;
                     written_count += 1;
                 }

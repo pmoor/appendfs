@@ -784,8 +784,8 @@ mod tests {
 
         let manifest = recovered.manifest.read().unwrap();
         assert_eq!(manifest.logs.len(), 2);
-        assert_eq!(manifest.logs[0].version, 1);
-        assert_eq!(manifest.logs[1].version, 1);
+        assert_eq!(manifest.logs[0].version, crate::log::record::CURRENT_VERSION);
+        assert_eq!(manifest.logs[1].version, crate::log::record::CURRENT_VERSION);
         assert!(manifest.logs[0].is_sealed(), "gen 1 was cleanly rolled and sealed");
         assert!(manifest.logs[0].sealed_at.is_some());
         assert!(
@@ -840,8 +840,8 @@ mod tests {
 
         let manifest = recovered.manifest.read().unwrap();
         assert_eq!(manifest.logs.len(), 2);
-        assert_eq!(manifest.logs[0].version, 1);
-        assert_eq!(manifest.logs[1].version, 1);
+        assert_eq!(manifest.logs[0].version, crate::log::record::CURRENT_VERSION);
+        assert_eq!(manifest.logs[1].version, crate::log::record::CURRENT_VERSION);
         assert!(!manifest.logs[0].is_sealed(), "gen 1 crashed without seal");
         assert_eq!(manifest.logs[0].sealed_at, None);
         assert!(!manifest.logs[1].is_sealed(), "gen 2 crashed without seal");

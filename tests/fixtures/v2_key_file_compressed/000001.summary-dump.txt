@@ -1,0 +1,79 @@
+=== appendfs Summary File Dump ===
+File:                "000001.summary"
+Generation:          1
+Format Version:      1
+Last Batch ID:       3
+Next Inode:          21
+File Size:           1.06 KiB
+Encryption:          ChaCha20-Poly1305
+Checksum (BLAKE3):   82be53863eb34ac2269c8b6896e313d1619645ee9a1a5fb466d97a54bfa21feb (VERIFIED)
+
+--- Inode Breakdown ---
+Total Inodes:        20 (6 directories, 7 regular files, 3 symlinks)
+Logical Data Size:   45.75 KiB
+
+--- File Extension Breakdown ---
+EXTENSION                   FILES   % OF FILES    TOTAL BYTES   % OF BYTES
+------------------------ -------- ------------ -------------- ------------
+.dat                            1        14.3%      32.00 KiB        69.9%
+.bin                            4        57.1%      13.71 KiB        30.0%
+.txt                            2        28.6%           40 B         0.1%
+
+--- File Extent & Fragmentation Statistics ---
+Total Regular Files: 7
+Total File Extents:  12
+Avg Extents / File:  1.71
+Max Extents in File: 3
+
+Extents / File Distribution:
+EXTENTS RANGE               FILES   % OF FILES   DISTRIBUTION
+------------------------ -------- ------------   --------------------
+1 extent (contiguous)           1        14.3%   ███                 
+2 - 4 extents                   5        71.4%   ██████████████      
+5 - 16 extents                  0         0.0%                       
+17 - 64 extents                 0         0.0%                       
+> 64 extents                    0         0.0%                       
+
+--- Top Files by Extent Count ---
+INODE            SIZE   EXTENTS  AVG EXTENT SIZE   PATH
+-------- ------------ --------- ----------------   ------------------------------
+11           8.10 KiB         3         2.70 KiB   /dir_b/regrown.bin
+10          32.00 KiB         2        16.00 KiB   /dir_b/multi_extent.dat
+12           4.10 KiB         2         2.05 KiB   /sparse_file.bin
+20              528 B         2            264 B   /dir_b/cloned.bin
+4                40 B         2             20 B   /dir_b/hello_hardlink.txt
+
+--- Tracked Log Generations Manifest ---
+Tracked Logs:        1 log generation files
+
+LOG FILE          RECORDS     LOG SIZE    DATA SIZE    LIVE DATA  EXTENTS   LIVE RATIO  STATUS
+-------------- ---------- ------------ ------------ ------------ -------- ------------  ------------------------
+000001.log             43     6.16 KiB    41.23 KiB    37.23 KiB       10        90.3%  Healthy
+
+=== Summary Inode Records ===
+#1     [Inode 1    ] Directory  "/" (mode 0o755, uid 1000, gid 1000, entries: 10, mtime: 1700000330.000000000s (2023-11-14 22:18:50 UTC))
+      entries: ["dir_a" -> Inode 3, "dir_b" -> Inode 7, "dir_empty" -> Inode 2, "hello.txt" -> Inode 4, "sparse_file.bin" -> Inode 12, "special_blk" -> Inode 18, "special_chr" -> Inode 17, "special_fifo" -> Inode 16, "special_sock" -> Inode 19, "symlink_rel" -> Inode 13]
+#2     [Inode 2    ] Directory  "/dir_empty" (mode 0o755, uid 1000, gid 1000, entries: 0, mtime: 1700000020.000000000s (2023-11-14 22:13:40 UTC))
+#3     [Inode 3    ] Directory  "/dir_a" (mode 0o755, uid 1001, gid 1001, entries: 4, mtime: 1700000040.000000000s (2023-11-14 22:14:00 UTC))
+      entries: ["empty_file.txt" -> Inode 8, "subdir_1" -> Inode 5, "symlink_abs" -> Inode 14, "symlink_dir" -> Inode 15]
+      xattrs: ["user.dir_attr" (12 bytes)]
+#4     [Inode 4    ] RegularFile "/dir_b/hello_hardlink.txt" (size 40 B, extents 2, mode 0o644, uid 1001, gid 1001, mtime: 1700000120.000000000s (2023-11-14 22:15:20 UTC))
+      xattrs: ["user.second_attr" (8 bytes), "user.test_attr" (9 bytes)]
+#5     [Inode 5    ] Directory  "/dir_a/subdir_1" (mode 0o700, uid 1001, gid 1001, entries: 2, mtime: 1700000060.000000000s (2023-11-14 22:14:20 UTC))
+      entries: ["data.bin" -> Inode 9, "deep" -> Inode 6]
+#6     [Inode 6    ] Directory  "/dir_a/subdir_1/deep" (mode 0o750, uid 1002, gid 1002, entries: 0, mtime: 1700000080.000000000s (2023-11-14 22:14:40 UTC))
+#7     [Inode 7    ] Directory  "/dir_b" (mode 0o750, uid 1003, gid 1003, entries: 4, mtime: 1700000100.000000000s (2023-11-14 22:15:00 UTC))
+      entries: ["cloned.bin" -> Inode 20, "hello_hardlink.txt" -> Inode 4, "multi_extent.dat" -> Inode 10, "regrown.bin" -> Inode 11]
+#8     [Inode 8    ] RegularFile "/dir_a/empty_file.txt" (size 0 B, extents 0, mode 0o640, uid 1001, gid 1001, mtime: 1700000140.000000000s (2023-11-14 22:15:40 UTC))
+#9     [Inode 9    ] RegularFile "/dir_a/subdir_1/data.bin" (size 1.00 KiB, extents 1, mode 0o600, uid 1002, gid 1002, mtime: 1700000160.000000000s (2023-11-14 22:16:00 UTC))
+#10    [Inode 10   ] RegularFile "/dir_b/multi_extent.dat" (size 32.00 KiB, extents 2, mode 0o644, uid 1003, gid 1003, mtime: 1700000180.000000000s (2023-11-14 22:16:20 UTC))
+#11    [Inode 11   ] RegularFile "/dir_b/regrown.bin" (size 8.10 KiB, extents 3, mode 0o644, uid 1003, gid 1003, mtime: 1700000360.000000000s (2023-11-14 22:19:20 UTC))
+#12    [Inode 12   ] RegularFile "/sparse_file.bin" (size 4.10 KiB, extents 2, mode 0o644, uid 1001, gid 1001, mtime: 1700000200.000000000s (2023-11-14 22:16:40 UTC))
+#13    [Inode 13   ] Symlink    "/symlink_rel" -> "hello.txt" (uid 1001, gid 1001, mtime: 1700000220.000000000s (2023-11-14 22:17:00 UTC))
+#14    [Inode 14   ] Symlink    "/dir_a/symlink_abs" -> "/dir_b/multi_extent.dat" (uid 1001, gid 1001, mtime: 1700000240.000000000s (2023-11-14 22:17:20 UTC))
+#15    [Inode 15   ] Symlink    "/dir_a/symlink_dir" -> "/dir_a/subdir_1" (uid 1001, gid 1001, mtime: 1700000260.000000000s (2023-11-14 22:17:40 UTC))
+#16    [Inode 16   ] FIFO       "/special_fifo" (mode 0o644, uid 1000, gid 1000, mtime: 1700000280.000000000s (2023-11-14 22:18:00 UTC))
+#17    [Inode 17   ] CharDev    "/special_chr" (rdev 0x1234, mode 0o660, uid 1000, gid 1000, mtime: 1700000300.000000000s (2023-11-14 22:18:20 UTC))
+#18    [Inode 18   ] BlockDev   "/special_blk" (rdev 0x5678, mode 0o660, uid 1000, gid 1000, mtime: 1700000320.000000000s (2023-11-14 22:18:40 UTC))
+#19    [Inode 19   ] Socket     "/special_sock" (mode 0o755, uid 1000, gid 1000, mtime: 1700000340.000000000s (2023-11-14 22:19:00 UTC))
+#20    [Inode 20   ] RegularFile "/dir_b/cloned.bin" (size 528 B, extents 2, mode 0o644, uid 1003, gid 1003, mtime: 1700000380.000000000s (2023-11-14 22:19:40 UTC))

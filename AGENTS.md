@@ -137,9 +137,9 @@ timeout 5m cargo test --test compat_test
 ### Generating Golden Fixtures
 Golden fixtures are produced deterministically via the `generate_compat_fixture` binary:
 
-- **Immutable v1 fixtures**:
-  Existing `v1` fixtures represent the live on-disk format and must **never** be regenerated.
-- **Generate fixtures for a new format version (e.g. v2)**:
+- **Frozen older fixtures**:
+  Fixtures of every format version before the current one (`v1*` today) must **never** be regenerated. The generator only writes the current format, and refuses any other version's directory.
+- **Generate fixtures for the current format version (`CURRENT_VERSION`, e.g. v2)**:
   ```bash
   cargo run --bin generate_compat_fixture tests/fixtures/v2
   ```

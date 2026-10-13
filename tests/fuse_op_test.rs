@@ -15,7 +15,7 @@ fn mock_time() -> SystemTime {
 #[test]
 fn test_fuse_op_exhaustive_properties() {
     assert_eq!(ALL_FUSE_OPS.len(), FUSE_OP_COUNT);
-    assert_eq!(FUSE_OP_COUNT, 31);
+    assert_eq!(FUSE_OP_COUNT, 32);
 
     for (idx, op) in ALL_FUSE_OPS.iter().enumerate() {
         assert_eq!(op.index(), idx);
@@ -35,6 +35,7 @@ fn test_fuse_op_exhaustive_properties() {
     assert!(FuseOp::Setxattr.is_mutating());
     assert!(FuseOp::Removexattr.is_mutating());
     assert!(FuseOp::Fallocate.is_mutating());
+    assert!(FuseOp::CopyFileRange.is_mutating());
 
     // Verify read classification
     assert!(FuseOp::Read.is_read());
@@ -48,6 +49,7 @@ fn test_fuse_op_exhaustive_properties() {
     // Verify tier categorization
     assert_eq!(FuseOp::Write.tier(), OpTier::Write);
     assert_eq!(FuseOp::Fallocate.tier(), OpTier::Write);
+    assert_eq!(FuseOp::CopyFileRange.tier(), OpTier::Write);
     assert_eq!(FuseOp::Create.tier(), OpTier::Metadata);
     assert_eq!(FuseOp::Read.tier(), OpTier::ReadOnly);
 }

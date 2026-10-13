@@ -90,6 +90,19 @@ type ShimSetattrCallback = extern "C" fn(
     to_set: u32,
 );
 
+/// Parameters in libfuse's order: each side's inode, offset, then file handle.
+type ShimCopyFileRangeCallback = extern "C" fn(
+    req: Request,
+    ino_in: u64,
+    off_in: i64,
+    fh_in: u64,
+    ino_out: u64,
+    off_out: i64,
+    fh_out: u64,
+    len: usize,
+    flags: c_int,
+);
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShimFlock {
@@ -136,6 +149,7 @@ struct RustLowlevelOps {
         Option<extern "C" fn(req: Request, ino: u64, name: *const c_char, value: *const u8, size: usize, flags: c_int)>,
     listxattr: Option<extern "C" fn(req: Request, ino: u64, size: usize)>,
     removexattr: Option<extern "C" fn(req: Request, ino: u64, name: *const c_char)>,
+    copy_file_range: Option<ShimCopyFileRangeCallback>,
     init: Option<extern "C" fn(userdata: *mut c_void) -> c_int>,
     destroy: Option<extern "C" fn(userdata: *mut c_void)>,
 }
@@ -1099,6 +1113,18 @@ pub trait Filesystem {
     fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> Result<FuseResponse<'static>, FsError>;
     fn listxattr(&self, ino: u64, size: usize) -> Result<FuseResponse<'static>, FsError>;
     fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError>;
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        ino_in: u64,
+        fh_in: u64,
+        off_in: i64,
+        ino_out: u64,
+        fh_out: u64,
+        off_out: i64,
+        len: u64,
+        flags: u32,
+    ) -> Result<FuseResponse<'static>, FsError>;
 }
 
 /// Real uid and gid of the calling process.
@@ -1334,6 +1360,32 @@ extern "C" fn removexattr_bridge(req: Request, ino: u64, name: *const c_char) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+extern "C" fn copy_file_range_bridge(
+    req: Request,
+    ino_in: u64,
+    off_in: i64,
+    fh_in: u64,
+    ino_out: u64,
+    off_out: i64,
+    fh_out: u64,
+    len: usize,
+    flags: c_int,
+) {
+    handle_op(req, FuseOp::CopyFileRange, |fs| {
+        fs.copy_file_range(
+            ino_in,
+            fh_in,
+            off_in,
+            ino_out,
+            fh_out,
+            off_out,
+            len as u64,
+            flags as u32,
+        )
+    });
+}
+
 /// Returns 0, or the errno that `run_fuse_ll` should fail the mount with.
 extern "C" fn init_bridge(userdata: *mut c_void) -> c_int {
     let fs = unsafe { &*(userdata as *const std::sync::Arc<crate::fs::AppendFs>) };
@@ -1404,6 +1456,7 @@ pub fn mount_arc(args: Vec<String>, fs: std::sync::Arc<crate::fs::AppendFs>) -> 
         setxattr: Some(setxattr_bridge),
         listxattr: Some(listxattr_bridge),
         removexattr: Some(removexattr_bridge),
+        copy_file_range: Some(copy_file_range_bridge),
         init: Some(init_bridge),
         destroy: Some(destroy_bridge),
     };

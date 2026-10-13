@@ -4,8 +4,8 @@ use crate::operations::dir::{fsyncdir_response, list_dir_core, mkdir_core, opend
 use crate::operations::links::{link_core, readlink_core, rename_core, symlink_core, unlink_core};
 use crate::operations::read_write::{
     FUSE_SET_ATTR_ATIME, FUSE_SET_ATTR_GID, FUSE_SET_ATTR_MODE, FUSE_SET_ATTR_MTIME, FUSE_SET_ATTR_SIZE,
-    FUSE_SET_ATTR_UID, create_core, fsync_response, getattr_core, open_core, punch_hole_core, read_response,
-    release_core, setattr_core, write_handle_core,
+    FUSE_SET_ATTR_UID, copy_file_range_core, create_core, fsync_response, getattr_core, open_core, punch_hole_core,
+    read_response, release_core, setattr_core, write_handle_core,
 };
 use crate::operations::special::mknod_core;
 use crate::operations::xattr::{getxattr_core, listxattr_core, removexattr_core, setxattr_core};
@@ -29,6 +29,10 @@ pub trait FsTestExt {
     /// Writes `buf` at `offset` through a read-write handle opened and released around the
     /// call, so the caller does not need one of its own.
     fn write_at(&self, ino: u64, buf: &[u8], offset: i64) -> Result<usize, FsError>;
+
+    /// Runs `copy_file_range` from `ino_in` at `off_in` to `ino_out` at `off_out` through
+    /// handles opened and released around the call, returning how many bytes it copied.
+    fn copy_range(&self, ino_in: u64, off_in: i64, ino_out: u64, off_out: i64, len: u64) -> Result<usize, FsError>;
 
     /// Reads up to `size` bytes at `offset` through a read-only handle opened and released
     /// around the call.
@@ -178,6 +182,17 @@ impl FsTestExt for AppendFs {
         let fh = open_core(self, ino, libc::O_RDWR as u32)?;
         let res = write_handle_core(self, ino, fh, buf, offset);
         let _ = release_core(self, ino, fh);
+        res
+    }
+
+    fn copy_range(&self, ino_in: u64, off_in: i64, ino_out: u64, off_out: i64, len: u64) -> Result<usize, FsError> {
+        let fh_in = open_core(self, ino_in, libc::O_RDONLY as u32)?;
+        let res = open_core(self, ino_out, libc::O_WRONLY as u32).and_then(|fh_out| {
+            let res = copy_file_range_core(self, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, 0);
+            let _ = release_core(self, ino_out, fh_out);
+            res
+        });
+        let _ = release_core(self, ino_in, fh_in);
         res
     }
 

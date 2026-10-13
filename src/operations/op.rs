@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Exhaustive enum of all 31 FUSE operations implemented by AppendFS.
+/// Exhaustive enum of all 32 FUSE operations implemented by AppendFS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FuseOp {
@@ -38,9 +38,10 @@ pub enum FuseOp {
     Setxattr = 28,
     Listxattr = 29,
     Removexattr = 30,
+    CopyFileRange = 31,
 }
 
-pub const FUSE_OP_COUNT: usize = 31;
+pub const FUSE_OP_COUNT: usize = 32;
 
 pub const ALL_FUSE_OPS: [FuseOp; FUSE_OP_COUNT] = [
     FuseOp::Lookup,
@@ -74,6 +75,7 @@ pub const ALL_FUSE_OPS: [FuseOp; FUSE_OP_COUNT] = [
     FuseOp::Setxattr,
     FuseOp::Listxattr,
     FuseOp::Removexattr,
+    FuseOp::CopyFileRange,
 ];
 
 impl FuseOp {
@@ -117,6 +119,7 @@ impl FuseOp {
             Self::Setxattr => "setxattr",
             Self::Listxattr => "listxattr",
             Self::Removexattr => "removexattr",
+            Self::CopyFileRange => "copy_file_range",
         }
     }
 
@@ -156,7 +159,7 @@ impl FuseOp {
             | Self::Removexattr => OpTier::Metadata,
 
             // Write: Delays as soon as flushing queues saturate; stalls at 100% capacity
-            Self::Write | Self::Fsync | Self::Fallocate | Self::Fsyncdir => OpTier::Write,
+            Self::Write | Self::Fsync | Self::Fallocate | Self::Fsyncdir | Self::CopyFileRange => OpTier::Write,
         }
     }
 
@@ -180,7 +183,7 @@ pub enum OpTier {
     ReadOnly,
     /// Light metadata mutations (e.g. mkdir, unlink, rename, setattr).
     Metadata,
-    /// Heavy payload write mutations (write, fallocate).
+    /// Heavy payload write mutations (write, fallocate, copy_file_range).
     Write,
 }
 

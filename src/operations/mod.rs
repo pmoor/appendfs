@@ -182,4 +182,18 @@ impl Filesystem for AppendFs {
     fn removexattr(&self, ino: u64, name: &str) -> Result<FuseResponse<'static>, FsError> {
         xattr::removexattr_core(self, ino, name)
     }
+
+    fn copy_file_range(
+        &self,
+        ino_in: u64,
+        fh_in: u64,
+        off_in: i64,
+        ino_out: u64,
+        fh_out: u64,
+        off_out: i64,
+        len: u64,
+        flags: u32,
+    ) -> Result<FuseResponse<'static>, FsError> {
+        read_write::copy_file_range_response(self, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags)
+    }
 }

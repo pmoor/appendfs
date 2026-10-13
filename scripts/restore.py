@@ -41,6 +41,8 @@ import zstandard as zstd
 
 
 FILE_MAGIC = b"APPF"
+# Log format versions this script replays. Version 2 added EXTENT_REF.
+SUPPORTED_LOG_VERSIONS = (1, 2)
 SUMMARY_MAGIC = b"APPS"
 FILE_HEADER_SIZE = 42
 RECORD_HEADER_SIZE = 37
@@ -67,6 +69,7 @@ TAG_SOCKET = 7
 
 EXTENT_DISK = 0
 EXTENT_ZERO = 1
+EXTENT_REF = 2
 
 DATA_KEY_CONTEXT = "appendfs volume data key v1"
 KCV_KEY_CONTEXT = "appendfs key check value v1"
@@ -184,18 +187,28 @@ def parse_entry_delta(payload: bytes) -> tuple:
         extents_cnt = r.read_u64()
         extents = []
         for _ in range(extents_cnt):
-            # (file_off, rec_log_off, length); rec_log_off is None for a hole.
+            # (file_off, length, source), where source is None for a hole, ("batch", rec_log_off)
+            # for a data record of this inode in the same batch, or ("ref", generation,
+            # rec_log_off, payload_off) for one written earlier, in any log file.
             kind = r.read_u32()
             if kind == EXTENT_DISK:
                 file_off = r.read_u64()
                 rec_log_off = r.read_u64()
                 _rec_size = r.read_u32()
                 length = r.read_u32()
-                extents.append((file_off, rec_log_off, length))
+                extents.append((file_off, length, ("batch", rec_log_off)))
             elif kind == EXTENT_ZERO:
                 file_off = r.read_u64()
                 length = r.read_u64()
-                extents.append((file_off, None, length))
+                extents.append((file_off, length, None))
+            elif kind == EXTENT_REF:
+                file_off = r.read_u64()
+                generation = r.read_u32()
+                rec_log_off = r.read_u64()
+                _rec_size = r.read_u32()
+                payload_off = r.read_u32()
+                length = r.read_u32()
+                extents.append((file_off, length, ("ref", generation, rec_log_off, payload_off)))
             else:
                 raise ValueError(f"Unknown LogExtent tag: {kind}")
         size = r.read_opt_u64()
@@ -521,9 +534,19 @@ def prompt_passphrase(prompt: str = "Enter passphrase: ") -> str:
 class Restorer:
     """Manages direct-to-disk incremental state restoration."""
 
-    def __init__(self, dest_dir: Path, decryptor: VolumeDecryptor, verbose: bool = False, dry_run: bool = False):
+    def __init__(
+        self,
+        dest_dir: Path,
+        decryptor: VolumeDecryptor,
+        log_paths: Dict[int, Path],
+        verbose: bool = False,
+        dry_run: bool = False,
+    ):
         self.dest_dir = dest_dir
         self.decryptor = decryptor
+        # Log file of each generation, for resolving EXTENT_REF extents.
+        self.log_paths = log_paths
+        self.ref_record: Optional[Tuple[Tuple[int, int], bytes]] = None
         self.verbose = verbose
         self.dry_run = dry_run
 
@@ -565,6 +588,35 @@ class Restorer:
                 paths.append(ppath / name)
         return paths
 
+    def read_ref(self, generation: int, rec_log_off: int, payload_off: int, length: int) -> bytes:
+        """Reads the bytes an EXTENT_REF extent references out of its data record."""
+        key = (generation, rec_log_off)
+        if self.ref_record is None or self.ref_record[0] != key:
+            path = self.log_paths.get(generation)
+            if path is None:
+                raise ValueError(f"Extent references generation {generation}, whose log file is not available")
+            with open(path, "rb") as f:
+                hdr = f.read(FILE_HEADER_SIZE)
+                key_salt = struct.unpack(">4sIIHqI16s", hdr)[6]
+                f.seek(rec_log_off)
+                rh_bytes = f.read(RECORD_HEADER_SIZE)
+                if len(rh_bytes) < RECORD_HEADER_SIZE:
+                    raise ValueError(f"Extent references {path.name} @ offset 0x{rec_log_off:x}, past its end")
+                op, ino, plen, seq, tag = struct.unpack(">BQIQ16s", rh_bytes)
+                if op not in (OP_DATA, OP_DATA_ZSTD):
+                    raise ValueError(
+                        f"Extent references {path.name} @ offset 0x{rec_log_off:x}, which holds op={op}, not data"
+                    )
+                payload = self.decryptor.decode_record(key_salt, seq, op, ino, f.read(plen), tag)
+            self.ref_record = (key, payload)
+        data = self.ref_record[1][payload_off : payload_off + length]
+        if len(data) != length:
+            raise ValueError(
+                f"Extent references bytes {payload_off}..{payload_off + length} of the record in generation "
+                f"{generation} @ offset 0x{rec_log_off:x}, which holds only {len(self.ref_record[1])}"
+            )
+        return data
+
     def replay_log_file(self, log_path: Path):
         with open(log_path, "rb") as f:
             hdr = f.read(FILE_HEADER_SIZE)
@@ -573,6 +625,8 @@ class Restorer:
             magic, ver, gen, rev, secs, nsecs, key_salt = struct.unpack(">4sIIHqI16s", hdr)
             if magic != FILE_MAGIC:
                 raise ValueError(f"Invalid file magic {magic} in {log_path.name}")
+            if ver not in SUPPORTED_LOG_VERSIONS:
+                raise ValueError(f"Unsupported log format version {ver} in {log_path.name}")
 
             if self.verbose:
                 print(f"[{log_path.name}] Replaying generation {gen}, rev {rev}...")
@@ -944,12 +998,16 @@ class Restorer:
                         pass
                 open_mode = "r+b" if primary.exists() else "w+b"
                 with open(primary, open_mode) as f:
-                    for file_off, rec_log_off, length in extents:
-                        if rec_log_off is not None:
-                            chunk = batch_chunks.get((ino, rec_log_off))
+                    for file_off, length, source in extents:
+                        if source is not None and source[0] == "batch":
+                            chunk = batch_chunks.get((ino, source[1]))
                             if chunk is not None:
                                 f.seek(file_off)
                                 f.write(chunk[:length])
+                        elif source is not None:
+                            _, generation, rec_log_off, payload_off = source
+                            f.seek(file_off)
+                            f.write(self.read_ref(generation, rec_log_off, payload_off, length))
                         else:
                             # Only bytes already in the file need zeroing: past EOF reads as
                             # zeros anyway, and a truncation's hole runs to u64::MAX.
@@ -1133,7 +1191,8 @@ def main():
         raise ValueError("Volume is encrypted. Pass --key-file to unlock it.")
 
     decryptor = VolumeDecryptor(key_bytes=key_bytes, no_verify=args.no_verify)
-    restorer = Restorer(dest_path, decryptor, verbose=args.verbose, dry_run=args.dry_run)
+    log_paths = {gen: log_path for gen, _, log_path in log_files}
+    restorer = Restorer(dest_path, decryptor, log_paths, verbose=args.verbose, dry_run=args.dry_run)
 
     if not args.dry_run:
         dest_path.mkdir(parents=True, exist_ok=True)

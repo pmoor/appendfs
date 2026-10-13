@@ -103,7 +103,7 @@ fn test_differential_fuzzing_and_crash_recovery() {
 
         for step in 1..=steps {
             clock.advance(Duration::from_secs(1));
-            let op_choice = prng.gen_range(0, 16);
+            let op_choice = prng.gen_range(0, 17);
             match op_choice {
                 0 => {
                     // Create directory
@@ -674,6 +674,42 @@ fn test_differential_fuzzing_and_crash_recovery() {
                         assert_eq!(res1, res3);
                         assert_eq!(res1, res4);
                         assert_eq!(res1, res5);
+                    }
+                }
+                16 => {
+                    // copy_file_range, between two files or within one. Sources have mostly
+                    // been flushed by the time they are copied, so the destination comes to
+                    // reference records from earlier batches - and on the small-log
+                    // instances, from earlier generations, which the remote instance may
+                    // since have pruned locally. Offsets reach past the writes' range, so
+                    // copies also start past EOF, end in it, and open gaps in the target.
+                    if !active_files.is_empty() {
+                        let ino_in = active_files[prng.gen_range(0, active_files.len() - 1)];
+                        let ino_out = active_files[prng.gen_range(0, active_files.len() - 1)];
+                        let off_in = (prng.gen_range(0, 30) * 16) as i64;
+                        let off_out = (prng.gen_range(0, 30) * 16) as i64;
+                        let len = prng.gen_range(1, 300) as u64;
+
+                        let source = fs_baseline.fs.read_at(ino_in, off_in, len as usize);
+                        let res1 = fs_baseline.fs.copy_range(ino_in, off_in, ino_out, off_out, len);
+                        let res2 = fs_micro.fs.copy_range(ino_in, off_in, ino_out, off_out, len);
+                        let res3 = fs_remount.fs.copy_range(ino_in, off_in, ino_out, off_out, len);
+                        let res4 = fs_crash.fs.copy_range(ino_in, off_in, ino_out, off_out, len);
+                        let res5 = fs_remote.fs.copy_range(ino_in, off_in, ino_out, off_out, len);
+
+                        assert_eq!(res1, res2);
+                        assert_eq!(res1, res3);
+                        assert_eq!(res1, res4);
+                        assert_eq!(res1, res5);
+
+                        // The other instances are held to the baseline at every checkpoint;
+                        // this holds the baseline to what the copy promised.
+                        if let Ok(copied) = res1 {
+                            let source = source.expect("source read failed although the copy succeeded");
+                            assert_eq!(copied, source.len(), "copy length must stop at the source's EOF");
+                            let copy = fs_baseline.fs.read_at(ino_out, off_out, copied).unwrap();
+                            assert_eq!(copy, source, "copied range must read back as the source did");
+                        }
                     }
                 }
                 _ => {

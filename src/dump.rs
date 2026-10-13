@@ -1114,6 +1114,22 @@ fn format_log_extent(ext: &LogExtent) -> String {
             file_offset.saturating_add(length),
             format_bytes(length)
         ),
+        LogExtent::Ref {
+            file_offset,
+            generation,
+            record_log_offset,
+            payload_offset,
+            length,
+            ..
+        } => format!(
+            "[0x{:x}..0x{:x} ({}) -> gen {} log offset 0x{:08x} +0x{:x}]",
+            file_offset,
+            file_offset.saturating_add(length as u64),
+            format_bytes(length as u64),
+            generation,
+            record_log_offset,
+            payload_offset
+        ),
     }
 }
 
@@ -1519,15 +1535,23 @@ mod tests {
                     file_offset: 4096,
                     length: 8192,
                 },
+                LogExtent::Ref {
+                    file_offset: 12288,
+                    generation: 3,
+                    record_log_offset: 0x2a,
+                    record_size: 4124,
+                    payload_offset: 0x100,
+                    length: 1024,
+                },
             ],
-            size: Some(12288),
+            size: Some(13312),
             attr_delta: LogAttrDelta::default(),
         }));
 
         let formatted = format_log_entry_delta(&delta);
         assert_eq!(
             formatted,
-            "File { extents: [[0x0..0x1000 (4.00 KiB) -> log offset 0x0000001c], [0x1000..0x3000 (8.00 KiB) -> hole]], size: 12288 (12.00 KiB) }"
+            "File { extents: [[0x0..0x1000 (4.00 KiB) -> log offset 0x0000001c], [0x1000..0x3000 (8.00 KiB) -> hole], [0x3000..0x3400 (1.00 KiB) -> gen 3 log offset 0x0000002a +0x100]], size: 13312 (13.00 KiB) }"
         );
 
         let small_size_delta = LogEntryDelta::Node(LogNodeDelta::File(LogFileDelta {

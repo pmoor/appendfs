@@ -34,14 +34,15 @@ pub enum OpTag {
     Stats = 23,
     Lock = 24,
     Other = 25,
+    CopyFileRange = 26,
     #[cfg(any(test, feature = "testing"))]
-    Test = 26,
+    Test = 27,
 }
 
 #[cfg(not(any(test, feature = "testing")))]
-pub const OP_TAG_COUNT: usize = 26;
-#[cfg(any(test, feature = "testing"))]
 pub const OP_TAG_COUNT: usize = 27;
+#[cfg(any(test, feature = "testing"))]
+pub const OP_TAG_COUNT: usize = 28;
 
 pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Write,
@@ -70,6 +71,7 @@ pub const ALL_OP_TAGS: [OpTag; OP_TAG_COUNT] = [
     OpTag::Stats,
     OpTag::Lock,
     OpTag::Other,
+    OpTag::CopyFileRange,
     #[cfg(any(test, feature = "testing"))]
     OpTag::Test,
 ];
@@ -103,6 +105,7 @@ impl OpTag {
             OpTag::Stats => "stats",
             OpTag::Lock => "lock",
             OpTag::Other => "other",
+            OpTag::CopyFileRange => "copy_file_range",
             #[cfg(any(test, feature = "testing"))]
             OpTag::Test => "test",
         }
@@ -671,7 +674,7 @@ mod tests {
     #[test]
     fn test_op_tags_coverage() {
         assert_eq!(ALL_OP_TAGS.len(), OP_TAG_COUNT);
-        assert_eq!(OP_TAG_COUNT, 27);
+        assert_eq!(OP_TAG_COUNT, 28);
 
         let m = ActionMutex::new(0);
         for &tag in &ALL_OP_TAGS {

@@ -183,7 +183,7 @@ fn test_fuse_op_declarative_classification_and_metrics() {
     use appendfs::{ALL_FUSE_OPS, FUSE_OP_COUNT, FuseOp, FuseOpMetrics, ThrottleDecision};
 
     assert_eq!(ALL_FUSE_OPS.len(), FUSE_OP_COUNT);
-    assert_eq!(FUSE_OP_COUNT, 31);
+    assert_eq!(FUSE_OP_COUNT, 32);
 
     // Verify tiers
     assert_eq!(FuseOp::Write.tier(), OpTier::Write);

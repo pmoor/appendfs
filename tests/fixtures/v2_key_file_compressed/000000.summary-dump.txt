@@ -1,0 +1,25 @@
+=== appendfs Summary File Dump ===
+File:                "000000.summary"
+Generation:          0
+Format Version:      1
+Last Batch ID:       0
+Next Inode:          2
+File Size:           263 B
+Encryption:          ChaCha20-Poly1305
+Checksum (BLAKE3):   6e1d2a3f77a9c2ecd12b860bcd931a97d99874ac1b86a964dcf13b258ef576f4 (VERIFIED)
+
+--- Inode Breakdown ---
+Total Inodes:        1 (1 directories, 0 regular files, 0 symlinks)
+Logical Data Size:   0 B
+
+--- File Extent & Fragmentation Statistics ---
+Total Regular Files: 0
+Total File Extents:  0
+Avg Extents / File:  0.00
+Max Extents in File: 0
+
+--- Tracked Log Generations Manifest ---
+Tracked Logs:        0 active log generation files
+
+=== Summary Inode Records ===
+#1     [Inode 1    ] Directory  "/" (mode 0o755, uid 1000, gid 1000, entries: 0, mtime: 1700000000.000000000s (2023-11-14 22:13:20 UTC))

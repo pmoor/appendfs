@@ -442,17 +442,44 @@ pub fn calculate_generation_live_stats_from_nodes<'a, I>(nodes: I, manifest: &Lo
 where
     I: IntoIterator<Item = &'a Node>,
 {
+    // `copy_file_range` lets several extents - in one file or in many - reference the same
+    // bytes of a record, so a record's live bytes are the union of the ranges referencing it,
+    // not their sum.
+    let mut referenced: HashMap<(u32, u64), Vec<(u64, u64)>> = HashMap::new();
     let mut live_map: HashMap<u32, (u64, u32)> = HashMap::new();
     for node in nodes {
         if let NodeKind::File { extent_map, .. } = &node.kind {
             for (_, entry) in extent_map.iter() {
-                if let Extent::Disk { generation, length, .. } = &entry.extent {
-                    let stats = live_map.entry(*generation).or_insert((0, 0));
-                    stats.0 += *length as u64;
-                    stats.1 += 1;
+                if let Extent::Disk {
+                    generation,
+                    record_log_offset,
+                    payload_offset,
+                    length,
+                    ..
+                } = &entry.extent
+                {
+                    let start = *payload_offset as u64;
+                    referenced
+                        .entry((*generation, *record_log_offset))
+                        .or_default()
+                        .push((start, start + *length as u64));
+                    live_map.entry(*generation).or_insert((0, 0)).1 += 1;
                 }
             }
         }
+    }
+    for ((generation, _), mut ranges) in referenced {
+        ranges.sort_unstable();
+        let mut live_bytes = 0;
+        let mut covered_to = 0;
+        for (start, end) in ranges {
+            let start = start.max(covered_to);
+            if end > start {
+                live_bytes += end - start;
+                covered_to = end;
+            }
+        }
+        live_map.entry(generation).or_insert((0, 0)).0 += live_bytes;
     }
 
     let mut result = Vec::with_capacity(manifest.logs.len());

@@ -50,6 +50,8 @@ typedef void (*rust_setxattr_t)(shim_req_t req, uint64_t ino, const char *name, 
                                 int flags);
 typedef void (*rust_listxattr_t)(shim_req_t req, uint64_t ino, size_t size);
 typedef void (*rust_removexattr_t)(shim_req_t req, uint64_t ino, const char *name);
+typedef void (*rust_copy_file_range_t)(shim_req_t req, uint64_t ino_in, int64_t off_in, uint64_t fh_in,
+                                       uint64_t ino_out, int64_t off_out, uint64_t fh_out, size_t len, int flags);
 typedef int (*rust_init_t)(void *userdata);
 typedef void (*rust_destroy_t)(void *userdata);
 
@@ -85,6 +87,7 @@ struct rust_lowlevel_ops {
   rust_setxattr_t setxattr;
   rust_listxattr_t listxattr;
   rust_removexattr_t removexattr;
+  rust_copy_file_range_t copy_file_range;
   rust_init_t init;
   rust_destroy_t destroy;
 };

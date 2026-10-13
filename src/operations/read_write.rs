@@ -423,6 +423,117 @@ pub fn fallocate_core(fs: &AppendFs, ino: u64, mode: i32, offset: i64, length: i
     })
 }
 
+/// Most bytes one `copy_file_range` call copies: the kernel's `MAX_RW_COUNT`. The FUSE reply
+/// carries the count in 32 bits, and a short copy is legal - callers loop until done.
+const MAX_COPY_LEN: u64 = i32::MAX as u64 & !0xfff;
+
+/// `copy_file_range(2)`: makes `[off_out, off_out + len)` of `ino_out` read as
+/// `[off_in, off_in + len)` of `ino_in` reads now, without copying a byte.
+///
+/// The destination takes the source's extents themselves. Flushed data is shared: the
+/// destination's delta records reference the source's log records, wherever and in whichever
+/// generation they are. Data still staged is shared in memory and written out once more with
+/// the destination, since it has no record to reference yet. Holes stay holes.
+///
+/// Returns how many bytes were copied, which is short of `len` when the source ends first.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_file_range_core(
+    fs: &AppendFs,
+    ino_in: u64,
+    fh_in: u64,
+    off_in: i64,
+    ino_out: u64,
+    fh_out: u64,
+    off_out: i64,
+    len: u64,
+    flags: u32,
+) -> Result<usize, FsError> {
+    log::trace!(
+        "copy_file_range(ino_in={}, off_in={}, ino_out={}, off_out={}, len={})",
+        ino_in,
+        off_in,
+        ino_out,
+        off_out,
+        len
+    );
+    if is_virtual_ino(ino_in) || is_virtual_ino(ino_out) {
+        // Not refused outright: the kernel answers this by copying through read and write,
+        // which serve virtual files - or refuse them - the way they always do.
+        return Err(FsError::EOPNOTSUPP);
+    }
+    if flags != 0 || off_in < 0 || off_out < 0 {
+        return Err(FsError::EINVAL);
+    }
+
+    let now = fs.clock.now();
+    let (off_in, off_out) = (off_in as u64, off_out as u64);
+
+    fs.with_inner(OpTag::CopyFileRange, |inner| {
+        inner.check_shutdown(true)?;
+        inner.validate_regular_handle(ino_in, fh_in)?;
+        inner.validate_regular_handle(ino_out, fh_out)?;
+        let src_attr = inner.get_attr(ino_in).ok_or(FsError::ENOENT)?;
+        let dst_attr = inner.get_attr(ino_out).ok_or(FsError::ENOENT)?;
+        if src_attr.file_type != FileType::RegularFile || dst_attr.file_type != FileType::RegularFile {
+            return Err(FsError::EINVAL);
+        }
+
+        let src_size = src_attr.size as u64;
+        if off_in >= src_size {
+            return Ok(0);
+        }
+        let len = len.min(src_size - off_in).min(MAX_COPY_LEN);
+        if len == 0 {
+            return Ok(0);
+        }
+        let end_out = off_out.checked_add(len).filter(|&end| end <= i64::MAX as u64);
+        let Some(end_out) = end_out else {
+            return Err(FsError::EFBIG);
+        };
+        if ino_in == ino_out && off_in < end_out && off_out < off_in + len {
+            return Err(FsError::EINVAL);
+        }
+
+        let extents = inner.with_inode_layers(ino_in, |layers| layers.resolve_extents(off_in, len));
+        let staged_bytes: u64 = extents
+            .iter()
+            .filter(|(_, extent)| extent.is_staged())
+            .map(|(_, extent)| extent.length())
+            .sum();
+
+        let entry = inner
+            .live
+            .entry(ino_out)
+            .or_insert_with(|| EntryDelta::Node(NodeDelta::File(FileDelta::default())));
+        if let EntryDelta::Node(NodeDelta::File(f)) = entry {
+            for (start, extent) in extents {
+                f.extents.insert(start - off_in + off_out, extent);
+            }
+            let current_size = f.size.unwrap_or(dst_attr.size as u64);
+            f.size = Some(current_size.max(end_out));
+            f.attr_delta.mtime = Some(now);
+            f.attr_delta.ctime = Some(now);
+        }
+        inner.record_mutation(staged_bytes as usize);
+        Ok(len as usize)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn copy_file_range_response(
+    fs: &AppendFs,
+    ino_in: u64,
+    fh_in: u64,
+    off_in: i64,
+    ino_out: u64,
+    fh_out: u64,
+    off_out: i64,
+    len: u64,
+    flags: u32,
+) -> Result<FuseResponse<'static>, FsError> {
+    copy_file_range_core(fs, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags).map(FuseResponse::write)
+}
+
 pub fn fallocate_response(
     fs: &AppendFs,
     ino: u64,
@@ -816,5 +927,131 @@ mod tests {
         // 256-byte name should fail with ENAMETOOLONG
         let name_256 = "f".repeat(256);
         assert_eq!(fs.create_file(1, &name_256, 0o644), Err(FsError::ENAMETOOLONG));
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + 3) as u8).collect()
+    }
+
+    #[test]
+    fn test_copy_file_range_references_records_of_an_older_generation() {
+        let mut tfs = TestFs::builder().build();
+        // 64-byte records, so the copy below spans three and starts and ends inside one.
+        tfs.set_max_extent_size(64);
+        let src_data = pattern(200);
+        let src = tfs.fs.create_file(1, "src.bin", 0o644).unwrap();
+        tfs.fs.write_at(src, &src_data, 0).unwrap();
+        tfs.fs.quiesce().unwrap();
+        tfs.fs.force_roll_active_log().unwrap();
+
+        let dst = tfs.fs.create_file(1, "dst.bin", 0o644).unwrap();
+        tfs.fs.write_at(dst, &[0xEE; 300], 0).unwrap();
+        tfs.fs.quiesce().unwrap();
+        let data_bytes_before = tfs.fs.log_writer.as_ref().unwrap().total_data_bytes();
+
+        assert_eq!(tfs.fs.copy_range(src, 50, dst, 10, 100), Ok(100));
+        let mut expected = vec![0xEE; 300];
+        expected[10..110].copy_from_slice(&src_data[50..150]);
+        assert_eq!(tfs.fs.read_all(dst).unwrap(), expected);
+
+        tfs.fs.quiesce().unwrap();
+        assert_eq!(
+            tfs.fs.log_writer.as_ref().unwrap().total_data_bytes(),
+            data_bytes_before,
+            "the copy must not write any data"
+        );
+        let stats = tfs.fs.calculate_generation_live_stats();
+        let gen1 = stats.iter().find(|g| g.generation == 1).unwrap();
+        assert_eq!(gen1.live_bytes, 200, "bytes referenced twice are live once");
+
+        let tfs = tfs.unclean_crash();
+        assert_eq!(tfs.fs.read_all(dst).unwrap(), expected, "replayed from the log");
+        let tfs = tfs.clean_remount();
+        assert_eq!(tfs.fs.read_all(dst).unwrap(), expected, "loaded from the summary");
+        assert_eq!(tfs.fs.read_all(src).unwrap(), src_data);
+    }
+
+    #[test]
+    fn test_copy_file_range_of_unflushed_data_and_holes_is_a_snapshot() {
+        let tfs = TestFs::builder().build();
+        let fs = &tfs.fs;
+        // The destination's flushed bytes must be masked wherever the source has a hole.
+        let dst = fs.create_file(1, "dst.bin", 0o644).unwrap();
+        fs.write_at(dst, &[0xEE; 500], 0).unwrap();
+        fs.quiesce().unwrap();
+
+        // Staged data with a punched hole, then an implicit one: [300, 400) was never written.
+        let src = fs.create_file(1, "src.bin", 0o644).unwrap();
+        fs.write_at(src, &[0xAA; 300], 0).unwrap();
+        fs.write_at(src, &[0xCC; 10], 400).unwrap();
+        fs.punch_hole(src, 100, 50).unwrap();
+
+        assert_eq!(
+            fs.copy_range(src, 0, dst, 0, 1000),
+            Ok(410),
+            "stops at the source's EOF"
+        );
+        let mut expected = vec![0xAA; 300];
+        expected[100..150].fill(0);
+        expected.extend_from_slice(&[0; 100]);
+        expected.extend_from_slice(&[0xCC; 10]);
+        expected.extend_from_slice(&[0xEE; 90]);
+
+        // Writes to the source after the copy do not reach it, flushed or not.
+        fs.write_at(src, &[0xBB; 410], 0).unwrap();
+        assert_eq!(fs.read_all(dst).unwrap(), expected);
+        fs.quiesce().unwrap();
+        assert_eq!(fs.read_all(dst).unwrap(), expected);
+
+        let tfs = tfs.unclean_crash();
+        assert_eq!(tfs.fs.read_all(dst).unwrap(), expected);
+        assert_eq!(tfs.fs.read_all(src).unwrap(), vec![0xBB; 410]);
+    }
+
+    #[test]
+    fn test_copy_file_range_bounds_and_refusals() {
+        let tfs = TestFs::builder().build();
+        let fs = &tfs.fs;
+        let src = file_with(fs, &[0x11; 100]);
+        let dst = fs.create_file(1, "dst.bin", 0o644).unwrap();
+
+        // Nothing to copy at or past the source's EOF.
+        assert_eq!(fs.copy_range(src, 100, dst, 0, 10), Ok(0));
+        assert_eq!(fs.copy_range(src, 500, dst, 0, 10), Ok(0));
+        assert_eq!(fs.get_attr(dst).unwrap().size, 0);
+
+        // Copying past the destination's EOF grows it, leaving a hole.
+        assert_eq!(fs.copy_range(src, 90, dst, 1000, 50), Ok(10));
+        assert_eq!(fs.get_attr(dst).unwrap().size, 1010);
+        let data = fs.read_all(dst).unwrap();
+        assert!(data[..1000].iter().all(|&b| b == 0));
+        assert_eq!(&data[1000..], &[0x11; 10]);
+
+        // Within one file, disjoint ranges copy and overlapping ones are refused.
+        assert_eq!(fs.copy_range(src, 0, src, 100, 50), Ok(50));
+        assert_eq!(fs.get_attr(src).unwrap().size, 150);
+        assert_eq!(fs.copy_range(src, 0, src, 20, 50), Err(FsError::EINVAL));
+
+        assert_eq!(fs.copy_range(src, -1, dst, 0, 10), Err(FsError::EINVAL));
+        assert_eq!(fs.copy_range(src, 0, dst, -1, 10), Err(FsError::EINVAL));
+        assert_eq!(fs.copy_range(src, 0, dst, i64::MAX - 5, 10), Err(FsError::EFBIG));
+
+        let fh_in = open_core(fs, src, libc::O_RDONLY as u32).unwrap();
+        let fh_out = open_core(fs, dst, libc::O_WRONLY as u32).unwrap();
+        assert_eq!(
+            copy_file_range_core(fs, src, fh_in, 0, dst, fh_out, 0, 10, 1),
+            Err(FsError::EINVAL),
+            "no flags are defined"
+        );
+        // Left to the kernel's read/write fallback, which handles virtual files.
+        assert_eq!(
+            copy_file_range_core(fs, crate::fs::VIRTUAL_INO_BASE, 0, 0, dst, fh_out, 0, 10, 0),
+            Err(FsError::EOPNOTSUPP)
+        );
+        fs.set_read_only();
+        assert_eq!(
+            copy_file_range_core(fs, src, fh_in, 0, dst, fh_out, 0, 10, 0),
+            Err(FsError::EROFS)
+        );
     }
 }

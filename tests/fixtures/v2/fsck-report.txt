@@ -1,0 +1,18 @@
+=================================================================
+               AppendFS Filesystem Integrity Check               
+=================================================================
+
+  Total Inodes:      20 (Directories: 6, Files: 7, Symlinks: 3)
+  Total Extents:     12
+  Logical Data Size: 46848 bytes (0.04 MiB)
+
+------------------------- Check Summary -------------------------
+  [PASS] Inode Reachability (0 orphaned inodes)
+  [PASS] Hardlink Reference Counts (nlink)
+  [PASS] Directory Hierarchy & Tree Acyclicity
+  [PASS] File Extents & Log Record Consistency (100.000% sample, 8 records, 0.04 MiB across 1 blocks)
+  [PASS] Log Manifest & Physical Storage
+
+=================================================================
+  VERDICT: CLEAN - Volume is healthy with 0 errors.
+=================================================================

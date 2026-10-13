@@ -20,7 +20,7 @@ Instead of mutating files in place on disk, AppendFS stages all filesystem opera
 - **Transparent Compression**: Payloads are compressed on the fly using **Zstandard (zstd)**, saving storage space and network transfer costs.
 - **Multi-Cloud Replication**: An autonomous background replication worker fans out sealed logs and summaries to S3-compatible cloud providers (AWS S3, Backblaze B2, Cloudflare R2, MinIO, Wasabi, Google Cloud Storage) or local/NFS paths.
 - **Tiered Storage & Range Reads**: Local disk space can be reclaimed by pruning uploaded log files. Missing extents are transparently fetched on demand.
-- **POSIX Compliant**: Supports regular files, directories, symlinks, hardlinks, special files (FIFOs, Unix sockets, character/block devices), sparse files (hole punching via `fallocate`), extended attributes (`xattr`), and advisory file locking (`flock` / `fcntl`).
+- **POSIX Compliant**: Supports regular files, directories, symlinks, hardlinks, special files (FIFOs, Unix sockets, character/block devices), sparse files (hole punching via `fallocate`), zero-copy `copy_file_range` (a `cp` within a volume shares the source's data instead of writing it again), extended attributes (`xattr`), and advisory file locking (`flock` / `fcntl`).
 - **Clean-Room Disaster Recovery**: Includes `scripts/restore.py`, an independent Python script that reconstructs the full filesystem tree directly from raw log files without requiring Rust, Cargo, or FUSE.
 - **Offline Diagnostics & Verification**: Built-in CLI commands to check filesystem tree consistency and payload checksums (`appendfs fsck`), inspect inode/storage breakdown (`appendfs stats`), and decode individual log records (`appendfs dump`).
 

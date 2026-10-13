@@ -98,6 +98,8 @@ typedef void (*shim_setxattr_fn)(shim_req_t req, uint64_t ino, const char *name,
                                  int flags);
 typedef void (*shim_listxattr_fn)(shim_req_t req, uint64_t ino, size_t size);
 typedef void (*shim_removexattr_fn)(shim_req_t req, uint64_t ino, const char *name);
+typedef void (*shim_copy_file_range_fn)(shim_req_t req, uint64_t ino_in, int64_t off_in, uint64_t fh_in,
+                                        uint64_t ino_out, int64_t off_out, uint64_t fh_out, size_t len, int flags);
 // Returns 0, or an errno to fail the mount with.
 typedef int (*shim_init_fn)(void *userdata);
 typedef void (*shim_destroy_fn)(void *userdata);
@@ -134,6 +136,7 @@ struct RustLowlevelOps {
   shim_setxattr_fn setxattr;
   shim_listxattr_fn listxattr;
   shim_removexattr_fn removexattr;
+  shim_copy_file_range_fn copy_file_range;
   shim_init_fn init;
   shim_destroy_fn destroy;
 };
@@ -350,6 +353,20 @@ static void ll_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
     uint64_t fh = fi ? fi->fh : 0;
     ctx->ops.fallocate(shim_req_t{req, ctx->userdata}, ino, static_cast<int32_t>(mode),
                        static_cast<int64_t>(offset), static_cast<int64_t>(length), fh);
+  } else {
+    fuse_reply_err(req, 38);
+  }
+}
+
+static void ll_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in, struct fuse_file_info *fi_in,
+                               fuse_ino_t ino_out, off_t off_out, struct fuse_file_info *fi_out, size_t len,
+                               int flags) {
+  auto *ctx = static_cast<ShimContext *>(fuse_req_userdata(req));
+  if (ctx && ctx->ops.copy_file_range) {
+    uint64_t fh_in = fi_in ? fi_in->fh : 0;
+    uint64_t fh_out = fi_out ? fi_out->fh : 0;
+    ctx->ops.copy_file_range(shim_req_t{req, ctx->userdata}, ino_in, static_cast<int64_t>(off_in), fh_in, ino_out,
+                             static_cast<int64_t>(off_out), fh_out, len, flags);
   } else {
     fuse_reply_err(req, 38);
   }
@@ -590,6 +607,7 @@ int run_fuse_ll(int argc, const char *const *argv, const RustLowlevelOps *ops, v
   ll_ops.link = ll_link;
   ll_ops.fsync = ll_fsync;
   ll_ops.fallocate = ll_fallocate;
+  ll_ops.copy_file_range = ll_copy_file_range;
   ll_ops.release = ll_release;
   ll_ops.releasedir = ll_releasedir;
   ll_ops.fsyncdir = ll_fsyncdir;
